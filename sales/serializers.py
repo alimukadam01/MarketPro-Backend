@@ -226,60 +226,59 @@ class PurchaseInvoiceAndItemsUpdateSerializer(serializers.ModelSerializer):
         items = self.validated_data.pop('items')
 
         try:
-            # with transaction.atomic():
-            for attr, value in self.validated_data.items():
-                setattr(self.instance, attr, value)
+            with transaction.atomic():
+                for attr, value in self.validated_data.items():
+                    setattr(self.instance, attr, value)
 
-            self.instance.save()
+                self.instance.save()
 
-            existing_items = PurchaseInvoiceItem.objects.filter(
-                purchase_invoice_id = self.instance.id
-            )
-            existing_items_map = {
-                item.id: item for item in existing_items
-            }
-            existing_item_ids = set(existing_items.values_list('id', flat=True))
+                existing_items = PurchaseInvoiceItem.objects.filter(
+                    purchase_invoice_id = self.instance.id
+                )
+                existing_items_map = {
+                    item.id: item for item in existing_items
+                }
+                existing_item_ids = set(existing_items.values_list('id', flat=True))
 
-            new_items = []
-            updated_items = []
+                new_items = []
+                updated_items = []
 
-            for item in items:
-                print(item)
-                if item['id'] in existing_item_ids:
-                    invoice_item = existing_items_map.get(item['id'])
-                    invoice_item.product_id = item['product_id']
-                    invoice_item.quantity = item['quantity']
-                    invoice_item.unit_cost = item['unit_cost']
-                    updated_items.append(invoice_item)
-                else:
-                    new_items.append(PurchaseInvoiceItem(
-                        business_id = self.context['business_id'],
-                        purchase_invoice = self.instance,
-                        product_id = item['product_id'],
-                        quantity = item['quantity'],
-                        unit_cost = item['unit_cost']
-                    ))
+                for item in items:
+                    print(item)
+                    if item['id'] in existing_item_ids:
+                        invoice_item = existing_items_map.get(item['id'])
+                        invoice_item.product_id = item['product_id']
+                        invoice_item.quantity = item['quantity']
+                        invoice_item.unit_cost = item['unit_cost']
+                        updated_items.append(invoice_item)
+                    else:
+                        new_items.append(PurchaseInvoiceItem(
+                            business_id = self.context['business_id'],
+                            purchase_invoice = self.instance,
+                            product_id = item['product_id'],
+                            quantity = item['quantity'],
+                            unit_cost = item['unit_cost']
+                        ))
 
-            if new_items:
-                print("Creating new items:", new_items)
-                for item in new_items:
-                    for attr, value in item.__dict__.items():
-                        print(f"{attr}: {value}")
+                if new_items:
+                    print("Creating new items:", new_items)
+                    for item in new_items:
+                        new_item = item.save()
+                        print(new_item)
 
-                new_items = PurchaseInvoiceItem.objects.bulk_create(new_items)
-            
-            if updated_items:
-                PurchaseInvoiceItem.objects.bulk_update(updated_items, [
-                    'product', 'quantity', 'unit_cost'
-                ])
+                
+                if updated_items:
+                    PurchaseInvoiceItem.objects.bulk_update(updated_items, [
+                        'product', 'quantity', 'unit_cost'
+                    ])
 
-            updated_ids = [item.id for item in updated_items]
-            existing_items = existing_items.exclude(id__in=updated_ids)
-            existing_items.delete()
-            
+                updated_ids = [item.id for item in updated_items]
+                existing_items = existing_items.exclude(id__in=updated_ids)
+                existing_items.delete()
+                
             self.instance.adjust_totals()
             return self.instance
-        
+    
         except Exception as error:
             print(error)
             return None

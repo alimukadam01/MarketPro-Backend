@@ -1,6 +1,7 @@
 from rest_framework.viewsets import ModelViewSet, ReadOnlyModelViewSet
 from rest_framework.response import Response
 from rest_framework.decorators import action
+from rest_framework.filters import SearchFilter
 from rest_framework import status
 from .models import Inventory, InventoryItem
 from .serializers import AvailableProductSerializer, InventoryItemCreateSerializer, InventoryItemSerializer, InventoryItemUpdateSerializer, InventorySerializer
@@ -21,6 +22,11 @@ class InventoryViewSet(ModelViewSet):
 
 
 class InventoryItemsViewSet(ModelViewSet):
+
+    filter_backends = [SearchFilter]
+    search_fields = [
+        'id', 'location__name', 'product__name', 'track_code', 'unit_cost', 'unit_price'
+    ]
 
     def get_queryset(self):
         return InventoryItem.objects.filter(inventory_id = self.kwargs['inventory_pk'])
@@ -73,4 +79,24 @@ class InventoryItemsViewSet(ModelViewSet):
             print(error)
             return Response({
                 "detail": "Internal Server Error"
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        
+    @action(['POST'], detail=False, url_path='bulk-delete', url_name='bulk-delete')
+    def bulk_delete(self, request):
+        item_ids = request.data.get('items_ids', [])
+        if not item_ids:
+            return Response({
+                'detail': 'Bad Request.'
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            InventoryItem.objects.filter(id__in=item_ids).delete()
+            return Response({
+                'detail': 'Success.'
+            }, status=status.HTTP_200_OK)
+        
+        except Exception as error:
+            print(error)
+            return Response({
+                'detail': 'Internal Server Error.'
             }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)

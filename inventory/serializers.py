@@ -7,6 +7,7 @@ class InventoryItemSerializer(BaseItemSerializer):
 
     product = SimpleProductSerializer()
     location = serializers.PrimaryKeyRelatedField(queryset=Location.objects.none())
+    quantity = serializers.IntegerField()
     quantity_on_hand = serializers.IntegerField()
     quantity_reserved = serializers.IntegerField()
     unit_cost = serializers.FloatField()
@@ -57,7 +58,7 @@ class InventoryItemUpdateSerializer(serializers.ModelSerializer):
     class Meta:
         model = InventoryItem
         fields = [
-            'id', 'location', 'quantity', 'quantity_on_hand', 'track_code', 
+            'id', 'location', 'quantity', 'quantity_on_hand', 'quantity_reserved','track_code', 
             'notes', 'unit_cost', 'unit_price', 'reorder_level'
         ]
 

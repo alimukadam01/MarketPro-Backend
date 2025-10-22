@@ -410,3 +410,18 @@ class PurchaseQuotationSupplier(models.Model):
 
     def __str__(self):
         return f"{self.supplier.name}-{self.purchase_quotation.quotation_no if self.purchase_quotation.quotation_no else self.purchase_quotation.id}"
+
+    #SalesQuotation*
+    #Payment*
+    #Inter Account Transfer
+    #Bank Reconciliations
+    #Witholding Tax 
+    #Debit Notes
+    #Inventory Write Offs
+    #Production Orders
+    #Employees
+    #Employee Payslips
+    #Master Account Functionality
+    #Folders
+    #Financial Reports
+    

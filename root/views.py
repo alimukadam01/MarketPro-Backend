@@ -2,6 +2,7 @@ from rest_framework import status
 from rest_framework.viewsets import ReadOnlyModelViewSet, ModelViewSet
 from rest_framework.response import Response
 from rest_framework.decorators import action
+from rest_framework.filters import SearchFilter
 
 from .utils import get_active_business
 from .serializers import (
@@ -88,6 +89,11 @@ class BusinessViewSet(ModelViewSet):
 
 
 class ProductViewSet(ModelViewSet):
+
+    filter_backends = [SearchFilter]
+    search_fields = [
+       'id', 'name', 'desc', 'unit__name' 
+    ]
 
     def get_queryset(self):
         business = get_active_business(self.request)
