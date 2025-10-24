@@ -2,6 +2,7 @@ from rest_framework.viewsets import ModelViewSet, ReadOnlyModelViewSet
 from rest_framework.response import Response
 from rest_framework.decorators import action
 from rest_framework.filters import SearchFilter
+from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework import status
 from .models import Inventory, InventoryItem
 from .serializers import AvailableProductSerializer, InventoryItemCreateSerializer, InventoryItemSerializer, InventoryItemUpdateSerializer, InventorySerializer
@@ -23,7 +24,11 @@ class InventoryViewSet(ModelViewSet):
 
 class InventoryItemsViewSet(ModelViewSet):
 
-    filter_backends = [SearchFilter]
+    filter_backends = [SearchFilter, DjangoFilterBackend]
+    filterset_fields = [
+        'inventory__id', 'location__name', 'product__name', 'track_code',
+        'product__name'
+    ]
     search_fields = [
         'id', 'location__name', 'product__name', 'track_code', 'unit_cost', 'unit_price'
     ]

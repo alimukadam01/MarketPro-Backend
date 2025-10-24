@@ -5,6 +5,7 @@ from rest_framework.viewsets import ModelViewSet
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.filters import SearchFilter
+from django_filters.rest_framework import DjangoFilterBackend
 
 from root.utils import get_active_business
 from .models import PurchaseInvoice, PurchaseInvoiceItem, SalesInvoice, SalesInvoiceItem
@@ -37,7 +38,8 @@ from .serializers import (
 
 class PurchaseInvoiceViewSet(ModelViewSet):
 
-    filter_backends = [SearchFilter]
+    filter_backends = [SearchFilter, DjangoFilterBackend]
+    filterset_fields = ['supplier__name', 'status', 'payment_status', 'sub_total', 'total', 'goods_received']
     search_fields = [
         'id', 'invoice_number', 'supplier__name', 'status', 'payment_status',
         'sub_total', 'total', 'amount_paid', 'goods_received', 'delivery', 'notes'
@@ -257,7 +259,11 @@ class PurchaseInvoiceViewSet(ModelViewSet):
 
 class PurchaseInvoiceItemViewSet(ModelViewSet):
 
-    filter_backends = [SearchFilter]
+    filter_backends = [SearchFilter, DjangoFilterBackend]
+    filterset_fields = [
+        'purchase_invoice__id', 'purchase_invoice__invoice_number', 'is_restocked', 'is_partially_restocked'
+        'product__name', 'track_code', 'unit_cost', 'quantity_received',
+    ]
     search_fields = [
         'id', 'purchase_invoice__id', 'purchase_invoice__invoice_number', 'product__name', 
         'track_code', 'notes', 'unit_cost', 'quantity_received'
@@ -294,7 +300,8 @@ class PurchaseInvoiceItemViewSet(ModelViewSet):
 
 class SalesInvoiceViewSet(ModelViewSet):
 
-    filter_backends = [SearchFilter]
+    filter_backends = [SearchFilter, DjangoFilterBackend]
+    filterset_fields = ['customer__name', 'status', 'payment_status', 'sub_total', 'total', 'is_deducted', 'is_partially_deducted']
     search_fields = [
         'id', 'invoice_number', 'customer__name', 'status', 'payment_status', 'sub_total', 'total', 'discount', 'tax', 'notes', 'created_by__email'
     ]
@@ -422,7 +429,11 @@ class SalesInvoiceViewSet(ModelViewSet):
 
 class SalesInvoiceItemViewSet(ModelViewSet):
 
-    filter_backends = [SearchFilter]
+    filter_backends = [SearchFilter, DjangoFilterBackend]
+    filterset_fields = [
+        'sales_invoice__id', 'sales_invoice__invoice_number', 'is_deducted', 'is_partially_deducted',
+        'product__name', 'track_code', 'unit_price', 'quantity_received'
+    ]
     search_fields = [
        'id', 'sales_invoice__id', 'sales_invoice__invoice_number', 'product__name', 'track_code', 'quantity_received', 'unit_price', 'discount'
     ]

@@ -3,6 +3,7 @@ from rest_framework.viewsets import ReadOnlyModelViewSet, ModelViewSet
 from rest_framework.response import Response
 from rest_framework.decorators import action
 from rest_framework.filters import SearchFilter
+from django_filters.rest_framework import DjangoFilterBackend
 
 from .utils import get_active_business
 from .serializers import (
@@ -90,7 +91,8 @@ class BusinessViewSet(ModelViewSet):
 
 class ProductViewSet(ModelViewSet):
 
-    filter_backends = [SearchFilter]
+    filter_backends = [SearchFilter, DjangoFilterBackend]
+    filterset_fields = ['unit_name', 'is_active']
     search_fields = [
        'id', 'name', 'desc', 'unit__name' 
     ]
@@ -165,6 +167,12 @@ class LocationViewSet(ModelViewSet):
     
 
 class CustomerViewSet(ModelViewSet):
+
+    filter_backends = [SearchFilter, DjangoFilterBackend]
+    filterset_fields = ['customer__name', 'city__name']
+    search_fields = [
+       'id', 'name', 'phone', 'email', 'address', 'city__name' 
+    ]
 
     def get_queryset(self):
         business = get_active_business(self.request)

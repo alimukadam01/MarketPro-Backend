@@ -150,7 +150,7 @@ class SalesInvoice(models.Model):
 
     def map_to_products(self) -> Dict[int, 'SalesInvoiceItem']:
         return {item.product_id: item for item in self.invoice_items.all()}
-    
+
 
 class SalesInvoiceItem(BaseItem):
     sales_invoice = models.ForeignKey(SalesInvoice, models.CASCADE, related_name='invoice_items')
@@ -283,7 +283,7 @@ class PurchaseInvoice(models.Model):
             self.is_restocked = True
             self.status = 'R'
             
-                
+
 class PurchaseInvoiceItem(BaseItem):
     purchase_invoice = models.ForeignKey(PurchaseInvoice, models.CASCADE, related_name='invoice_items')
     unit_cost = models.FloatField()

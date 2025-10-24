@@ -53,6 +53,7 @@ class InventoryItem(BaseItem):
     class Meta:
         unique_together = [('inventory', 'product')]
 
+
 class InventoryItemHistory(InventoryItem):
     version_no = models.IntegerField()
     item = models.ForeignKey(InventoryItem, models.CASCADE, related_name='history')
