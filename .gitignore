@@ -17,10 +17,9 @@ venv.bak/
 *.pyc
 *.pyo
 *.db
-*.sqlite3
 *.sqlite3-journal
 local_settings.py
-db.sqlite3
+
 
 # If you're using PostgreSQL/MySQL dumps
 *.dump
