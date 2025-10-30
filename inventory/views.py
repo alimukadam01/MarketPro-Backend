@@ -27,7 +27,6 @@ class InventoryItemsViewSet(ModelViewSet):
     filter_backends = [SearchFilter, DjangoFilterBackend]
     filterset_fields = [
         'inventory__id', 'location__name', 'product__name', 'track_code',
-        'product__name'
     ]
     search_fields = [
         'id', 'location__name', 'product__name', 'track_code', 'unit_cost', 'unit_price'
