@@ -92,7 +92,7 @@ class BusinessViewSet(ModelViewSet):
 class ProductViewSet(ModelViewSet):
 
     filter_backends = [SearchFilter, DjangoFilterBackend]
-    filterset_fields = ['unit_name', 'is_active']
+    filterset_fields = ['unit__name', 'is_active']
     search_fields = [
        'id', 'name', 'desc', 'unit__name' 
     ]
@@ -169,7 +169,7 @@ class LocationViewSet(ModelViewSet):
 class CustomerViewSet(ModelViewSet):
 
     filter_backends = [SearchFilter, DjangoFilterBackend]
-    filterset_fields = ['customer__name', 'city__name']
+    filterset_fields = ['name', 'city__name']
     search_fields = [
        'id', 'name', 'phone', 'email', 'address', 'city__name' 
     ]

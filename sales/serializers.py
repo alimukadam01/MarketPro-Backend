@@ -8,7 +8,7 @@ from root.serializers import (
     SupplierSerializer, BaseItemSerializer
 )
 from inventory.models import InventoryItem
-from .models import PurchaseInvoice, PurchaseInvoiceItem, SalesInvoice, SalesInvoiceItem
+from .models import PurchaseInvoice, PurchaseInvoiceItem, SalesInvoice, SalesInvoiceItem, ReturnedItem
 from .utils import (
     checkPurchaseInvoiceItemFields, 
     checkPurchaseInvoiceCreateFields,
@@ -307,7 +307,7 @@ class SalesInvoiceItemSerializer(serializers.ModelSerializer):
         model = SalesInvoiceItem
         fields = [
             'id', 'sales_invoice', 'product', 'unit_price', 'quantity', 'quantity_received', 'track_code', 
-            'notes', 'quantity_received', 'is_deducted', 'is_partially_deducted'
+            'notes', 'quantity_received', 'is_deducted', 'is_partially_deducted', 'is_returned'
         ]
 
     def update(self, instance, validated_data):
@@ -327,7 +327,7 @@ class SimpleSalesInvoiceItemSerializer(serializers.ModelSerializer):
         model = SalesInvoiceItem
         fields = [
             'id', 'sales_invoice', 'product', 'unit_price', 'quantity', 
-            'quantity_received', 'discount', 'is_deducted', 'is_partially_deducted'    
+            'quantity_received', 'discount', 'is_deducted', 'is_partially_deducted', 'is_returned'
         ]
 
 
@@ -634,3 +634,27 @@ class SalesInvoiceAndItemsUpdateSerializer(serializers.ModelSerializer):
             'items'
         ]
 
+
+class ReturnedItemSerializer(serializers.ModelSerializer):
+
+    invoice_item = SimpleSalesInvoiceItemSerializer(read_only=True)
+
+    class Meta:
+        model = ReturnedItem
+        fields = [
+            'id', 'invoice_item', 'reason', 'quantity', 'created_at', 'updated_at'
+        ]
+
+
+class ReturnedItemCreateSerializer(serializers.ModelSerializer):
+
+    class Meta:
+        model = ReturnedItem
+        fields = ['quantity', 'reason']
+
+    def create(self, validated_data):
+        return ReturnedItem.objects.create(
+            business_id = self.context['business_id'],
+            invoice_item_id = self.context['invoice_item_id'],
+            **validated_data
+        )

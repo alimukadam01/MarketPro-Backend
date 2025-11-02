@@ -8,7 +8,7 @@ from rest_framework.filters import SearchFilter
 from django_filters.rest_framework import DjangoFilterBackend
 
 from root.utils import get_active_business
-from .models import PurchaseInvoice, PurchaseInvoiceItem, SalesInvoice, SalesInvoiceItem
+from .models import PurchaseInvoice, PurchaseInvoiceItem, ReturnedItem, SalesInvoice, SalesInvoiceItem
 from .serializers import (
     PurchaseInvoiceAndItemsCreateSerializer,
     PurchaseInvoiceAndItemsUpdateSerializer,
@@ -19,12 +19,14 @@ from .serializers import (
     PurchaseInvoiceUpdateSerializer,
     PurchaseInvoiceSerializer,
     RestockSerializer,
+    ReturnedItemCreateSerializer,
     SalesInvoiceAndItemsCreateSerializer,
     SalesInvoiceAndItemsUpdateSerializer,
     SalesInvoiceCreateSerializer,
     SalesInvoiceItemCreateSerializer,
     SalesInvoiceItemSerializer,
     SalesInvoiceItemUpdateSerializer,
+    ReturnedItemSerializer,
     SalesInvoiceSerializer,
     SalesInvoiceUpdateSerializer,
     SimplePurchaseInvoiceItemSerializer,
@@ -448,6 +450,9 @@ class SalesInvoiceItemViewSet(ModelViewSet):
     def get_serializer_class(self):
         method = self.request.method
 
+        if self.action == 'return_item':
+            return ReturnedItemCreateSerializer
+
         if self.action == 'list':
             return SimpleSalesInvoiceItemSerializer
 
@@ -456,6 +461,7 @@ class SalesInvoiceItemViewSet(ModelViewSet):
 
         if method in ('PUT', 'PATCH'):
             return SalesInvoiceItemUpdateSerializer
+        
 
         return SalesInvoiceItemSerializer
 
@@ -468,4 +474,61 @@ class SalesInvoiceItemViewSet(ModelViewSet):
             'business_id': business.id,
             'sales_invoice_id': self.kwargs['sales_invoice_pk'],
             'inventory_id': business.inventory_glance.id
+        }
+
+    @action(['POST'], detail=True, url_path='return', url_name='return')
+    def return_item(self, request, pk=None, sales_invoice_pk=None):
+        if request.method == 'POST':
+            business = get_active_business(self.request)
+            if not business:
+                return Response({
+                    'detail': 'Not Found.'
+                }, status=status.HTTP_404_NOT_FOUND)
+
+            serializer = ReturnedItemCreateSerializer(data=request.data, context={
+                'business_id': business.id,
+                'invoice_item_id': self.kwargs['pk']
+            })
+
+            try:
+                serializer.is_valid(raise_exception=True)
+                returned_item = serializer.save()
+
+                if not returned_item:
+                    return Response({
+                        'detail': 'Bad Request.'
+                    }, status=status.HTTP_400_BAD_REQUEST)
+
+                return Response({
+                    'detail': 'OK'
+                }, status=status.HTTP_200_OK)
+
+            except Exception as error:
+                print(error)
+                return Response({
+                    'detail': 'Internal Server Error'
+                }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+class ReturnedItemsViewSet(ModelViewSet):
+
+    def get_queryset(self):
+        business = get_active_business(self.request)
+        if not business:
+            return []
+
+        return ReturnedItem.objects.filter(business_id=business.id)
+    
+    def get_serializer_class(self):
+        if self.request.method == 'POST':
+            return ReturnedItemCreateSerializer
+        
+        return ReturnedItemSerializer
+    
+    def get_serializer_context(self):
+        business = get_active_business(self.request)
+        if not business:
+            return {}
+        return {
+            'business_id': business.id
         }

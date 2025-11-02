@@ -1,8 +1,8 @@
-from django.db.models.signals import pre_save ,post_save, post_delete
+from django.db.models.signals import pre_save, post_save, post_delete
 from django.dispatch import receiver
 
 from root.utils import generateTransactionId
-from .models import PurchaseInvoice, PurchaseInvoiceItem, SalesInvoice, SalesInvoiceItem
+from .models import PurchaseInvoice, PurchaseInvoiceItem, SalesInvoice, SalesInvoiceItem, ReturnedItem
 from .utils import (
     getRestockField, update_inventory, spiltNewAndOldProducts, 
     logRestockEvent, createInventoryItemFromRestock
@@ -85,3 +85,17 @@ def updateInventoryOnSale(sender, instance: SalesInvoice, **kwargs):
                 item.update_restock_flags()
 
         instance.update_deduction_flags()
+
+
+@receiver(post_save, sender=ReturnedItem)
+def mark_item_as_returned(sender, instance: ReturnedItem, created, **kwargs):
+    if created:
+        invoice_item = instance.invoice_item
+        invoice_item.is_returned = True
+        invoice_item.save(update_fields=['is_returned'])
+
+
+@receiver(post_delete, sender=ReturnedItem)
+def unmark_item_as_returned(sender, instance, **kwargs):
+    instance.invoice_item.is_returned = False
+    instance.invoice_item.save(update_fields=['is_returned'])

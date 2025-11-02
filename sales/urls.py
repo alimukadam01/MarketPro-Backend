@@ -1,9 +1,16 @@
 from rest_framework_nested.routers import NestedDefaultRouter, DefaultRouter
-from .views import PurchaseInvoiceItemViewSet, PurchaseInvoiceViewSet, SalesInvoiceItemViewSet, SalesInvoiceViewSet
+from .views import (
+    PurchaseInvoiceItemViewSet, 
+    PurchaseInvoiceViewSet, 
+    SalesInvoiceItemViewSet, 
+    SalesInvoiceViewSet,
+    ReturnedItemsViewSet
+)
 
 router = DefaultRouter()
 router.register('purchase-invoices', PurchaseInvoiceViewSet, basename='purchase_invoices')
 router.register('sales-invoices', SalesInvoiceViewSet, basename='sales_invoices')
+router.register('returned-items', ReturnedItemsViewSet, basename='returned_items')
 
 purchase_invoice_router = NestedDefaultRouter(router, 'purchase-invoices', lookup='purchase_invoice')
 purchase_invoice_router.register('items', PurchaseInvoiceItemViewSet, basename='purchase_invoice_items')

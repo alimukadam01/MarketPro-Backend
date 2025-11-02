@@ -164,6 +164,7 @@ class SalesInvoiceItem(BaseItem):
     quantity_received = models.IntegerField(null=True, blank=True)
     is_deducted = models.BooleanField(default=False)
     is_partially_deducted = models.BooleanField(default=False)
+    is_returned = models.BooleanField(default=False)
     
     def compute_restock_delta(self) -> int:
         """
@@ -172,9 +173,6 @@ class SalesInvoiceItem(BaseItem):
         agg = self.restocks.aggregate(total=models.Sum('quantity'))
         prev = agg.get('total') or 0
         return getattr(self, 'quantity_received') - prev
-
-    class Meta:                  
-        unique_together = [('sales_invoice', 'product')]
 
     def update_restock_flags(self):
         """
@@ -185,6 +183,9 @@ class SalesInvoiceItem(BaseItem):
         self.is_deducted = full
         self.is_partially_deducted = not full
         self.save(update_fields=['is_deducted', 'is_partially_deducted'])
+
+    class Meta:                  
+        unique_together = [('sales_invoice', 'product')]
 
 
 class PurchaseInvoice(models.Model):
@@ -424,4 +425,20 @@ class PurchaseQuotationSupplier(models.Model):
     #Master Account Functionality
     #Folders
     #Financial Reports
-    
+
+
+class ReturnedItem(models.Model):
+    business = models.ForeignKey(Business, on_delete=models.CASCADE, related_name='returned_items')
+    invoice_item = models.OneToOneField(
+        SalesInvoiceItem,
+        on_delete=models.CASCADE,
+        related_name='returned_item',
+    )
+    reason = models.TextField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    quantity = models.IntegerField(null=True, blank=True)
+
+    def __str__(self):
+        return f"Return for {self.invoice_item.product.name} from Invoice {self.invoice_item.sales_invoice.invoice_number}"
+
