@@ -127,7 +127,6 @@ class ProductSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'business', 'name', 'desc', 
             'unit', 'created_at', 'updated_at',
-            'image'
         ]
 
 
@@ -135,7 +134,7 @@ class SimpleProductSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Product
-        fields = ['id', 'name', 'unit', 'image', 'desc']
+        fields = ['id', 'name', 'unit', 'desc']
 
 
 class ProductCreateUpdateSerializer(serializers.ModelSerializer):
@@ -145,7 +144,6 @@ class ProductCreateUpdateSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'name', 'desc', 
             'unit', 'created_at', 'updated_at',
-            'image'
         ]
 
     def create(self, validated_data):

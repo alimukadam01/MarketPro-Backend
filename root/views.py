@@ -121,6 +121,27 @@ class ProductViewSet(ModelViewSet):
             "business_id": business.id
         }
 
+    @action(['POST'], detail=False, url_path='bulk-delete', url_name='bulk-delete')
+    def bulk_delete(self, request):
+
+        product_ids = request.data.get('product_ids', [])
+        if not product_ids:
+            return Response({
+                'detail': 'Bad Request.'
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            Product.objects.filter(id__in=product_ids).delete()
+            return Response({
+                'detail': 'Success.'
+            }, status=status.HTTP_200_OK)
+
+        except Exception as error:
+            print(error)
+            return Response({
+                'detail': 'Internal Server Error.'
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
 
 class SupplierViewSet(ModelViewSet):
 
