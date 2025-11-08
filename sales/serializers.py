@@ -435,6 +435,8 @@ class SalesInvoiceUpdateSerializer(serializers.ModelSerializer):
         self.instance.save()
         return self.instance
 
+class CompleteSalesInvoiceItemSerializer(SimpleSalesInvoiceItemSerializer):
+    sales_invoice = SimpleSalesInvoiceSerializer()
 
 class RestockSerializer(serializers.Serializer):
 
@@ -637,7 +639,7 @@ class SalesInvoiceAndItemsUpdateSerializer(serializers.ModelSerializer):
 
 class ReturnedItemSerializer(serializers.ModelSerializer):
 
-    invoice_item = SimpleSalesInvoiceItemSerializer(read_only=True)
+    invoice_item = CompleteSalesInvoiceItemSerializer(read_only=True)
 
     class Meta:
         model = ReturnedItem

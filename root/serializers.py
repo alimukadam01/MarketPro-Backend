@@ -86,6 +86,8 @@ class CustomerSerializer(serializers.ModelSerializer):
 
 class SimpleCustomerSerializer(serializers.ModelSerializer):
 
+    city = CitySerializer()
+
     class Meta:
         model = Customer
         fields =  [
@@ -95,6 +97,8 @@ class SimpleCustomerSerializer(serializers.ModelSerializer):
 
 
 class LocationSerializer(serializers.ModelSerializer):
+
+    business = serializers.PrimaryKeyRelatedField(read_only=True)
 
     class Meta:
         model = Location

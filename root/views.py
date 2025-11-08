@@ -145,6 +145,11 @@ class ProductViewSet(ModelViewSet):
 
 class SupplierViewSet(ModelViewSet):
 
+    filter_backends = [SearchFilter]
+    search_fields = [
+       'id', 'name', 'business_name', 'phone', 'email', 'notes' 
+    ]
+
     serializer_class = SupplierSerializer
 
     def get_queryset(self):
@@ -163,8 +168,34 @@ class SupplierViewSet(ModelViewSet):
             'business_id': business.id,
         }
     
+    @action(['POST'], detail=False, url_path='bulk-delete', url_name='bulk-delete')
+    def bulk_delete(self, request):
+        
+        supplier_ids = request.data.get('supplier_ids', [])
+        if not supplier_ids:
+            return Response({
+                'detail': 'Bad Request.'
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            Supplier.objects.filter(id__in=supplier_ids).delete()
+            return Response({
+                'detail': 'Success.'
+            }, status=status.HTTP_200_OK)
+
+        except Exception as error:
+            print(error)
+            return Response({
+                'detail': 'Internal Server Error.'
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    
 
 class LocationViewSet(ModelViewSet):
+
+    filter_backends = [SearchFilter]
+    search_fields = [
+       'id', 'name', 'address'
+    ]
 
     serializer_class = LocationSerializer
 
@@ -186,11 +217,32 @@ class LocationViewSet(ModelViewSet):
             'business_id': business.id
         }
     
+    @action(['POST'], detail=False, url_path='bulk-delete', url_name='bulk-delete')
+    def bulk_delete(self, request):
+        
+        location_ids = request.data.get('location_ids', [])
+        if not location_ids:
+            return Response({
+                'detail': 'Bad Request.'
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            Location.objects.filter(id__in=location_ids).delete()
+            return Response({
+                'detail': 'Success.'
+            }, status=status.HTTP_200_OK)
+
+        except Exception as error:
+            print(error)
+            return Response({
+                'detail': 'Internal Server Error.'
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    
 
 class CustomerViewSet(ModelViewSet):
 
     filter_backends = [SearchFilter, DjangoFilterBackend]
-    filterset_fields = ['name', 'city__name']
+    filterset_fields = ['city__name']
     search_fields = [
        'id', 'name', 'phone', 'email', 'address', 'city__name' 
     ]
@@ -215,5 +267,26 @@ class CustomerViewSet(ModelViewSet):
         return {
             'business_id': business.id
         }
+    
+    @action(['POST'], detail=False, url_path='bulk-delete', url_name='bulk-delete')
+    def bulk_delete(self, request):
+
+        customer_ids = request.data.get('customer_ids', [])
+        if not customer_ids:
+            return Response({
+                'detail': 'Bad Request.'
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            Customer.objects.filter(id__in=customer_ids).delete()
+            return Response({
+                'detail': 'Success.'
+            }, status=status.HTTP_200_OK)
+
+        except Exception as error:
+            print(error)
+            return Response({
+                'detail': 'Internal Server Error.'
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
     
     

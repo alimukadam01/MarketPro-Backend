@@ -512,6 +512,14 @@ class SalesInvoiceItemViewSet(ModelViewSet):
 
 class ReturnedItemsViewSet(ModelViewSet):
 
+    filter_backends = [SearchFilter, DjangoFilterBackend]
+    filterset_fields = [
+        'invoice_item__sales_invoice__id', 'invoice_item__product__name', 'quantity'
+    ]
+    search_fields = [
+       'id', 'invoice_item__sales_invoice__id', 'invoice_item__product__name'
+    ]
+
     def get_queryset(self):
         business = get_active_business(self.request)
         if not business:
@@ -532,3 +540,23 @@ class ReturnedItemsViewSet(ModelViewSet):
         return {
             'business_id': business.id
         }
+    
+    @action(['POST'], detail=False, url_path='bulk-delete', url_name='bulk-delete')
+    def bulk_delete(self, request):
+        returned_item_ids = request.data.get('returned_item_ids', [])
+        if not returned_item_ids:
+            return Response({
+                'detail': 'Bad Request.'
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            ReturnedItem.objects.filter(id__in=returned_item_ids).delete()
+            return Response({
+                'detail': 'Success.'
+            }, status=status.HTTP_200_OK)
+
+        except Exception as error:
+            print(error)
+            return Response({
+                'detail': 'Internal Server Error.'
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
