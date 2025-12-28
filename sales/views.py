@@ -1,7 +1,7 @@
 from django.db import transaction
 
 from rest_framework import status
-from rest_framework.viewsets import ModelViewSet
+from rest_framework.viewsets import ModelViewSet, ViewSet
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.filters import SearchFilter
@@ -19,7 +19,7 @@ from .serializers import (
     PurchaseInvoiceUpdateSerializer,
     PurchaseInvoiceSerializer,
     RestockSerializer,
-    ReturnedItemCreateSerializer,
+    ReturnedItemCreateUpdateSerializer,
     SalesInvoiceAndItemsCreateSerializer,
     SalesInvoiceAndItemsUpdateSerializer,
     SalesInvoiceCreateSerializer,
@@ -134,14 +134,14 @@ class PurchaseInvoiceViewSet(ModelViewSet):
                     'user_id': self.request.user.id,
                 })
                 serializer.is_valid(raise_exception=True)
-                sales_invoice = serializer.save()
+                purchase_invoice = serializer.save()
 
-                if not sales_invoice:
+                if not purchase_invoice:
                     return Response({
                         'detail': 'Bad Request.'
                     }, status=status.HTTP_400_BAD_REQUEST)
 
-                res_serializer = PurchaseInvoiceSerializer(sales_invoice)
+                res_serializer = PurchaseInvoiceSerializer(purchase_invoice)
                 return Response(res_serializer.data, status=status.HTTP_201_CREATED)
 
             except Exception as error:
@@ -451,7 +451,7 @@ class SalesInvoiceItemViewSet(ModelViewSet):
         method = self.request.method
 
         if self.action == 'return_item':
-            return ReturnedItemCreateSerializer
+            return ReturnedItemCreateUpdateSerializer
 
         if self.action == 'list':
             return SimpleSalesInvoiceItemSerializer
@@ -485,7 +485,7 @@ class SalesInvoiceItemViewSet(ModelViewSet):
                     'detail': 'Not Found.'
                 }, status=status.HTTP_404_NOT_FOUND)
 
-            serializer = ReturnedItemCreateSerializer(data=request.data, context={
+            serializer = ReturnedItemCreateUpdateSerializer(data=request.data, context={
                 'business_id': business.id,
                 'invoice_item_id': self.kwargs['pk']
             })
@@ -528,9 +528,8 @@ class ReturnedItemsViewSet(ModelViewSet):
         return ReturnedItem.objects.filter(business_id=business.id)
     
     def get_serializer_class(self):
-        if self.request.method == 'POST':
-            return ReturnedItemCreateSerializer
-        
+        if self.request.method in ('POST', 'PUT', 'PATCH'):
+            return ReturnedItemCreateUpdateSerializer
         return ReturnedItemSerializer
     
     def get_serializer_context(self):

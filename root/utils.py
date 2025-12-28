@@ -1,4 +1,4 @@
-from django.db.models import Model
+from django.db.models import Q, Model
 from .models import Business
 from datetime import datetime
 from django.apps import apps
@@ -38,3 +38,26 @@ def generateTransactionId(instance: Model):
         parts.append(str(quantity))
 
     return "-".join(parts)
+
+def build_search_q(fields, query):
+    """
+    Build an OR Q() object for all provided fields using icontains.
+    `fields` is an iterable of field names (strings).
+    """
+    q = Q()
+    for field in fields:
+        q |= Q(**{f"{field}__icontains": query})
+    return q
+
+def serialize_queryset(qs, serializer_class, result_type, many=True, limit=None):
+    """
+    Serialize queryset (optionally slice it), and attach a `type` field to each item.
+    Returns a list of dicts.
+    """
+    if limit:
+        qs = qs[:limit]
+    serialized = serializer_class(qs, many=many).data
+    # attach type to each result
+    for item in serialized:
+        item["type"] = result_type
+    return serialized

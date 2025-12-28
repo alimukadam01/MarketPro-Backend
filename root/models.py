@@ -1,7 +1,18 @@
 from django.db import models
+from datetime import datetime, timedelta
 from django.conf import settings
 
 # Create your models here.
+
+class BaseQuerySet(models.QuerySet):
+
+    def for_business(self, business_id):
+        return self.filter(business_id=business_id)
+
+    def in_period(self, days):
+        start = datetime.today() - timedelta(days=days)
+        return self.filter(created_at__gte = start)
+
 
 class City(models.Model):
 
@@ -46,6 +57,14 @@ class Business(models.Model):
 
     def __str__(self):
         return f"{ self.name }"
+
+
+class BusinessConfig(models.Model):
+    user = models.OneToOneField(settings.AUTH_USER_MODEL, models.CASCADE, related_name='business_config')
+    is_sales_enabled = models.BooleanField(default=True)
+    is_purchases_enabled = models.BooleanField(default=True)
+    is_projects_enabled = models.BooleanField(default=False)
+    is_inventory_enabled = models.BooleanField(default=True)
 
 
 class Customer(models.Model):

@@ -18,8 +18,8 @@ def updateTotalsAfterSalesInvoiceItem(sender, instance, **kwargs):
 
 
 ### automatically update inventory  
-@receiver(pre_save, sender=PurchaseInvoice)
-def updateInventoryOnRestock(sender, instance: PurchaseInvoice, **kwargs):
+@receiver(post_save, sender=PurchaseInvoice)
+def updateInventoryOnPurchase(sender, instance: PurchaseInvoice, **kwargs):
     if instance.is_restocked: return
 
     if instance.status in ('R', 'PR'):
@@ -61,7 +61,7 @@ def updateTotalsAfterPurchaseInvoiceItem(sender, instance, **kwargs):
 
 ### Create delete signal
 
-@receiver(pre_save, sender=SalesInvoice)
+@receiver(post_save, sender=SalesInvoice)
 def updateInventoryOnSale(sender, instance: SalesInvoice, **kwargs):
     if instance.is_deducted: return
 
@@ -84,6 +84,7 @@ def updateInventoryOnSale(sender, instance: SalesInvoice, **kwargs):
                 logRestockEvent(item, delta, instance)
                 item.update_restock_flags()
 
+        ### Fix logic here
         instance.update_deduction_flags()
 
 
@@ -91,6 +92,14 @@ def updateInventoryOnSale(sender, instance: SalesInvoice, **kwargs):
 def mark_item_as_returned(sender, instance: ReturnedItem, created, **kwargs):
     if created:
         invoice_item = instance.invoice_item
+        
+        '''
+        if instance.quantity < instance.invoice_item.quantity:
+            invoice_item.is_partially_returned = True
+            invoice_item.save(update_fields=['is_partially_returned'])
+            return
+        '''
+        
         invoice_item.is_returned = True
         invoice_item.save(update_fields=['is_returned'])
 

@@ -177,8 +177,6 @@ class PurchaseInvoiceAndItemsCreateSerializer(serializers.ModelSerializer):
     def save(self, **kwargs):
         items = self.validated_data.pop('items')
 
-        print()
-
         try:
             with transaction.atomic():
                 purchase_invoice = PurchaseInvoice.objects.create(
@@ -435,8 +433,10 @@ class SalesInvoiceUpdateSerializer(serializers.ModelSerializer):
         self.instance.save()
         return self.instance
 
+
 class CompleteSalesInvoiceItemSerializer(SimpleSalesInvoiceItemSerializer):
     sales_invoice = SimpleSalesInvoiceSerializer()
+
 
 class RestockSerializer(serializers.Serializer):
 
@@ -518,18 +518,20 @@ class SalesInvoiceAndItemsCreateSerializer(serializers.ModelSerializer):
                     created_by_id = self.context['user_id'],
                     **self.validated_data
                 )
-
             
                 invoice_items = [SalesInvoiceItem(
                     business_id = self.context['business_id'],
                     sales_invoice_id = sales_invoice.id,
                     product_id = item['product_id'],
                     quantity = item['quantity'],
+                    quantity_received = item['quantity'],
                     unit_price = item['unit_price']
                 ) for item in items]
                 invoice_items = SalesInvoiceItem.objects.bulk_create(invoice_items)
+            
+            sales_invoice.refresh_from_db()
             sales_invoice.adjust_totals()
-            updateInventoryOnSale(sales_invoice)
+            updateInventoryOnSale(sales_invoice) ### No need to call this, it's called in adjust_totals.
             return sales_invoice
         
         except Exception as error:
@@ -564,7 +566,6 @@ class SalesInvoiceAndItemsUpdateSerializer(serializers.ModelSerializer):
             # with transaction.atomic():
             for attr, value in self.validated_data.items():
                 setattr(self.instance, attr, value)
-
             self.instance.save()
 
             existing_items = SalesInvoiceItem.objects.filter(
@@ -609,10 +610,11 @@ class SalesInvoiceAndItemsUpdateSerializer(serializers.ModelSerializer):
                 ])
 
             updated_ids = [item.id for item in updated_items]
-            existing_items = existing_items.exclude(id__in=updated_ids)
+            new_ids = [item.id for item in new_items]
+            existing_items = existing_items.exclude(id__in=updated_ids+new_ids,)
             existing_items.delete()
             
-            print(new_items)
+            self.instance.refresh_from_db()
             self.instance.adjust_totals()
             updateInventoryOnSale(self.instance)
             return self.instance
@@ -648,11 +650,13 @@ class ReturnedItemSerializer(serializers.ModelSerializer):
         ]
 
 
-class ReturnedItemCreateSerializer(serializers.ModelSerializer):
+class ReturnedItemCreateUpdateSerializer(serializers.ModelSerializer):
+
+    invoice_item = SimpleSalesInvoiceItemSerializer(read_only=True)
 
     class Meta:
         model = ReturnedItem
-        fields = ['quantity', 'reason']
+        fields = ['id', 'invoice_item', 'reason']
 
     def create(self, validated_data):
         return ReturnedItem.objects.create(
@@ -660,3 +664,17 @@ class ReturnedItemCreateSerializer(serializers.ModelSerializer):
             invoice_item_id = self.context['invoice_item_id'],
             **validated_data
         )
+    
+    def update(self, instance, validated_data):
+        for attr, value in validated_data.items():
+            setattr(instance, attr, value)
+
+        instance.save()
+        return instance
+    
+
+class RecentSalesSerializer(serializers.ModelSerializer):
+
+    class Meta:
+        model = SalesInvoice
+        fields = ['id', 'product_name']

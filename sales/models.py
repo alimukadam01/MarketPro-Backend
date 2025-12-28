@@ -1,16 +1,25 @@
 from typing import Dict
+from datetime import datetime, timedelta
 from django.db import models
+from django.db.models import Sum
 from django.core.exceptions import ValidationError
 from django.conf import settings
 from root.utils import generateTransactionId
-from root.models import Business, Customer, BaseItem, Supplier, Location
+from root.models import Business, BusinessConfig, Customer, BaseItem, Supplier, Location, BaseQuerySet
 
 
 # Create your models here.
 
+class SalesConfig(models.Model):
+    business_config = models.OneToOneField(BusinessConfig, on_delete=models.CASCADE, related_name="sales_config")
+    on_sale_auto_update_inventory = models.BooleanField(default=True)
+    on_purchase_auto_update_inventory = models.BooleanField(default=True)
+    is_returned_items_enabled = models.BooleanField(default=False)
+
+
 class BaseRestock(models.Model):
 
-    quantity = models.PositiveIntegerField()
+    quantity = models.PositiveIntegerField(default=0)
     received_at = models.DateField(null=True, blank=True)
     notes = models.TextField(null=True, blank=True)  # Optional link to external txn
 
@@ -20,6 +29,25 @@ class BaseRestock(models.Model):
     class Meta:
         abstract = True
         ordering = ['-created_at']
+
+
+class SalesInvoiceQuerySet(BaseQuerySet):
+
+    pass
+
+
+class SalesInvoiceManager(models.Manager):
+    
+    def get_queryset(self):
+        return SalesInvoiceQuerySet(self.model)
+    
+    def total_sales(self, business_id, num_days=None):
+        queryset = self.get_queryset().for_business(business_id)
+
+        if num_days:
+            queryset = queryset.in_period(num_days)
+
+        return queryset.aggregate(total=Sum("total"))["total"] or 0
 
 
 class SalesInvoice(models.Model):
@@ -41,7 +69,7 @@ class SalesInvoice(models.Model):
         ("C", "CANCELLED"),
     ]
 
-    invoice_number = models.CharField(max_length=256)
+    invoice_number = models.CharField(max_length=256, null=True, blank=True)
     business = models.ForeignKey(Business, models.CASCADE)
     customer = models.ForeignKey(Customer, models.CASCADE, related_name='sale_invoices')
     date_issued = models.DateTimeField(auto_now_add=True)
@@ -67,6 +95,8 @@ class SalesInvoice(models.Model):
     notes = models.TextField(null=True, blank=True)
     is_deducted = models.BooleanField(default=False)
     is_partially_deducted = models.BooleanField(default=False)
+
+    objects = SalesInvoiceManager()
 
     def update_deduction_flags(self):
         items = self.invoice_items.all()
@@ -150,6 +180,14 @@ class SalesInvoice(models.Model):
 
     def map_to_products(self) -> Dict[int, 'SalesInvoiceItem']:
         return {item.product_id: item for item in self.invoice_items.all()}
+    
+    class Meta:
+        constraints = [
+            models.CheckConstraint(
+                check=~(models.Q(is_deducted=True) & models.Q(is_partially_deducted=True)),
+                name='is_deducted_and_is_partially_deducted_mutually_exclusive_si'
+            )
+        ]
 
 
 class SalesInvoiceItem(BaseItem):
@@ -161,10 +199,11 @@ class SalesInvoiceItem(BaseItem):
         default=dict,
         help_text='e.g., {"value": 10.0, "type": "percentage" or "amount"}'
     )
-    quantity_received = models.IntegerField(null=True, blank=True)
+    quantity_received = models.IntegerField(default=0)
     is_deducted = models.BooleanField(default=False)
     is_partially_deducted = models.BooleanField(default=False)
     is_returned = models.BooleanField(default=False)
+    is_partially_returned = models.BooleanField(default=False)
     
     def compute_restock_delta(self) -> int:
         """
@@ -172,7 +211,7 @@ class SalesInvoiceItem(BaseItem):
         """
         agg = self.restocks.aggregate(total=models.Sum('quantity'))
         prev = agg.get('total') or 0
-        return getattr(self, 'quantity_received') - prev
+        return getattr(self, 'quantity') - prev
 
     def update_restock_flags(self):
         """
@@ -186,6 +225,16 @@ class SalesInvoiceItem(BaseItem):
 
     class Meta:                  
         unique_together = [('sales_invoice', 'product')]
+        constraints = [
+            models.CheckConstraint(
+                check=~(models.Q(is_returned=True) & models.Q(is_partially_returned=True)),
+                name='is_returned_and_is_partially_returned_mutually_exclusive'
+            ),
+            models.CheckConstraint(
+                check=~(models.Q(is_deducted=True) & models.Q(is_partially_deducted=True)),
+                name='is_deducted_and_is_partially_deducted_mutually_exclusive_sii'
+            )
+        ]
 
 
 class PurchaseInvoice(models.Model):
@@ -270,8 +319,9 @@ class PurchaseInvoice(models.Model):
     def update_restock_flags(self):
 
         items = self.invoice_items.all()
-        restocked = 0
+        if len(items) == 0: return
 
+        restocked = 0
         for obj in items:
             if obj.is_partially_restocked:
                 self.is_partially_restocked = True
@@ -283,12 +333,20 @@ class PurchaseInvoice(models.Model):
             self.is_partially_restocked = False
             self.is_restocked = True
             self.status = 'R'
-            
+    
+    class Meta:
+        constraints = [
+            models.CheckConstraint(
+                check=~(models.Q(is_restocked=True) & models.Q(is_partially_restocked=True)),
+                name='is_restocked_and_is_partially_restocked_mutually_exclusive_pi'
+            )
+        ]
+
 
 class PurchaseInvoiceItem(BaseItem):
     purchase_invoice = models.ForeignKey(PurchaseInvoice, models.CASCADE, related_name='invoice_items')
     unit_cost = models.FloatField()
-    quantity_received = models.IntegerField(null=True, blank=True)
+    quantity_received = models.IntegerField(default=0)
     is_restocked = models.BooleanField(default=False)
     is_partially_restocked = models.BooleanField(default=False)
 
@@ -342,6 +400,12 @@ class PurchaseInvoiceItem(BaseItem):
 
     class Meta:
         unique_together = [('purchase_invoice', 'product')]
+        constraints = [
+            models.CheckConstraint(
+                check=~(models.Q(is_restocked=True) & models.Q(is_partially_restocked=True)),
+                name='is_restocked_and_is_partially_restocked_mutually_exclusive_pii'
+            )
+        ]
 
 
 class PurchaseInvoiceItemRestock(BaseRestock):
@@ -437,7 +501,7 @@ class ReturnedItem(models.Model):
     reason = models.TextField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
-    quantity = models.IntegerField(null=True, blank=True)
+    quantity = models.IntegerField(default=0)
 
     def __str__(self):
         return f"Return for {self.invoice_item.product.name} from Invoice {self.invoice_item.sales_invoice.invoice_number}"
