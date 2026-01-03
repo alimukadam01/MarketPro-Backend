@@ -1,5 +1,7 @@
 from django.db import models
-from datetime import datetime, timedelta
+from django.db.models.functions import TruncDate
+from calendar import monthrange
+from datetime import date, datetime, timedelta
 from django.conf import settings
 
 # Create your models here.
@@ -12,6 +14,51 @@ class BaseQuerySet(models.QuerySet):
     def in_period(self, days):
         start = datetime.today() - timedelta(days=days)
         return self.filter(created_at__gte = start)
+    
+    def monthly_trend(self, business_id, field):
+        today = date.today()
+        year = today.year
+        month = today.month
+
+        # 1. Get correct number of days in the month
+        _, days_in_month = monthrange(year, month)
+
+        # 2. Aggregate sales by date
+        qs = (
+            self
+            .for_business(business_id)
+            .filter(
+                created_at__year=year,
+                created_at__month=month
+            )
+            .annotate(day=TruncDate("created_at"))
+            .values("day")
+            .annotate(total=models.Sum(field))
+        )
+
+        # 3. Convert queryset to lookup map
+        sales_map = {
+            item["day"]: float(item["total"])
+            for item in qs
+        }
+
+        # 4. Build full month result
+        result = []
+
+        for day_num in range(1, days_in_month + 1):
+            current_date = date(year, month, day_num)
+
+            if current_date > today:
+                total_sales = 0.0
+            else:
+                total_sales = sales_map.get(current_date, 0.0)
+
+            result.append({
+                "day": current_date.isoformat(),
+                "value": total_sales
+            })
+
+        return result
 
 
 class City(models.Model):

@@ -1,10 +1,32 @@
 from django.db import models
 from django.conf import settings
 from root.utils import generateTransactionId
-from root.models import Business, BaseItem, Location
+from root.models import BaseQuerySet, Business, BaseItem, Location
 # from sales.utils import printObject
 
 # Create your models here.
+class InventoryQuerySet(BaseQuerySet):
+    
+    def get_items(self, id):
+        return self.get(id=id).items.all()
+
+
+class InventoryManager(models.Manager):
+
+    def get_queryset(self):
+        return InventoryQuerySet(self.model)
+    
+    def total_inventory_value(self, id):
+        
+        items = self.get_queryset().get_items(id)
+
+        total = 0
+        for item in items:
+            total += item.quantity * item.unit_cost
+
+        return total
+        
+
 
 class Inventory(models.Model):
     business = models.OneToOneField(Business, models.CASCADE, related_name='inventory_glance')
@@ -15,10 +37,12 @@ class Inventory(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
+    objects = InventoryManager()
+
     def __str__(self):
         return f"{self.business}"
-    
-    
+
+
 class InventoryItem(BaseItem):
     inventory = models.ForeignKey(Inventory, models.CASCADE, related_name='items')
     location = models.ForeignKey(

@@ -1,3 +1,4 @@
+from calendar import monthrange
 from rest_framework import status
 from rest_framework.views import APIView
 from rest_framework.viewsets import ReadOnlyModelViewSet, ModelViewSet, ViewSet
@@ -6,7 +7,7 @@ from rest_framework.decorators import action
 from rest_framework.filters import SearchFilter
 from django_filters.rest_framework import DjangoFilterBackend
 
-from inventory.models import InventoryItem
+from inventory.models import Inventory, InventoryItem
 from inventory.serializers import InventoryItemSerializer
 from sales.models import PurchaseInvoice, PurchaseInvoiceItem, ReturnedItem, SalesInvoice, SalesInvoiceItem
 from sales.serializers import PurchaseInvoiceItemSerializer, PurchaseInvoiceSerializer, ReturnedItemSerializer, SalesInvoiceItemSerializer, SalesInvoiceSerializer
@@ -333,6 +334,26 @@ class KeyPerformanceIndicatorsViewSet(ViewSet):
             "detail": "Method not allowed"
         }, status=status.HTTP_405_METHOD_NOT_ALLOWED)
     
+    @action(['GET'], detail=False, url_name='monthly-sales-trend', url_path='monthly-sales-trend')
+    def monthly_sales_trend(self, request):
+
+        if request.method == 'GET':
+
+            business_id = get_active_business(request)
+            if not business_id:
+                return Response({
+                    'detail': 'Unauthorized'
+                }, status=status.HTTP_401_UNAUTHORIZED)
+
+            total_sales = SalesInvoice.objects.monthly_sales_trend(business_id)
+            return Response({
+                "monthly_sales_trend": total_sales
+            }, status=status.HTTP_200_OK)
+        
+        return Response({
+            "detail": "Method not allowed"
+        }, status=status.HTTP_405_METHOD_NOT_ALLOWED)
+    
     @action(['GET'], detail=False, url_name='daily-total-sales', url_path='daily-total-sales')
     def daily_total_sales(self, request):
         if request.method == 'GET':
@@ -346,6 +367,82 @@ class KeyPerformanceIndicatorsViewSet(ViewSet):
             total_sales = SalesInvoice.objects.total_sales(business_id, 1)
             return Response({
                 "total_daily_sales": total_sales
+            }, status=status.HTTP_200_OK)
+        
+        return Response({
+            "detail": "Method not allowed"
+        }, status=status.HTTP_405_METHOD_NOT_ALLOWED)
+    
+    @action(['GET'], detail=False, url_name='recent-sales', url_path='recent-sales')
+    def recent_sales(self, request):
+        if request.method == 'GET':
+            business_id = get_active_business(request)
+            
+            if not business_id:
+                return Response({
+                    'detail': 'Unauthorized'
+                }, status=status.HTTP_401_UNAUTHORIZED)
+
+            recent_sales = SalesInvoice.objects.recent_sales(business_id)
+            return Response({
+                "recent_sales": recent_sales
+            }, status=status.HTTP_200_OK)
+        
+        return Response({
+            "detail": "Method not allowed"
+        }, status=status.HTTP_405_METHOD_NOT_ALLOWED)
+    
+    @action(['GET'], detail=False, url_name='total-inventory-value', url_path='total-inventory-value')
+    def total_inventory_value(self, request):
+        if request.method == 'GET':
+            business_id = get_active_business(request).id
+            
+            if not business_id:
+                return Response({
+                    'detail': 'Unauthorized'
+                }, status=status.HTTP_401_UNAUTHORIZED)
+
+            total_inventory_value = Inventory.objects.total_inventory_value(business_id)
+            return Response({
+                "total_inventory_value": total_inventory_value
+            }, status=status.HTTP_200_OK)
+        
+        return Response({
+            "detail": "Method not allowed"
+        }, status=status.HTTP_405_METHOD_NOT_ALLOWED)
+    
+    @action(['GET'], detail=False, url_name='average-order-value', url_path='average-order-value')
+    def avg_order_value(self, request):
+        if request.method == 'GET':
+            business_id = get_active_business(request).id
+            
+            if not business_id:
+                return Response({
+                    'detail': 'Unauthorized'
+                }, status=status.HTTP_401_UNAUTHORIZED)
+
+            avg_order_value = SalesInvoice.objects.average_order_value(business_id)
+            return Response({
+                "avg_order_value": avg_order_value
+            }, status=status.HTTP_200_OK)
+        
+        return Response({
+            "detail": "Method not allowed"
+        }, status=status.HTTP_405_METHOD_NOT_ALLOWED)
+    
+    @action(['GET'], detail=False, url_name='total-purchases', url_path='total-purchases')
+    def total_purchases(self, request):
+        if request.method == 'GET':
+            business_id = get_active_business(request).id
+            
+            if not business_id:
+                return Response({
+                    'detail': 'Unauthorized'
+                }, status=status.HTTP_401_UNAUTHORIZED)
+
+            total_purchases = PurchaseInvoice.objects.total_purchases(business_id)
+            return Response({
+                "total_purchases": total_purchases
             }, status=status.HTTP_200_OK)
         
         return Response({
