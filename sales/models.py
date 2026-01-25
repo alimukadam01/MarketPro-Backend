@@ -23,7 +23,7 @@ class SalesConfig(models.Model):
 class BaseRestock(models.Model):
 
     quantity = models.PositiveIntegerField(default=0)
-    received_at = models.DateField(null=True, blank=True)
+    received_at = models.DateField(auto_now_add=True, null=True, blank=True)
     # Optional link to external txn
     notes = models.TextField(null=True, blank=True)
 
@@ -53,12 +53,15 @@ class SalesInvoiceManager(models.Manager):
 
         return queryset.aggregate(total=Sum("total"))["total"] or 0
 
+    def total_invoices(self, business_id, num_days=None):
+        return self.get_queryset().for_business(business_id).in_period(num_days).count() 
+
     def monthly_sales_trend(self, business_id):
         return self.get_queryset().monthly_trend(business_id, 'total')
 
     def recent_sales(self, business_id):
         queryset = self.get_queryset().for_business(
-            business_id).order_by('-created_at')[4:]
+            business_id).order_by('-created_at')[:4]
 
         res = []
         for sale in queryset:
@@ -129,7 +132,8 @@ class SalesInvoice(models.Model):
     )
     total = models.FloatField(null=True, blank=True)
     created_by = models.ForeignKey(
-        settings.AUTH_USER_MODEL, models.CASCADE, 'created_sales_invoices')
+        settings.AUTH_USER_MODEL, models.CASCADE, 'created_sales_invoices'
+    )
     created_at = models.DateTimeField(auto_now_add=True)
     notes = models.TextField(null=True, blank=True)
     is_deducted = models.BooleanField(default=False)
@@ -239,6 +243,15 @@ class SalesInvoiceItemManager(models.Manager):
 
     def get_queryset(self):
         return SalesInvoiceItemQuerySet(self.model)
+    
+    def total_items_sold(self, business_id, num_days):
+        queryset = self.get_queryset().for_business(business_id).in_period(num_days)
+        total_items = 0
+
+        for item in queryset:
+            total_items += item.quantity
+
+        return total_items
 
 
 class SalesInvoiceItem(BaseItem):
@@ -256,6 +269,8 @@ class SalesInvoiceItem(BaseItem):
     is_partially_deducted = models.BooleanField(default=False)
     is_returned = models.BooleanField(default=False)
     is_partially_returned = models.BooleanField(default=False)
+
+    objects = SalesInvoiceItemManager()
 
     def compute_restock_delta(self) -> int:
         """
@@ -275,6 +290,8 @@ class SalesInvoiceItem(BaseItem):
         self.is_partially_deducted = not full
         self.save(update_fields=['is_deducted', 'is_partially_deducted'])
 
+    def __str__(self):
+        return f'{self.id}_{self.product.name}_{self.sales_invoice.id}_{self.sales_invoice.invoice_number}'
     class Meta:
         unique_together = [('sales_invoice', 'product')]
         constraints = [
@@ -305,6 +322,17 @@ class PurchaseInvoiceManager(models.Manager):
 
         if num_days:
             queryset = queryset.in_period(num_days)
+
+        return queryset.aggregate(total=Sum("total"))["total"] or 0
+
+    def total_invoices(self, business_id, num_days=None):
+        return self.get_queryset().for_business(business_id).in_period(num_days).count() 
+
+    def total_pending_invoices(self, business_id):
+        return self.get_queryset().for_business(business_id).filter(payment_status="PEN").count() 
+
+    def total_pending_payment(self, business_id):
+        queryset = self.get_queryset().for_business(business_id).filter(payment_status="PEN")
 
         return queryset.aggregate(total=Sum("total"))["total"] or 0
 
@@ -469,7 +497,7 @@ class PurchaseInvoiceItem(BaseItem):
         """
         agg = self.restocks.aggregate(total=models.Sum('quantity'))
         prev = agg.get('total') or 0
-        return getattr(self, 'quantity_received') - prev
+        return getattr(self, 'quantity') - prev
 
     def update_restock_flags(self):
         """
@@ -586,6 +614,24 @@ class PurchaseQuotationSupplier(models.Model):
     # Financial Reports
 
 
+class ReturnedItemsQuerySet(BaseQuerySet):
+    pass
+
+
+class ReturnedItemManager(models.Manager):
+
+    def get_queryset(self):
+        return ReturnedItemsQuerySet(self.model)
+
+    def total_returned_items(self, business_id, num_days=None):
+        queryset = self.get_queryset().for_business(business_id)
+
+        if num_days:
+            queryset = queryset.in_period(num_days)
+
+        return queryset.count()
+
+
 class ReturnedItem(models.Model):
     business = models.ForeignKey(
         Business, on_delete=models.CASCADE, related_name='returned_items')
@@ -598,6 +644,8 @@ class ReturnedItem(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
     quantity = models.IntegerField(default=0)
+
+    objects = ReturnedItemManager()
 
     def __str__(self):
         return f"Return for {self.invoice_item.product.name} from Invoice {self.invoice_item.sales_invoice.invoice_number}"

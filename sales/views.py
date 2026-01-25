@@ -1,7 +1,10 @@
+from calendar import monthrange
+from datetime import datetime
+
 from django.db import transaction
 
 from rest_framework import status
-from rest_framework.viewsets import ModelViewSet, ViewSet
+from rest_framework.viewsets import GenericViewSet, ModelViewSet, ViewSet
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.filters import SearchFilter
@@ -33,6 +36,7 @@ from .serializers import (
     SimplePurchaseInvoiceSerializer,
     SimpleSalesInvoiceItemSerializer,
     SimpleSalesInvoiceSerializer,
+    GenerateInvoiceSerializer
 )
 
 # Create your views here.
@@ -52,7 +56,7 @@ class PurchaseInvoiceViewSet(ModelViewSet):
         if not business:
             return []
 
-        return PurchaseInvoice.objects.filter(business_id=business.id)
+        return PurchaseInvoice.objects.filter(business_id=business.id).order_by('-created_at')
 
     def get_serializer_class(self):
         method = self.request.method
@@ -300,6 +304,109 @@ class PurchaseInvoiceItemViewSet(ModelViewSet):
         }
 
 
+class PurchasesKPIViewSet(GenericViewSet):
+
+    ### MONTHLY METRICS
+    @action(['GET'], detail=False, url_name='monthly-total-purchases', url_path='monthly-total-purchases')
+    def monthly_total_purchases(self, request):
+
+        if request.method == 'GET':
+
+            business_id = get_active_business(request)
+            if not business_id:
+                return Response({
+                    'detail': 'Unauthorized'
+                }, status=status.HTTP_401_UNAUTHORIZED)
+
+            today = datetime.today()
+            total_purchases = PurchaseInvoice.objects.total_purchases(business_id, today.day)
+            return Response({
+                "total_purchases": total_purchases
+            }, status=status.HTTP_200_OK)
+        
+        return Response({
+            "detail": "Method not allowed"
+        }, status=status.HTTP_405_METHOD_NOT_ALLOWED)
+
+    @action(['GET'], detail=False, url_name='monthly-total-purchase-invoices', url_path='monthly-total-purchase-invoices')
+    def monthly_total_invoices(self, request):
+        if request.method == 'GET':
+
+            business_id = get_active_business(request).id
+            if not business_id:
+                return Response({
+                    'detail': 'Unauthorized'
+                }, status=status.HTTP_401_UNAUTHORIZED)
+
+            today = datetime.today()
+            total_invoices = PurchaseInvoice.objects.total_invoices(business_id, today.day)
+            return Response({
+                "total_invoices": total_invoices
+            }, status=status.HTTP_200_OK)
+        
+        return Response({
+            "detail": "Method not allowed"
+        }, status=status.HTTP_405_METHOD_NOT_ALLOWED)
+
+    ### All TIME METRICS
+    @action(['GET'], detail=False, url_name='total-purchases', url_path='total-purchases')
+    def total_purchases(self, request):
+        if request.method == 'GET':
+            business_id = get_active_business(request).id
+            
+            if not business_id:
+                return Response({
+                    'detail': 'Unauthorized'
+                }, status=status.HTTP_401_UNAUTHORIZED)
+
+            total_purchases = PurchaseInvoice.objects.total_purchases(business_id)
+            return Response({
+                "total_purchases": total_purchases
+            }, status=status.HTTP_200_OK)
+        
+        return Response({
+            "detail": "Method not allowed"
+        }, status=status.HTTP_405_METHOD_NOT_ALLOWED)
+
+    @action(['GET'], detail=False, url_name='total-pending-invoices', url_path='total-pending-invoices')
+    def total_pending_invoices(self, request):
+        if request.method == 'GET':
+
+            business_id = get_active_business(request).id
+            if not business_id:
+                return Response({
+                    'detail': 'Unauthorized'
+                }, status=status.HTTP_401_UNAUTHORIZED)
+
+            total_invoices = PurchaseInvoice.objects.total_pending_invoices(business_id)
+            return Response({
+                "total_invoices": total_invoices
+            }, status=status.HTTP_200_OK)
+        
+        return Response({
+            "detail": "Method not allowed"
+        }, status=status.HTTP_405_METHOD_NOT_ALLOWED)
+    
+    @action(['GET'], detail=False, url_name='total-pending-payment', url_path='total-pending-payment')
+    def total_pending_paymnet(self, request):
+        if request.method == 'GET':
+
+            business_id = get_active_business(request).id
+            if not business_id:
+                return Response({
+                    'detail': 'Unauthorized'
+                }, status=status.HTTP_401_UNAUTHORIZED)
+
+            total_payment = PurchaseInvoice.objects.total_pending_payment(business_id)
+            return Response({
+                "total_payment": total_payment
+            }, status=status.HTTP_200_OK)
+        
+        return Response({
+            "detail": "Method not allowed"
+        }, status=status.HTTP_405_METHOD_NOT_ALLOWED)
+
+
 class SalesInvoiceViewSet(ModelViewSet):
 
     filter_backends = [SearchFilter, DjangoFilterBackend]
@@ -313,7 +420,7 @@ class SalesInvoiceViewSet(ModelViewSet):
         if not business:
             return []
 
-        return SalesInvoice.objects.filter(business_id=business.id)
+        return SalesInvoice.objects.filter(business_id=business.id).order_by("-created_at")
 
     def get_serializer_class(self):
         method = self.request.method
@@ -427,6 +534,163 @@ class SalesInvoiceViewSet(ModelViewSet):
                 return Response({
                     'detail': 'Internal Server Error.'
                 }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    @action(['GET'], detail=True, url_path='print-invoice', url_name='print-invoice')
+    def print_invoice(self, request, pk=None):
+        if request.method == "GET":
+            sales_invoice = self.get_object()
+            serializer = GenerateInvoiceSerializer(sales_invoice)
+
+            return Response(serializer.data, status=status.HTTP_200_OK)
+
+
+class SalesKPIViewSet(GenericViewSet):
+
+    queryset = []
+    serializer_class = None
+
+    ### DAILY METRICS
+    @action(['GET'], detail=False, url_name='daily-total-sales', url_path='daily-total-sales')
+    def daily_total_sales(self, request):
+        if request.method == 'GET':
+
+            business_id = get_active_business(request)
+            if not business_id:
+                return Response({
+                    'detail': 'Unauthorized'
+                }, status=status.HTTP_401_UNAUTHORIZED)
+
+            total_sales = SalesInvoice.objects.total_sales(business_id, 1)
+            return Response({
+                "total_daily_sales": total_sales
+            }, status=status.HTTP_200_OK)
+        
+        return Response({
+            "detail": "Method not allowed"
+        }, status=status.HTTP_405_METHOD_NOT_ALLOWED)
+
+    @action(['GET'], detail=False, url_name='daily-total-sales-invoices', url_path='daily-total-sales-invoices')
+    def daily_total_invoices(self, request):
+        if request.method == 'GET':
+
+            business_id = get_active_business(request).id
+            if not business_id:
+                return Response({
+                    'detail': 'Unauthorized'
+                }, status=status.HTTP_401_UNAUTHORIZED)
+
+            total_invoices = SalesInvoice.objects.total_invoices(business_id, 1)
+            return Response({
+                "total_invoices": total_invoices
+            }, status=status.HTTP_200_OK)
+        
+        return Response({
+            "detail": "Method not allowed"
+        }, status=status.HTTP_405_METHOD_NOT_ALLOWED)
+    
+    @action(['GET'], detail=False, url_name='recent-sales', url_path='recent-sales')
+    def recent_sales(self, request):
+        if request.method == 'GET':
+            business_id = get_active_business(request)
+            
+            if not business_id:
+                return Response({
+                    'detail': 'Unauthorized'
+                }, status=status.HTTP_401_UNAUTHORIZED)
+
+            recent_sales = SalesInvoice.objects.recent_sales(business_id)
+            return Response({
+                "recent_sales": recent_sales
+            }, status=status.HTTP_200_OK)
+        
+        return Response({
+            "detail": "Method not allowed"
+        }, status=status.HTTP_405_METHOD_NOT_ALLOWED)
+
+    @action(methods=['GET'], detail=False, url_name='daily-total-items', url_path='daily-total-items')
+    def daily_total_items(self, request):
+        if request.method == "GET":
+            business_id = get_active_business(request)
+            if not business_id:
+                return Response({
+                    'detail': 'Unauthorized'
+                }, status=status.HTTP_401_UNAUTHORIZED)
+
+            total_items = SalesInvoiceItem.objects.total_items_sold(business_id, 1)
+            return Response({
+                "total_items": total_items
+            }, status=status.HTTP_200_OK)
+        
+        return Response({
+            "detail": "Method not allowed"
+        }, status=status.HTTP_405_METHOD_NOT_ALLOWED)
+
+    ### MONTHLY METRICS
+    @action(['GET'], detail=False, url_name='monthly-total-sales', url_path='monthly-total-sales')
+    def monthly_total_sales(self, request):
+
+        if request.method == 'GET':
+
+            business_id = get_active_business(request)
+            if not business_id:
+                return Response({
+                    'detail': 'Unauthorized'
+                }, status=status.HTTP_401_UNAUTHORIZED)
+
+            today = datetime.today()
+            total_days_month = monthrange(today.year, today.month)[1]
+            days = total_days_month - today.day
+            total_sales = SalesInvoice.objects.total_sales(business_id, days)
+            return Response({
+                "total_monthly_sales": total_sales
+            }, status=status.HTTP_200_OK)
+        
+        return Response({
+            "detail": "Method not allowed"
+        }, status=status.HTTP_405_METHOD_NOT_ALLOWED)
+
+    @action(['GET'], detail=False, url_name='monthly-sales-trend', url_path='monthly-sales-trend')
+    def monthly_sales_trend(self, request):
+
+        if request.method == 'GET':
+
+            business_id = get_active_business(request)
+            if not business_id:
+                return Response({
+                    'detail': 'Unauthorized'
+                }, status=status.HTTP_401_UNAUTHORIZED)
+
+            total_sales = SalesInvoice.objects.monthly_sales_trend(business_id)
+            return Response({
+                "monthly_sales_trend": total_sales
+            }, status=status.HTTP_200_OK)
+        
+        return Response({
+            "detail": "Method not allowed"
+        }, status=status.HTTP_405_METHOD_NOT_ALLOWED)
+
+    ### YEARLY METRICS
+
+
+    ### ALL TIME METRICS
+    @action(['GET'], detail=False, url_name='average-order-value', url_path='average-order-value')
+    def avg_order_value(self, request):
+        if request.method == 'GET':
+            business_id = get_active_business(request).id
+            
+            if not business_id:
+                return Response({
+                    'detail': 'Unauthorized'
+                }, status=status.HTTP_401_UNAUTHORIZED)
+
+            avg_order_value = SalesInvoice.objects.average_order_value(business_id)
+            return Response({
+                "avg_order_value": avg_order_value
+            }, status=status.HTTP_200_OK)
+        
+        return Response({
+            "detail": "Method not allowed"
+        }, status=status.HTTP_405_METHOD_NOT_ALLOWED)
 
 
 class SalesInvoiceItemViewSet(ModelViewSet):
@@ -559,3 +823,28 @@ class ReturnedItemsViewSet(ModelViewSet):
             return Response({
                 'detail': 'Internal Server Error.'
             }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        
+
+class ReturnedItemsKPIViewSet(GenericViewSet):
+
+    serializer_class = None
+
+    @action(['GET'], detail=False, url_name='total-returned-items', url_path='total-returned-items')
+    def total_returned_items(self, request):
+        if request.method == 'GET':
+            business_id = get_active_business(request).id
+            
+            if not business_id:
+                return Response({
+                    'detail': 'Unauthorized'
+                }, status=status.HTTP_401_UNAUTHORIZED)
+
+            total_returned_items = ReturnedItem.objects.total_returned_items(business_id)
+            return Response({
+                "total_returned_items": total_returned_items
+            }, status=status.HTTP_200_OK)
+        
+        return Response({
+            "detail": "Method not allowed"
+        }, status=status.HTTP_405_METHOD_NOT_ALLOWED)
+    

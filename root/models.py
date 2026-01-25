@@ -99,6 +99,7 @@ class Business(models.Model):
         related_name="businesses"
     )
     phone = models.CharField(max_length=256)
+    address = models.TextField(null=True, blank=True)
     logo = models.ImageField(upload_to="business_logos/", null=True, blank=True)
     is_active = models.BooleanField(default=False)
 
@@ -114,6 +115,23 @@ class BusinessConfig(models.Model):
     is_inventory_enabled = models.BooleanField(default=True)
 
 
+class CustomerQuerySet(BaseQuerySet):
+    pass
+
+
+class CustomerManager(models.Manager):
+
+    def get_queryset(self):
+        return CustomerQuerySet(self.model)
+
+    def total_customers(self, business_id, num_days=None):
+
+        if num_days:
+            return self.get_queryset().for_business(business_id).in_period(num_days).count()
+
+        return self.get_queryset().for_business(business_id).count()
+
+
 class Customer(models.Model):
 
     name = models.CharField(max_length=256)
@@ -127,8 +145,23 @@ class Customer(models.Model):
     notes = models.TextField(null=True, blank=True)
     total_sales = models.FloatField(null=True, blank=True)
 
+    objects = CustomerManager()
+
     def __str__(self):
         return f"{self.email}"
+
+
+class LocationQuerySet(BaseQuerySet):
+    pass
+
+
+class LocationManager(models.Manager):
+
+    def get_queryset(self):
+        return LocationQuerySet(self.model)
+    
+    def total_locations(self, business_id):
+        return self.get_queryset().for_business(business_id).count()
 
 
 class Location(models.Model):
@@ -139,8 +172,27 @@ class Location(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     is_default = models.BooleanField(default=False)
 
+    objects = LocationManager()
+
     def __str__(self):
         return f"{self.name}"
+
+
+class ProductQuerySet(BaseQuerySet):
+    pass
+
+
+class ProductManager(models.Manager):
+
+    def get_queryset(self):
+        return ProductQuerySet(self.model)
+    
+    def total_products(self, business_id, num_days=None):
+
+        if num_days:
+            return self.get_queryset().for_business(business_id).in_period(num_days).count()
+        
+        return self.get_queryset().for_business(business_id).count()
 
 
 class Product(models.Model):
@@ -151,6 +203,8 @@ class Product(models.Model):
     is_active = models.BooleanField(default=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+
+    objects = ProductManager()
 
     def __str__(self):
         return f"{self.name}"
@@ -170,6 +224,23 @@ class BaseItem(models.Model):
         abstract = True
 
 
+class SupplierQuerySet(BaseQuerySet):
+    pass
+
+
+class SupplierManager(models.Manager):
+
+    def get_queryset(self):
+        return SupplierQuerySet(self.model)
+    
+    def total_suppliers(self, business_id, num_days=None):
+
+        if num_days:
+            return self.get_queryset().for_business(business_id).in_period(num_days).count()
+        
+        return self.get_queryset().for_business(business_id).count()
+
+
 class Supplier(models.Model):
     business = models.ForeignKey(Business, models.CASCADE, related_name='suppliers')
     name = models.CharField(max_length=256)
@@ -178,6 +249,44 @@ class Supplier(models.Model):
     email = models.EmailField(null=True, blank=True)
     notes = models.TextField(null=True, blank=True)
 
+    objects = SupplierManager()
+
     def __str__(self):
         return f"{self.business_name}: {self.name}"
 
+
+class ExpenseQuerySet(BaseQuerySet):
+    pass
+
+
+class ExpenseManager(models.Manager):
+
+    def get_queryset(self):
+        return ExpenseQuerySet(self.model)
+    
+    def total_expenses(self, business_id, num_days=None):
+
+        if num_days:
+            return self.get_queryset().for_business(business_id).in_period(num_days).count()
+        
+        return self.get_queryset().for_business(business_id).count()
+    
+    def total_expense_amount(self, business_id, num_days=None):
+        queryset = self.get_queryset().for_business(business_id)
+
+        if num_days:
+            queryset = queryset.in_period(num_days)
+
+        return queryset.aggregate(total=models.Sum("amount"))["total"] or 0
+
+    def monthly_expenses_trend(self, business_id):
+        return self.get_queryset().monthly_trend(business_id, 'amount')
+
+class Expense(models.Model):
+    business = models.ForeignKey(Business, on_delete=models.CASCADE, related_name='expenses')
+    name = models.CharField(max_length=256)
+    desc = models.TextField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    amount = models.FloatField(default=0)
+
+    objects = ExpenseManager()

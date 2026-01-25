@@ -24,8 +24,11 @@ class InventoryManager(models.Manager):
         for item in items:
             total += item.quantity * item.unit_cost
 
-        return total
-        
+        return total      
+
+    def total_restocks_required(self, id):
+        items = self.get_queryset().get_items(id)
+        return items.filter(quantity_on_hand__lte = models.F('reorder_level')).count()
 
 
 class Inventory(models.Model):

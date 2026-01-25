@@ -7,7 +7,7 @@ from .models import (
     PurchaseInvoiceItemRestock, 
     SalesInvoiceItemDeduction, 
     SalesReservation,
-    ReturnedItem
+    ReturnedItem,
 )
 
 

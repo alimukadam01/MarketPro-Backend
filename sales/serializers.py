@@ -4,7 +4,7 @@ from rest_framework import serializers
 from core.serializers import SimpleUserSerializer
 from root.models import Location
 from root.serializers import (
-    CustomerSerializer, SimpleBusinessSerializer, SimpleCustomerSerializer, SimpleProductSerializer, SimpleSupplierSerializer, 
+    BusinessSerializer, CustomerSerializer, SimpleBusinessSerializer, SimpleCustomerSerializer, SimpleProductSerializer, SimpleSupplierSerializer, 
     SupplierSerializer, BaseItemSerializer
 )
 from inventory.models import InventoryItem
@@ -326,6 +326,16 @@ class SimpleSalesInvoiceItemSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'sales_invoice', 'product', 'unit_price', 'quantity', 
             'quantity_received', 'discount', 'is_deducted', 'is_partially_deducted', 'is_returned'
+        ]
+
+
+class BasicSalesInvoiceItemSerializer(serializers.ModelSerializer):
+    product = SimpleProductSerializer(read_only=True)
+
+    class Meta:
+        model = SalesInvoiceItem
+        fields = [
+            'id', 'product', 'unit_price', 'quantity'
         ]
 
 
@@ -678,3 +688,17 @@ class RecentSalesSerializer(serializers.ModelSerializer):
     class Meta:
         model = SalesInvoice
         fields = ['id', 'product_name']
+
+
+class GenerateInvoiceSerializer(serializers.ModelSerializer):
+
+    business = BusinessSerializer()
+    customer = SimpleCustomerSerializer()
+    invoice_items = BasicSalesInvoiceItemSerializer(many=True)
+
+    class Meta:
+        model = SalesInvoice
+        fields = [
+            'id', 'created_at', 'business', 'customer', 'invoice_number',
+            'invoice_items', 'discount', 'tax', 'sub_total', 'total'
+        ]

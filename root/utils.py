@@ -1,7 +1,9 @@
-from django.db.models import Q, Model
-from .models import Business
 from datetime import datetime
-from django.apps import apps
+from django.template.loader import get_template
+from django.conf import settings
+from django.db.models import Q, Model
+from rest_framework.viewsets import ModelViewSet
+from .models import Business
 
 def get_active_business(request):
 

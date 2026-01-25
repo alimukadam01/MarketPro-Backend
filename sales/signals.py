@@ -17,7 +17,7 @@ def updateTotalsAfterSalesInvoiceItem(sender, instance, **kwargs):
         instance.sales_invoice.adjust_totals()
 
 
-### automatically update inventory  
+### automatically update inventory on purchase
 @receiver(post_save, sender=PurchaseInvoice)
 def updateInventoryOnPurchase(sender, instance: PurchaseInvoice, **kwargs):
     if instance.is_restocked: return
@@ -51,7 +51,6 @@ def updateInventoryOnPurchase(sender, instance: PurchaseInvoice, **kwargs):
         instance.update_restock_flags()
 
 
-
 ### update invoice totals
 @receiver(post_save, sender=PurchaseInvoiceItem)
 @receiver(post_delete, sender=PurchaseInvoiceItem)
@@ -60,7 +59,7 @@ def updateTotalsAfterPurchaseInvoiceItem(sender, instance, **kwargs):
         instance.purchase_invoice.adjust_totals()
 
 ### Create delete signal
-
+### automatically update inventory on sale
 @receiver(post_save, sender=SalesInvoice)
 def updateInventoryOnSale(sender, instance: SalesInvoice, **kwargs):
     if instance.is_deducted: return
