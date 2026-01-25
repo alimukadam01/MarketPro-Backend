@@ -18,20 +18,20 @@ from .filters import GlobalSearch
 
 class CategoryViewSet(ReadOnlyModelViewSet):
 
-    queryset = Category.objects.all()
+    queryset = Category.objects.all().order_by('name')
     serializer_class = CategorySerializer
 
 
 
 class CityViewSet(ReadOnlyModelViewSet):
 
-    queryset = City.objects.all()
+    queryset = City.objects.all().order_by('name')
     serializer_class = CitySerializer
 
 
 class UnitViewSet(ReadOnlyModelViewSet):
 
-    queryset = Unit.objects.all()
+    queryset = Unit.objects.all().order_by('name')
     serializer_class = UnitSerializer
 
 
@@ -98,7 +98,7 @@ class ProductViewSet(ModelViewSet):
         if not business:
             return []
 
-        return Product.objects.filter(business_id=business.id)
+        return Product.objects.filter(business_id=business.id).order_by('name')
 
     def get_serializer_class(self):
 
@@ -176,7 +176,7 @@ class SupplierViewSet(ModelViewSet):
         if not business:
             return []
 
-        return Supplier.objects.filter(business_id=business.id)
+        return Supplier.objects.filter(business_id=business.id).order_by('name')
 
     def get_serializer_context(self):
         business = get_active_business(self.request)
@@ -249,7 +249,7 @@ class LocationViewSet(ModelViewSet):
         if not business:
             return []
 
-        return Location.objects.filter(business_id=business.id)
+        return Location.objects.filter(business_id=business.id).order_by('name')
 
     def get_serializer_context(self):
 
@@ -320,7 +320,7 @@ class CustomerViewSet(ModelViewSet):
         if not business:
             return []
 
-        return Customer.objects.filter(business_id=business.id)
+        return Customer.objects.filter(business_id=business.id).order_by('name')
 
     def get_serializer_class(self):
         if self.action == 'list':
@@ -395,7 +395,7 @@ class ExpenseViewSet(ModelViewSet):
         if not business:
             return []
 
-        return Expense.objects.filter(business_id=business.id)
+        return Expense.objects.filter(business_id=business.id).order_by('-created_at')
 
     def get_serializer_context(self):
         business = get_active_business(self.request)
