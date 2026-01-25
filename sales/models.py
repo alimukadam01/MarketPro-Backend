@@ -227,11 +227,13 @@ class SalesInvoice(models.Model):
 
     class Meta:
         constraints = [
+            '''
             models.CheckConstraint(
                 check=~(models.Q(is_deducted=True) &
                         models.Q(is_partially_deducted=True)),
                 name='is_deducted_and_is_partially_deducted_mutually_exclusive_si'
             )
+            '''
         ]
 
 
@@ -295,6 +297,7 @@ class SalesInvoiceItem(BaseItem):
     class Meta:
         unique_together = [('sales_invoice', 'product')]
         constraints = [
+            '''
             models.CheckConstraint(
                 check=~(models.Q(is_returned=True) &
                         models.Q(is_partially_returned=True)),
@@ -305,6 +308,7 @@ class SalesInvoiceItem(BaseItem):
                         models.Q(is_partially_deducted=True)),
                 name='is_deducted_and_is_partially_deducted_mutually_exclusive_sii'
             )
+            '''
         ]
 
 
@@ -445,11 +449,13 @@ class PurchaseInvoice(models.Model):
 
     class Meta:
         constraints = [
+            '''
             models.CheckConstraint(
                 check=~(models.Q(is_restocked=True) &
                         models.Q(is_partially_restocked=True)),
                 name='is_restocked_and_is_partially_restocked_mutually_exclusive_pi'
             )
+            '''
         ]
 
 
@@ -512,11 +518,13 @@ class PurchaseInvoiceItem(BaseItem):
     class Meta:
         unique_together = [('purchase_invoice', 'product')]
         constraints = [
+            '''
             models.CheckConstraint(
                 check=~(models.Q(is_restocked=True) &
                         models.Q(is_partially_restocked=True)),
                 name='is_restocked_and_is_partially_restocked_mutually_exclusive_pii'
             )
+            '''
         ]
 
 
