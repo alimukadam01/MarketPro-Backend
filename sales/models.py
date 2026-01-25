@@ -519,15 +519,15 @@ class PurchaseInvoiceItem(BaseItem):
 
     class Meta:
         unique_together = [('purchase_invoice', 'product')]
-        constraints = [
+        # constraints = [
             
-            models.CheckConstraint(
-                check=~(models.Q(is_restocked=True) &
-                        models.Q(is_partially_restocked=True)),
-                name='is_restocked_and_is_partially_restocked_mutually_exclusive_pii'
-            )
+        #     models.CheckConstraint(
+        #         check=~(models.Q(is_restocked=True) &
+        #                 models.Q(is_partially_restocked=True)),
+        #         name='is_restocked_and_is_partially_restocked_mutually_exclusive_pii'
+        #     )
             
-        ]
+        # ]
 
 
 class PurchaseInvoiceItemRestock(BaseRestock):
