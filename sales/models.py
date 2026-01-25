@@ -226,15 +226,16 @@ class SalesInvoice(models.Model):
         return {item.product_id: item for item in self.invoice_items.all()}
 
     class Meta:
-        constraints = [
-            '''
-            models.CheckConstraint(
-                check=~(models.Q(is_deducted=True) &
-                        models.Q(is_partially_deducted=True)),
-                name='is_deducted_and_is_partially_deducted_mutually_exclusive_si'
-            )
-            '''
-        ]
+        # constraints = [
+        #     '''
+        #     models.CheckConstraint(
+        #         check=~(models.Q(is_deducted=True) &
+        #                 models.Q(is_partially_deducted=True)),
+        #         name='is_deducted_and_is_partially_deducted_mutually_exclusive_si'
+        #     )
+        #     '''
+        # ]
+        pass
 
 
 class SalesInvoiceItemQuerySet(BaseQuerySet):
@@ -296,20 +297,20 @@ class SalesInvoiceItem(BaseItem):
         return f'{self.id}_{self.product.name}_{self.sales_invoice.id}_{self.sales_invoice.invoice_number}'
     class Meta:
         unique_together = [('sales_invoice', 'product')]
-        constraints = [
-            '''
-            models.CheckConstraint(
-                check=~(models.Q(is_returned=True) &
-                        models.Q(is_partially_returned=True)),
-                name='is_returned_and_is_partially_returned_mutually_exclusive'
-            ),
-            models.CheckConstraint(
-                check=~(models.Q(is_deducted=True) &
-                        models.Q(is_partially_deducted=True)),
-                name='is_deducted_and_is_partially_deducted_mutually_exclusive_sii'
-            )
-            '''
-        ]
+        # constraints = [
+        #     '''
+        #     models.CheckConstraint(
+        #         check=~(models.Q(is_returned=True) &
+        #                 models.Q(is_partially_returned=True)),
+        #         name='is_returned_and_is_partially_returned_mutually_exclusive'
+        #     ),
+        #     models.CheckConstraint(
+        #         check=~(models.Q(is_deducted=True) &
+        #                 models.Q(is_partially_deducted=True)),
+        #         name='is_deducted_and_is_partially_deducted_mutually_exclusive_sii'
+        #     )
+        #     '''
+        # ]
 
 
 class PurchaseInvoiceQuerySet(BaseQuerySet):
@@ -448,15 +449,16 @@ class PurchaseInvoice(models.Model):
             self.status = 'R'
 
     class Meta:
-        constraints = [
-            '''
-            models.CheckConstraint(
-                check=~(models.Q(is_restocked=True) &
-                        models.Q(is_partially_restocked=True)),
-                name='is_restocked_and_is_partially_restocked_mutually_exclusive_pi'
-            )
-            '''
-        ]
+        # constraints = [
+        #     '''
+        #     models.CheckConstraint(
+        #         check=~(models.Q(is_restocked=True) &
+        #                 models.Q(is_partially_restocked=True)),
+        #         name='is_restocked_and_is_partially_restocked_mutually_exclusive_pi'
+        #     )
+        #     '''
+        # ]
+        pass
 
 
 class PurchaseInvoiceItem(BaseItem):
@@ -518,13 +520,13 @@ class PurchaseInvoiceItem(BaseItem):
     class Meta:
         unique_together = [('purchase_invoice', 'product')]
         constraints = [
-            '''
+            
             models.CheckConstraint(
                 check=~(models.Q(is_restocked=True) &
                         models.Q(is_partially_restocked=True)),
                 name='is_restocked_and_is_partially_restocked_mutually_exclusive_pii'
             )
-            '''
+            
         ]
 
 
