@@ -21,4 +21,4 @@ router.register('expenses-kpis', ExpenseKPIViewSet, basename='expenses-kpis')
 
 urlpatterns = [
     path('search/', MultiModelSearchView.as_view())
-] + list(router.urls)
+] + router.urls
