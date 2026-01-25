@@ -1,6 +1,5 @@
 from django.urls import path
 from rest_framework.routers import DefaultRouter
-from rest_framework_nested.routers import NestedDefaultRouter
 from .views import BusinessViewSet, CategoryViewSet, CityViewSet, CustomerKPIViewSet, CustomerViewSet, ExpenseKPIViewSet, ExpenseViewSet, KeyPerformanceIndicatorsViewSet, LocationKPIViewSet, LocationViewSet, MultiModelSearchView, ProductKPIViewSet, SupplierKPIViewSet, SupplierViewSet, UnitViewSet, ProductViewSet
 
 router = DefaultRouter()
@@ -22,4 +21,4 @@ router.register('expenses-kpis', ExpenseKPIViewSet, basename='expenses-kpis')
 
 urlpatterns = [
     path('search/', MultiModelSearchView.as_view())
-] + router.urls
+] + list(router.urls)
