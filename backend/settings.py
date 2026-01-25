@@ -10,9 +10,12 @@ For the full list of settings and their values, see
 https://docs.djangoproject.com/en/4.2/ref/settings/
 """
 import os
+from dotenv import load_dotenv
 from pathlib import Path
 from datetime import timedelta
 
+
+load_dotenv()
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
 
@@ -21,12 +24,17 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 # See https://docs.djangoproject.com/en/4.2/howto/deployment/checklist/
 
 # SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = 'django-insecure-n)ih+0wkoxbkcx4#s+ni9@hu9_ojy(rt+f%624^0ulcmi%gf28'
+SECRET_KEY = os.environ['SECRET_KEY']
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = True
+DEBUG = False
 
-ALLOWED_HOSTS = []
+ALLOWED_HOSTS = [
+    'localhost', 
+    '127.0.0.1',
+    '13.201.100.213', 
+    'backend.market-pro.pk'
+]
 
 
 # Application definition
@@ -91,6 +99,15 @@ DATABASES = {
         'ENGINE': 'django.db.backends.sqlite3',
         'NAME': BASE_DIR / 'db.sqlite3',
     }
+} if DEBUG else {
+    'default': {
+        'ENGINE': 'django.db.backends.postgresql',
+        'NAME': os.environ['RDS_DB_NAME'],
+        'USER': os.environ['RDS_DB_USER'],
+        'PASSWORD': os.environ['RDS_DB_PASSWORD'],
+        'HOST': os.environ['RDS_DB_HOST'],
+        'PORT': os.environ['RDS_DB_PORT'],
+    }
 }
 
 
@@ -134,8 +151,8 @@ REST_FRAMEWORK = {
 }
 
 SIMPLE_JWT = {
-   'AUTH_HEADER_TYPES': ('JWT',),
-   'ACCESS_TOKEN_LIFETIME': timedelta(minutes=10080),
+    'AUTH_HEADER_TYPES': ('JWT',),
+    'ACCESS_TOKEN_LIFETIME': timedelta(minutes=10080),
     'REFRESH_TOKEN_LIFETIME': timedelta(days=7),
 }
 
@@ -147,9 +164,9 @@ DJOSER = {
     'PASSWORD_RESET_CONFIRM_RETYPE': True,
     'LOGOUT_ON_PASSWORD_CHANGE': True,
     'PASSWORD_RESET_SHOW_EMAIL_NOT_FOUND': True,
-    'SERIALIZERS':{
-        "user":"core.serializers.UserSerializer",
-        "current_user":"core.serializers.UserSerializer",
+    'SERIALIZERS': {
+        "user": "core.serializers.UserSerializer",
+        "current_user": "core.serializers.UserSerializer",
     },
 }
 

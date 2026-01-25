@@ -1,0 +1,270 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <title>Invoice</title>
+
+    <style>
+        @page {
+            size: A4;
+            margin: 15mm;
+        }
+
+        body {
+            font-family: Arial, Helvetica, sans-serif;
+            font-size: 12px;
+            color: #000;
+        }
+
+        .invoice-container {
+            width: 190mm;
+            margin: auto;
+            border: 1px solid #000;
+            padding: 10mm;
+            box-sizing: border-box;
+        }
+
+        .business-header {
+            text-align: center;
+            margin-bottom: 10px;
+        }
+
+        .business-name {
+            font-size: 18px;
+            font-weight: bold;
+        }
+
+        .business-address,
+        .business-contact {
+            font-size: 12px;
+        }
+
+        .header {
+            text-align: center;
+            margin: 15px 0 20px;
+        }
+
+        .header h1 {
+            margin: 0;
+            font-size: 28px;
+            letter-spacing: 2px;
+        }
+
+        .info-section {
+            width: 100%;
+            border-collapse: collapse;
+            margin-bottom: 20px;
+        }
+
+        .info-box {
+            width: 50%;
+            border: 1px solid #000;
+            vertical-align: top;
+        }
+
+        .info-box table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+
+        .info-box td {
+            padding: 5px;
+        }
+
+        .items-table {
+            width: 100%;
+            min-width: 100%;
+            border-collapse: collapse;
+            margin-top: 10px;
+        }
+
+        .items-table th,
+        .items-table td {
+            border: 1px solid #000;
+            padding: 6px;
+        }
+
+        .items-table th {
+            text-align: center;
+            font-weight: bold;
+        }
+
+        .items-table td {
+            text-align: center;
+        }
+
+        .right {
+            text-align: right;
+        }
+
+        .col-sno {
+            width: 5%;
+        }
+
+        .col-qty {
+            width: 8%;
+        }
+
+        .col-particular {
+            width: 52%;
+            text-align: left;
+        }
+
+        .col-rate {
+            width: 15%;
+        }
+
+        .col-amount {
+            width: 20%;
+        }
+
+        .totals-table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 15px;
+        }
+
+        .totals-table td {
+            border: 1px solid #000;
+            padding: 6px;
+        }
+
+        .totals-table tr:last-child td {
+            font-weight: bold;
+        }
+
+        .footer {
+            position: fixed;
+            bottom: 10mm;
+            left: 0;
+            right: 0;
+            text-align: center;
+            font-size: 10px;
+            color: #555;
+        }
+    </style>
+</head>
+
+<body>
+
+    <div class="invoice-container">
+
+        <!-- Business Details -->
+        <div class="business-header">
+            <div class="business-name">{{ business.name }}</div>
+            <div class="business-address">{{ business.address }}</div>
+            <div class="business-contact">Contact #: {{ business.phone }}</div>
+        </div>
+
+        <!-- Invoice Header -->
+        <div class="header">
+            <h1>INVOICE</h1>
+        </div>
+
+        <!-- Invoice & Customer Info -->
+        <table class="info-section">
+            <tr>
+                <td class="info-box">
+                    <table>
+                        <tr>
+                            <td><strong>Name:</strong></td>
+                            <td>{{ customer.name }}</td>
+                        </tr>
+                        <tr>
+                            <td><strong>Contact #:</strong></td>
+                            <td>{{ customer.phone }}</td>
+                        </tr>
+                        <tr>
+                            <td><strong>Address:</strong></td>
+                            <td>{{ customer.address }}</td>
+                        </tr>
+                    </table>
+                </td>
+
+                <td class="info-box">
+                    <table>
+                        <tr>
+                            <td><strong>Date:</strong></td>
+                            <td>{{ invoice.created_at }}</td>
+                        </tr>
+                        <tr>
+                            <td><strong>Invoice #:</strong></td>
+                            <td>{{ invoice.number }}</td>
+                        </tr>
+                    </table>
+                </td>
+            </tr>
+        </table>
+
+        <!-- Line Items -->
+        <table class="items-table">
+            <thead>
+                <tr>
+                    <th class="col-sno">S #</th>
+                    <th class="col-particular">Particular</th>
+                    <th class="col-qty">Qty</th>
+                    <th class="col-rate">Rate</th>
+                    <th class="col-amount">Amount</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for item in invoice.items %}
+                <tr>
+                    <td class="col-sno">{{ forloop.counter }}</td>
+                    <td class="col-particular">{{ item.name }}</td>
+                    <td class="col-qty">{{ item.quantity }}</td>
+                    <td class="col-rate right">{{ item.rate }}</td>
+                    <td class="col-amount right">{{ item.total }}</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+
+        <!-- Totals -->
+        <table class="totals-table">
+            <tr>
+                <td class="right">SUBTOTAL</td>
+                <td class="right">{{ invoice.subtotal }}</td>
+            </tr>
+
+            {% if invoice.discount %}
+            <tr>
+                <td class="right">
+                    DISCOUNT
+                    {% if invoice.discount_type == "percent" %}
+                    ({{ invoice.discount_value }}%)
+                    {% endif %}
+                </td>
+                <td class="right">- {{ invoice.discount_amount }}</td>
+            </tr>
+            {% endif %}
+
+            {% if invoice.tax %}
+            <tr>
+                <td class="right">
+                    TAX
+                    {% if invoice.tax_type == "percent" %}
+                    ({{ invoice.tax_value }}%)
+                    {% endif %}
+                </td>
+                <td class="right">{{ invoice.tax_amount }}</td>
+            </tr>
+            {% endif %}
+
+            <tr>
+                <td class="right">NET AMOUNT</td>
+                <td class="right">{{ invoice.net_amount }}</td>
+            </tr>
+        </table>
+
+    </div>
+
+    <!-- Footer -->
+    <div class="footer">
+        Invoice generated by Market Pro
+    </div>
+
+</body>
+
+</html>

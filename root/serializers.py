@@ -2,6 +2,7 @@ from rest_framework import serializers
 from .models import (
     City, 
     Category,
+    Expense,
     Product,
     Supplier,
     Unit,
@@ -36,7 +37,7 @@ class BusinessSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Business
-        fields = ['id', 'name', 'owner', 'phone', 'logo', 'is_active']
+        fields = ['id', 'name', 'owner', 'phone', 'address', 'logo', 'is_active']
 
 
 class BusinessCreateSerializer(serializers.ModelSerializer):
@@ -86,15 +87,19 @@ class CustomerSerializer(serializers.ModelSerializer):
 
 class SimpleCustomerSerializer(serializers.ModelSerializer):
 
+    city = CitySerializer()
+
     class Meta:
         model = Customer
         fields =  [
-            'id', 'name', 'business', 'phone', 
-            'email', 'address', 'city', 'notes'
+            'id', 'name', 'phone', 
+            'email', 'address', 'city'
         ]
 
 
 class LocationSerializer(serializers.ModelSerializer):
+
+    business = serializers.PrimaryKeyRelatedField(read_only=True)
 
     class Meta:
         model = Location
@@ -127,7 +132,6 @@ class ProductSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'business', 'name', 'desc', 
             'unit', 'created_at', 'updated_at',
-            'image'
         ]
 
 
@@ -135,7 +139,7 @@ class SimpleProductSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Product
-        fields = ['id', 'name', 'unit', 'image', 'desc']
+        fields = ['id', 'name', 'unit', 'desc']
 
 
 class ProductCreateUpdateSerializer(serializers.ModelSerializer):
@@ -145,7 +149,6 @@ class ProductCreateUpdateSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'name', 'desc', 
             'unit', 'created_at', 'updated_at',
-            'image'
         ]
 
     def create(self, validated_data):
@@ -211,3 +214,12 @@ class BaseItemSerializer(serializers.Serializer):
                 self.fields['location'].queryset = Location.objects.filter(business_id=business_id)        
 
 
+class ExpenseSerializer(serializers.ModelSerializer):
+
+    business = serializers.PrimaryKeyRelatedField(read_only=True)
+    
+    def create(self, validated_data):
+        return Expense.objects.create(business_id = self.context['business_id'], **validated_data)
+    class Meta:
+        model = Expense
+        fields = ['id', 'business', 'name', 'desc', 'amount', 'created_at']

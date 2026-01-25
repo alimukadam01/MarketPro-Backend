@@ -1,12 +1,13 @@
-from rest_framework.viewsets import ModelViewSet, ReadOnlyModelViewSet
+from rest_framework.viewsets import ModelViewSet, GenericViewSet, ReadOnlyModelViewSet
 from rest_framework.response import Response
 from rest_framework.decorators import action
 from rest_framework.filters import SearchFilter
 from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework import status
+from root.utils import get_active_business
+from root.models import BaseQuerySet
 from .models import Inventory, InventoryItem
 from .serializers import AvailableProductSerializer, InventoryItemCreateSerializer, InventoryItemSerializer, InventoryItemUpdateSerializer, InventorySerializer
-from root.utils import get_active_business
 
 # Create your views here.
 
@@ -27,7 +28,6 @@ class InventoryItemsViewSet(ModelViewSet):
     filter_backends = [SearchFilter, DjangoFilterBackend]
     filterset_fields = [
         'inventory__id', 'location__name', 'product__name', 'track_code',
-        'product__name'
     ]
     search_fields = [
         'id', 'location__name', 'product__name', 'track_code', 'unit_cost', 'unit_price'
@@ -105,3 +105,47 @@ class InventoryItemsViewSet(ModelViewSet):
             return Response({
                 'detail': 'Internal Server Error.'
             }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        
+
+class InventoryKPIViewSet(GenericViewSet):
+    serializer_class = None
+
+    @action(['GET'], detail=False, url_name='total-inventory-value', url_path='total-inventory-value')
+    def total_inventory_value(self, request):
+        if request.method == 'GET':
+            business_id = get_active_business(request).id
+            
+            if not business_id:
+                return Response({
+                    'detail': 'Unauthorized'
+                }, status=status.HTTP_401_UNAUTHORIZED)
+
+            total_inventory_value = Inventory.objects.total_inventory_value(business_id)
+            return Response({
+                "total_inventory_value": total_inventory_value
+            }, status=status.HTTP_200_OK)
+        
+        return Response({
+            "detail": "Method not allowed"
+        }, status=status.HTTP_405_METHOD_NOT_ALLOWED)
+    
+    @action(['GET'], detail=False, url_name='total-restocks-required', url_path='total-restocks-required')
+    def total_restocks_required(self, request):
+        if request.method == 'GET':
+            business_id = get_active_business(request).id
+            
+            if not business_id:
+                return Response({
+                    'detail': 'Unauthorized'
+                }, status=status.HTTP_401_UNAUTHORIZED)
+
+            restocks_req = Inventory.objects.total_restocks_required(business_id)
+            return Response({
+                "restocks_req": restocks_req
+            }, status=status.HTTP_200_OK)
+        
+        return Response({
+            "detail": "Method not allowed"
+        }, status=status.HTTP_405_METHOD_NOT_ALLOWED)
+    
+ 

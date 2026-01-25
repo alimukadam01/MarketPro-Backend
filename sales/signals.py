@@ -1,8 +1,8 @@
-from django.db.models.signals import pre_save ,post_save, post_delete
+from django.db.models.signals import pre_save, post_save, post_delete
 from django.dispatch import receiver
 
 from root.utils import generateTransactionId
-from .models import PurchaseInvoice, PurchaseInvoiceItem, SalesInvoice, SalesInvoiceItem
+from .models import PurchaseInvoice, PurchaseInvoiceItem, SalesInvoice, SalesInvoiceItem, ReturnedItem
 from .utils import (
     getRestockField, update_inventory, spiltNewAndOldProducts, 
     logRestockEvent, createInventoryItemFromRestock
@@ -17,9 +17,9 @@ def updateTotalsAfterSalesInvoiceItem(sender, instance, **kwargs):
         instance.sales_invoice.adjust_totals()
 
 
-### automatically update inventory  
-@receiver(pre_save, sender=PurchaseInvoice)
-def updateInventoryOnRestock(sender, instance: PurchaseInvoice, **kwargs):
+### automatically update inventory on purchase
+@receiver(post_save, sender=PurchaseInvoice)
+def updateInventoryOnPurchase(sender, instance: PurchaseInvoice, **kwargs):
     if instance.is_restocked: return
 
     if instance.status in ('R', 'PR'):
@@ -51,7 +51,6 @@ def updateInventoryOnRestock(sender, instance: PurchaseInvoice, **kwargs):
         instance.update_restock_flags()
 
 
-
 ### update invoice totals
 @receiver(post_save, sender=PurchaseInvoiceItem)
 @receiver(post_delete, sender=PurchaseInvoiceItem)
@@ -60,8 +59,8 @@ def updateTotalsAfterPurchaseInvoiceItem(sender, instance, **kwargs):
         instance.purchase_invoice.adjust_totals()
 
 ### Create delete signal
-
-@receiver(pre_save, sender=SalesInvoice)
+### automatically update inventory on sale
+@receiver(post_save, sender=SalesInvoice)
 def updateInventoryOnSale(sender, instance: SalesInvoice, **kwargs):
     if instance.is_deducted: return
 
@@ -84,4 +83,27 @@ def updateInventoryOnSale(sender, instance: SalesInvoice, **kwargs):
                 logRestockEvent(item, delta, instance)
                 item.update_restock_flags()
 
+        ### Fix logic here
         instance.update_deduction_flags()
+
+
+@receiver(post_save, sender=ReturnedItem)
+def mark_item_as_returned(sender, instance: ReturnedItem, created, **kwargs):
+    if created:
+        invoice_item = instance.invoice_item
+        
+        '''
+        if instance.quantity < instance.invoice_item.quantity:
+            invoice_item.is_partially_returned = True
+            invoice_item.save(update_fields=['is_partially_returned'])
+            return
+        '''
+        
+        invoice_item.is_returned = True
+        invoice_item.save(update_fields=['is_returned'])
+
+
+@receiver(post_delete, sender=ReturnedItem)
+def unmark_item_as_returned(sender, instance, **kwargs):
+    instance.invoice_item.is_returned = False
+    instance.invoice_item.save(update_fields=['is_returned'])
