@@ -16,11 +16,11 @@ from .serializers import (
 from .models import Business, Category, City, Customer, Expense, Location, Product, Supplier, Unit
 from .filters import GlobalSearch
 
+
 class CategoryViewSet(ReadOnlyModelViewSet):
 
     queryset = Category.objects.all().order_by('name')
     serializer_class = CategorySerializer
-
 
 
 class CityViewSet(ReadOnlyModelViewSet):
@@ -110,7 +110,7 @@ class ProductViewSet(ModelViewSet):
 
         business = get_active_business(self.request)
         if not business:
-            return None
+            return {}
 
         return {
             "business_id": business.id
@@ -145,18 +145,18 @@ class ProductKPIViewSet(GenericViewSet):
     @action(['GET'], detail=False, url_name='total-products', url_path='total-products')
     def total_products(self, request):
         if request.method == 'GET':
-            business_id = get_active_business(request).id
-            
-            if not business_id:
-                return Response({
-                    'detail': 'Unauthorized'
-                }, status=status.HTTP_401_UNAUTHORIZED)
+            business = get_active_business(request)
 
-            total_products = Product.objects.total_products(business_id)
+            if not business:
+                return Response({
+                    'detail': 'No active business exists. Please contact admin.'
+                }, status=status.HTTP_400_BAD_REQUEST)
+
+            total_products = Product.objects.total_products(business.id)
             return Response({
                 "total_products": total_products
             }, status=status.HTTP_200_OK)
-        
+
         return Response({
             "detail": "Method not allowed"
         }, status=status.HTTP_405_METHOD_NOT_ALLOWED)
@@ -216,22 +216,21 @@ class SupplierKPIViewSet(GenericViewSet):
     @action(['GET'], detail=False, url_name='total-suppliers', url_path='total-suppliers')
     def total_suppliers(self, request):
         if request.method == 'GET':
-            business_id = get_active_business(request).id
-            
-            if not business_id:
-                return Response({
-                    'detail': 'Unauthorized'
-                }, status=status.HTTP_401_UNAUTHORIZED)
+            business = get_active_business(request)
 
-            total_suppliers = Supplier.objects.total_suppliers(business_id)
+            if not business:
+                return Response({
+                    'detail': 'No active business exists. Please contact admin.'
+                }, status=status.HTTP_400_BAD_REQUEST)
+
+            total_suppliers = Supplier.objects.total_suppliers(business.id)
             return Response({
                 "total_suppliers": total_suppliers
             }, status=status.HTTP_200_OK)
-        
+
         return Response({
             "detail": "Method not allowed"
         }, status=status.HTTP_405_METHOD_NOT_ALLOWED)
-    
 
 
 class LocationViewSet(ModelViewSet):
@@ -290,18 +289,18 @@ class LocationKPIViewSet(GenericViewSet):
     @action(['GET'], detail=False, url_name='total-locations', url_path='total-locations')
     def total_locations(self, request):
         if request.method == 'GET':
-            business_id = get_active_business(request).id
-            
-            if not business_id:
-                return Response({
-                    'detail': 'Unauthorized'
-                }, status=status.HTTP_401_UNAUTHORIZED)
+            business = get_active_business(request)
 
-            total_locations = Location.objects.total_locations(business_id)
+            if not business:
+                return Response({
+                    'detail': 'No active business exists. Please contact admin.'
+                }, status=status.HTTP_400_BAD_REQUEST)
+
+            total_locations = Location.objects.total_locations(business.id)
             return Response({
                 "total_locations": total_locations
             }, status=status.HTTP_200_OK)
-        
+
         return Response({
             "detail": "Method not allowed"
         }, status=status.HTTP_405_METHOD_NOT_ALLOWED)
@@ -365,22 +364,22 @@ class CustomerKPIViewSet(GenericViewSet):
     @action(['GET'], detail=False, url_name='total-customers', url_path='total-customers')
     def total_customers(self, request):
         if request.method == 'GET':
-            business_id = get_active_business(request).id
-            
-            if not business_id:
-                return Response({
-                    'detail': 'Unauthorized'
-                }, status=status.HTTP_401_UNAUTHORIZED)
+            business = get_active_business(request)
 
-            total_customers = Customer.objects.total_customers(business_id)
+            if not business:
+                return Response({
+                    'detail': 'No active business exists. Please contact admin.'
+                }, status=status.HTTP_400_BAD_REQUEST)
+
+            total_customers = Customer.objects.total_customers(business.id)
             return Response({
                 "total_customers": total_customers
             }, status=status.HTTP_200_OK)
-        
+
         return Response({
             "detail": "Method not allowed"
         }, status=status.HTTP_405_METHOD_NOT_ALLOWED)
-    
+
 
 class ExpenseViewSet(ModelViewSet):
     serializer_class = ExpenseSerializer
@@ -434,38 +433,38 @@ class ExpenseKPIViewSet(GenericViewSet):
     @action(['GET'], detail=False, url_name='monthly-total-expenses', url_path='monthly-total-expenses')
     def monthly_total_expenses(self, request):
         if request.method == 'GET':
-            business_id = get_active_business(request).id
-            
-            if not business_id:
-                return Response({
-                    'detail': 'Unauthorized'
-                }, status=status.HTTP_401_UNAUTHORIZED)
+            business = get_active_business(request)
 
-            monthly_total_expenses = Expense.objects.total_expenses(business_id)
+            if not business:
+                return Response({
+                    'detail': 'No active business exists. Please contact admin.'
+                }, status=status.HTTP_400_BAD_REQUEST)
+
+            monthly_total_expenses = Expense.objects.total_expenses(business.id)
             return Response({
                 "monthly_total_expenses": monthly_total_expenses
             }, status=status.HTTP_200_OK)
-        
+
         return Response({
             "detail": "Method not allowed"
         }, status=status.HTTP_405_METHOD_NOT_ALLOWED)
-    
+
     @action(['GET'], detail=False, url_name='monthly-total-expense-amount', url_path='monthly-total-expense-amount')
     def monthly_total_expense_amount(self, request):
         if request.method == 'GET':
-            business_id = get_active_business(request).id
-            
-            if not business_id:
+            business = get_active_business(request)
+
+            if not business:
                 return Response({
-                    'detail': 'Unauthorized'
-                }, status=status.HTTP_401_UNAUTHORIZED)
+                    'detail': 'No active business exists. Please contact admin.'
+                }, status=status.HTTP_400_BAD_REQUEST)
 
             today = datetime.today()
-            monthly_total_expense_amount = Expense.objects.total_expense_amount(business_id, num_days=today.day)
+            monthly_total_expense_amount = Expense.objects.total_expense_amount(business.id, num_days=today.day)
             return Response({
                 "monthly_total_expense_amount": monthly_total_expense_amount
             }, status=status.HTTP_200_OK)
-        
+
         return Response({
             "detail": "Method not allowed"
         }, status=status.HTTP_405_METHOD_NOT_ALLOWED)
@@ -475,31 +474,38 @@ class ExpenseKPIViewSet(GenericViewSet):
 
         if request.method == 'GET':
 
-            business_id = get_active_business(request)
-            if not business_id:
+            business = get_active_business(request)
+            if not business:
                 return Response({
-                    'detail': 'Unauthorized'
-                }, status=status.HTTP_401_UNAUTHORIZED)
+                    'detail': 'No active business exists. Please contact admin.'
+                }, status=status.HTTP_400_BAD_REQUEST)
 
-            total_expenses = Expense.objects.monthly_expenses_trend(business_id)
+            total_expenses = Expense.objects.monthly_expenses_trend(business.id)
             return Response({
                 "monthly_expenses_trend": total_expenses
             }, status=status.HTTP_200_OK)
-        
+
         return Response({
             "detail": "Method not allowed"
         }, status=status.HTTP_405_METHOD_NOT_ALLOWED)
 
+
 class MultiModelSearchView(APIView):
 
     def get(self, request):
-        
+
+        business = get_active_business(request)
+        if not business:
+            return Response({
+                'detail': 'No active business exists. Please contact admin.'
+            }, status=status.HTTP_400_BAD_REQUEST)
+
         query = request.query_params.get("search", "")
         if not query or not query.strip():
             return Response({"detail": "Query parameter 'search' is required."}, status=status.HTTP_400_BAD_REQUEST)
         
         try:
-            results = GlobalSearch.search(query)
+            results = GlobalSearch.search(query, business.id)
         except Exception as error:
             print(f"There was an error performing the search: {error}")
             return Response({"detail": "Internal Server Error"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)

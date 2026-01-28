@@ -77,6 +77,8 @@ class PurchaseInvoiceViewSet(ModelViewSet):
     def get_serializer_context(self):
 
         business = get_active_business(self.request)
+        if not business:
+            return {}
         if self.action == 'detail':
             return {
                 'business_id': business.id,
@@ -93,11 +95,11 @@ class PurchaseInvoiceViewSet(ModelViewSet):
 
         if request.method == 'POST':
 
-            business = get_active_business(self.request)
+            business = get_active_business(request)
             if not business:
                 return Response({
-                    'detail': 'Not Found.'
-                }, status=status.HTTP_404_NOT_FOUND)
+                    'detail': 'No active business exists. Please contact admin.'
+                }, status=status.HTTP_400_BAD_REQUEST)
 
             serializer = RestockSerializer(data=request.data, context={
                 'purchase_invoice_id': self.kwargs['pk'],
@@ -127,11 +129,11 @@ class PurchaseInvoiceViewSet(ModelViewSet):
     def create_invoice_and_items(self, request):
         if request.method == 'POST':
             try:
-                business = get_active_business(self.request)
+                business = get_active_business(request)
                 if not business:
                     return Response({
-                        'detail': 'Not Found.'
-                    }, status=status.HTTP_404_NOT_FOUND)
+                        'detail': 'No active business exists. Please contact admin.'
+                    }, status=status.HTTP_400_BAD_REQUEST)
 
                 serializer = PurchaseInvoiceAndItemsCreateSerializer(data=request.data, context={
                     'business_id': business.id,
@@ -312,14 +314,14 @@ class PurchasesKPIViewSet(GenericViewSet):
 
         if request.method == 'GET':
 
-            business_id = get_active_business(request)
-            if not business_id:
+            business = get_active_business(request)
+            if not business:
                 return Response({
-                    'detail': 'Unauthorized'
-                }, status=status.HTTP_401_UNAUTHORIZED)
+                    'detail': 'No active business exists. Please contact admin.'
+                }, status=status.HTTP_400_BAD_REQUEST)
 
             today = datetime.today()
-            total_purchases = PurchaseInvoice.objects.total_purchases(business_id, today.day)
+            total_purchases = PurchaseInvoice.objects.total_purchases(business.id, today.day)
             return Response({
                 "total_purchases": total_purchases
             }, status=status.HTTP_200_OK)
@@ -332,14 +334,14 @@ class PurchasesKPIViewSet(GenericViewSet):
     def monthly_total_invoices(self, request):
         if request.method == 'GET':
 
-            business_id = get_active_business(request).id
-            if not business_id:
+            business = get_active_business(request)
+            if not business:
                 return Response({
-                    'detail': 'Unauthorized'
-                }, status=status.HTTP_401_UNAUTHORIZED)
+                    'detail': 'No active business exists. Please contact admin.'
+                }, status=status.HTTP_400_BAD_REQUEST)
 
             today = datetime.today()
-            total_invoices = PurchaseInvoice.objects.total_invoices(business_id, today.day)
+            total_invoices = PurchaseInvoice.objects.total_invoices(business.id, today.day)
             return Response({
                 "total_invoices": total_invoices
             }, status=status.HTTP_200_OK)
@@ -352,14 +354,13 @@ class PurchasesKPIViewSet(GenericViewSet):
     @action(['GET'], detail=False, url_name='total-purchases', url_path='total-purchases')
     def total_purchases(self, request):
         if request.method == 'GET':
-            business_id = get_active_business(request).id
-            
-            if not business_id:
+            business = get_active_business(request)
+            if not business:
                 return Response({
-                    'detail': 'Unauthorized'
-                }, status=status.HTTP_401_UNAUTHORIZED)
+                    'detail': 'No active business exists. Please contact admin.'
+                }, status=status.HTTP_400_BAD_REQUEST)
 
-            total_purchases = PurchaseInvoice.objects.total_purchases(business_id)
+            total_purchases = PurchaseInvoice.objects.total_purchases(business.id)
             return Response({
                 "total_purchases": total_purchases
             }, status=status.HTTP_200_OK)
@@ -372,13 +373,13 @@ class PurchasesKPIViewSet(GenericViewSet):
     def total_pending_invoices(self, request):
         if request.method == 'GET':
 
-            business_id = get_active_business(request).id
-            if not business_id:
+            business = get_active_business(request)
+            if not business:
                 return Response({
-                    'detail': 'Unauthorized'
-                }, status=status.HTTP_401_UNAUTHORIZED)
+                    'detail': 'No active business exists. Please contact admin.'
+                }, status=status.HTTP_400_BAD_REQUEST)
 
-            total_invoices = PurchaseInvoice.objects.total_pending_invoices(business_id)
+            total_invoices = PurchaseInvoice.objects.total_pending_invoices(business.id)
             return Response({
                 "total_invoices": total_invoices
             }, status=status.HTTP_200_OK)
@@ -391,13 +392,13 @@ class PurchasesKPIViewSet(GenericViewSet):
     def total_pending_paymnet(self, request):
         if request.method == 'GET':
 
-            business_id = get_active_business(request).id
-            if not business_id:
+            business = get_active_business(request)
+            if not business:
                 return Response({
-                    'detail': 'Unauthorized'
-                }, status=status.HTTP_401_UNAUTHORIZED)
+                    'detail': 'No active business exists. Please contact admin.'
+                }, status=status.HTTP_400_BAD_REQUEST)
 
-            total_payment = PurchaseInvoice.objects.total_pending_payment(business_id)
+            total_payment = PurchaseInvoice.objects.total_pending_payment(business.id)
             return Response({
                 "total_payment": total_payment
             }, status=status.HTTP_200_OK)
@@ -451,11 +452,11 @@ class SalesInvoiceViewSet(ModelViewSet):
     def create_invoice_and_items(self, request):
         if request.method == 'POST':
             try:
-                business = get_active_business(self.request)
+                business = get_active_business(request)
                 if not business:
                     return Response({
-                        'detail': 'Not Found.'
-                    }, status=status.HTTP_404_NOT_FOUND)
+                        'detail': 'No active business exists. Please contact admin.'
+                    }, status=status.HTTP_400_BAD_REQUEST)
 
                 serializer = SalesInvoiceAndItemsCreateSerializer(data=request.data, context={
                     'business_id': business.id,
@@ -502,11 +503,11 @@ class SalesInvoiceViewSet(ModelViewSet):
     def update_invoice_and_items(self, request, pk=None):
         if request.method == 'POST':
             try:
-                business = get_active_business(self.request)
+                business = get_active_business(request)
                 if not business:
                     return Response({
-                        'detail': 'Not Found.'
-                    }, status=status.HTTP_404_NOT_FOUND)
+                        'detail': 'No active business exists. Please contact admin.'
+                    }, status=status.HTTP_400_BAD_REQUEST)
 
                 instance = self.get_object()
                 if not instance:
@@ -554,13 +555,13 @@ class SalesKPIViewSet(GenericViewSet):
     def daily_total_sales(self, request):
         if request.method == 'GET':
 
-            business_id = get_active_business(request)
-            if not business_id:
+            business = get_active_business(request)
+            if not business:
                 return Response({
-                    'detail': 'Unauthorized'
-                }, status=status.HTTP_401_UNAUTHORIZED)
+                    'detail': 'No active business exists. Please contact admin.'
+                }, status=status.HTTP_400_BAD_REQUEST)
 
-            total_sales = SalesInvoice.objects.total_sales(business_id, 1)
+            total_sales = SalesInvoice.objects.total_sales(business.id, 1)
             return Response({
                 "total_daily_sales": total_sales
             }, status=status.HTTP_200_OK)
@@ -573,13 +574,13 @@ class SalesKPIViewSet(GenericViewSet):
     def daily_total_invoices(self, request):
         if request.method == 'GET':
 
-            business_id = get_active_business(request).id
-            if not business_id:
+            business = get_active_business(request)
+            if not business:
                 return Response({
-                    'detail': 'Unauthorized'
-                }, status=status.HTTP_401_UNAUTHORIZED)
+                    'detail': 'No active business exists. Please contact admin.'
+                }, status=status.HTTP_400_BAD_REQUEST)
 
-            total_invoices = SalesInvoice.objects.total_invoices(business_id, 1)
+            total_invoices = SalesInvoice.objects.total_invoices(business.id, 1)
             return Response({
                 "total_invoices": total_invoices
             }, status=status.HTTP_200_OK)
@@ -591,14 +592,13 @@ class SalesKPIViewSet(GenericViewSet):
     @action(['GET'], detail=False, url_name='recent-sales', url_path='recent-sales')
     def recent_sales(self, request):
         if request.method == 'GET':
-            business_id = get_active_business(request)
-            
-            if not business_id:
+            business = get_active_business(request)
+            if not business:
                 return Response({
-                    'detail': 'Unauthorized'
-                }, status=status.HTTP_401_UNAUTHORIZED)
+                    'detail': 'No active business exists. Please contact admin.'
+                }, status=status.HTTP_400_BAD_REQUEST)
 
-            recent_sales = SalesInvoice.objects.recent_sales(business_id)
+            recent_sales = SalesInvoice.objects.recent_sales(business.id)
             return Response({
                 "recent_sales": recent_sales
             }, status=status.HTTP_200_OK)
@@ -610,13 +610,13 @@ class SalesKPIViewSet(GenericViewSet):
     @action(methods=['GET'], detail=False, url_name='daily-total-items', url_path='daily-total-items')
     def daily_total_items(self, request):
         if request.method == "GET":
-            business_id = get_active_business(request)
-            if not business_id:
+            business = get_active_business(request)
+            if not business:
                 return Response({
-                    'detail': 'Unauthorized'
-                }, status=status.HTTP_401_UNAUTHORIZED)
+                    'detail': 'No active business exists. Please contact admin.'
+                }, status=status.HTTP_400_BAD_REQUEST)
 
-            total_items = SalesInvoiceItem.objects.total_items_sold(business_id, 1)
+            total_items = SalesInvoiceItem.objects.total_items_sold(business.id, 1)
             return Response({
                 "total_items": total_items
             }, status=status.HTTP_200_OK)
@@ -631,16 +631,16 @@ class SalesKPIViewSet(GenericViewSet):
 
         if request.method == 'GET':
 
-            business_id = get_active_business(request)
-            if not business_id:
+            business = get_active_business(request)
+            if not business:
                 return Response({
-                    'detail': 'Unauthorized'
-                }, status=status.HTTP_401_UNAUTHORIZED)
+                    'detail': 'No active business exists. Please contact admin.'
+                }, status=status.HTTP_400_BAD_REQUEST)
 
             today = datetime.today()
             total_days_month = monthrange(today.year, today.month)[1]
             days = total_days_month - today.day
-            total_sales = SalesInvoice.objects.total_sales(business_id, days)
+            total_sales = SalesInvoice.objects.total_sales(business.id, days)
             return Response({
                 "total_monthly_sales": total_sales
             }, status=status.HTTP_200_OK)
@@ -654,13 +654,13 @@ class SalesKPIViewSet(GenericViewSet):
 
         if request.method == 'GET':
 
-            business_id = get_active_business(request)
-            if not business_id:
+            business = get_active_business(request)
+            if not business:
                 return Response({
-                    'detail': 'Unauthorized'
-                }, status=status.HTTP_401_UNAUTHORIZED)
+                    'detail': 'No active business exists. Please contact admin.'
+                }, status=status.HTTP_400_BAD_REQUEST)
 
-            total_sales = SalesInvoice.objects.monthly_sales_trend(business_id)
+            total_sales = SalesInvoice.objects.monthly_sales_trend(business.id)
             return Response({
                 "monthly_sales_trend": total_sales
             }, status=status.HTTP_200_OK)
@@ -676,14 +676,14 @@ class SalesKPIViewSet(GenericViewSet):
     @action(['GET'], detail=False, url_name='average-order-value', url_path='average-order-value')
     def avg_order_value(self, request):
         if request.method == 'GET':
-            business_id = get_active_business(request).id
+            business = get_active_business(request)
             
-            if not business_id:
+            if not business:
                 return Response({
-                    'detail': 'Unauthorized'
-                }, status=status.HTTP_401_UNAUTHORIZED)
+                    'detail': 'No active business exists. Please contact admin.'
+                }, status=status.HTTP_400_BAD_REQUEST)
 
-            avg_order_value = SalesInvoice.objects.average_order_value(business_id)
+            avg_order_value = SalesInvoice.objects.average_order_value(business.id)
             return Response({
                 "avg_order_value": avg_order_value
             }, status=status.HTTP_200_OK)
@@ -743,11 +743,11 @@ class SalesInvoiceItemViewSet(ModelViewSet):
     @action(['POST'], detail=True, url_path='return', url_name='return')
     def return_item(self, request, pk=None, sales_invoice_pk=None):
         if request.method == 'POST':
-            business = get_active_business(self.request)
+            business = get_active_business(request)
             if not business:
                 return Response({
-                    'detail': 'Not Found.'
-                }, status=status.HTTP_404_NOT_FOUND)
+                    'detail': 'No active business exists. Please contact admin.'
+                }, status=status.HTTP_400_BAD_REQUEST)
 
             serializer = ReturnedItemCreateUpdateSerializer(data=request.data, context={
                 'business_id': business.id,
@@ -832,14 +832,14 @@ class ReturnedItemsKPIViewSet(GenericViewSet):
     @action(['GET'], detail=False, url_name='total-returned-items', url_path='total-returned-items')
     def total_returned_items(self, request):
         if request.method == 'GET':
-            business_id = get_active_business(request).id
+            business = get_active_business(request)
             
-            if not business_id:
+            if not business:
                 return Response({
-                    'detail': 'Unauthorized'
-                }, status=status.HTTP_401_UNAUTHORIZED)
+                    'detail': 'No active business exists. Please contact admin.'
+                }, status=status.HTTP_400_BAD_REQUEST)
 
-            total_returned_items = ReturnedItem.objects.total_returned_items(business_id)
+            total_returned_items = ReturnedItem.objects.total_returned_items(business.id)
             return Response({
                 "total_returned_items": total_returned_items
             }, status=status.HTTP_200_OK)

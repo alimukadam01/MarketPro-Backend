@@ -45,15 +45,15 @@ def createInventoryItemFromRestock(item, qty_field: str) -> 'InventoryItem':
         data = item.morph()
         qty = getattr(item, qty_field)
         return InventoryItem.objects.create(
-            business_id         = data['business_id'],
-            inventory_id        = data['inventory_id'],
-            location_id         = data['location_id'],
-            product_id          = data['product_id'],
-            quantity            = qty,
-            quantity_on_hand    = qty,
-            track_code          = data.get('track_code'),
-            notes               = data.get('notes'),
-            unit_cost           = data.get('unit_cost'),
+            business_id = data['business_id'],
+            inventory_id = data['inventory_id'],
+            location_id = data['location_id'],
+            product_id = data['product_id'],
+            quantity = qty,
+            quantity_on_hand = qty,
+            track_code = data.get('track_code'),
+            notes = data.get('notes'),
+            unit_cost = data.get('unit_cost'),
             last_transaction = data['last_transaction']
         )
 

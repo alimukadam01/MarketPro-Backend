@@ -113,14 +113,13 @@ class InventoryKPIViewSet(GenericViewSet):
     @action(['GET'], detail=False, url_name='total-inventory-value', url_path='total-inventory-value')
     def total_inventory_value(self, request):
         if request.method == 'GET':
-            business_id = get_active_business(request).id
-            
-            if not business_id:
+            business = get_active_business(request)
+            if not business:
                 return Response({
-                    'detail': 'Unauthorized'
-                }, status=status.HTTP_401_UNAUTHORIZED)
+                    'detail': 'No active business exists. Please contact admin.'
+                }, status=status.HTTP_400_BAD_REQUEST)
 
-            total_inventory_value = Inventory.objects.total_inventory_value(business_id)
+            total_inventory_value = Inventory.objects.total_inventory_value(business.id)
             return Response({
                 "total_inventory_value": total_inventory_value
             }, status=status.HTTP_200_OK)
@@ -132,14 +131,14 @@ class InventoryKPIViewSet(GenericViewSet):
     @action(['GET'], detail=False, url_name='total-restocks-required', url_path='total-restocks-required')
     def total_restocks_required(self, request):
         if request.method == 'GET':
-            business_id = get_active_business(request).id
+            business = get_active_business(request)
             
-            if not business_id:
+            if not business:
                 return Response({
-                    'detail': 'Unauthorized'
-                }, status=status.HTTP_401_UNAUTHORIZED)
+                    'detail': 'No active business exists. Please contact admin.'
+                }, status=status.HTTP_400_BAD_REQUEST)
 
-            restocks_req = Inventory.objects.total_restocks_required(business_id)
+            restocks_req = Inventory.objects.total_restocks_required(business.id)
             return Response({
                 "restocks_req": restocks_req
             }, status=status.HTTP_200_OK)

@@ -24,8 +24,13 @@ class ProjectViewSet(ModelViewSet):
         return ProjectSerializer
 
     def get_serializer_context(self):
+
+        business = get_active_business(self.request)
+        if not business:
+            return {}
+
         return {
-            'business_id': get_active_business(self.request).id    
+            'business_id': business.id    
         }
     
 
@@ -69,8 +74,10 @@ class ProjectPurchaseInvoiceViewSet(ModelViewSet):
     
     def get_serializer_context(self):
         business = get_active_business(self.request)
+        if not business:
+            return {}
 
         return {
             'project_id': self.kwargs.get('project_pk'),
-            'business_id': business.id if business else None
+            'business_id': business.id
         }

@@ -85,7 +85,7 @@ class SalesInvoiceManager(models.Manager):
             total_value += invoice.total
             quantity += 1
 
-        return int(total_value/quantity)
+        return int(total_value/quantity) if quantity > 0 else 0
 
 
 class SalesInvoice(models.Model):

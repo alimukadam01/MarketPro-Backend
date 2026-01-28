@@ -4,8 +4,8 @@ from inventory.models import InventoryItem
 from inventory.serializers import InventoryItemSerializer
 from sales.models import PurchaseInvoice, PurchaseInvoiceItem, ReturnedItem, SalesInvoice, SalesInvoiceItem
 from sales.serializers import PurchaseInvoiceItemSerializer, ReturnedItemSerializer, SalesInvoiceItemSerializer, SalesInvoiceSerializer, SimplePurchaseInvoiceSerializer
-from .models import Customer, Product, Location, Supplier
-from .serializers import CustomerSerializer, ProductSerializer, LocationSerializer, SimpleCustomerSerializer, SupplierSerializer
+from .models import Customer, Expense, Product, Location, Supplier
+from .serializers import CustomerSerializer, ExpenseSerializer, ProductSerializer, LocationSerializer, SimpleCustomerSerializer, SupplierSerializer
 
 class MultiModelSearchEngine:
     """
@@ -66,7 +66,7 @@ class MultiModelSearchEngine:
     # Core Search Logic
     # -----------------------------
 
-    def search(self, key: str):
+    def search(self, key: str, business_id):
         """
         Execute a search across all registered models using the
         configured fields, returning raw serialized data.
@@ -81,7 +81,11 @@ class MultiModelSearchEngine:
                 continue
 
             try:
-                queryset = model.objects.all()
+                # Check if model has a business field
+                if hasattr(model, '_meta') and any(f.name == 'business' for f in model._meta.fields):
+                    queryset = model.objects.filter(business_id=business_id)
+                else:
+                    queryset = model.objects.all()
             except Exception:
                 continue  # avoids model misconfigurations
 
@@ -154,6 +158,9 @@ GlobalSearch.set_models({
     ],
     Location: [
         'id', 'name', 'address'
+    ],
+    Expense: [
+        'id', 'name', 'amount'
     ]
 })
 GlobalSearch.set_serializers({
@@ -166,5 +173,6 @@ GlobalSearch.set_serializers({
     Product: ProductSerializer,
     Customer: SimpleCustomerSerializer,
     Supplier: SupplierSerializer,
-    Location: LocationSerializer
+    Location: LocationSerializer,
+    Expense: ExpenseSerializer
 })
