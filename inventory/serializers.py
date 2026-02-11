@@ -1,11 +1,12 @@
 from rest_framework import serializers
 from root.models import Location
-from root.serializers import BaseItemSerializer, SimpleProductSerializer
+from root.serializers import BaseItemSerializer, ProductVariantSerializer, SimpleProductSerializer
 from .models import Inventory, InventoryItem
 
 class InventoryItemSerializer(BaseItemSerializer):
 
     product = SimpleProductSerializer()
+    product_var = ProductVariantSerializer()
     location = serializers.PrimaryKeyRelatedField(queryset=Location.objects.none())
     quantity = serializers.IntegerField()
     quantity_on_hand = serializers.IntegerField()
@@ -39,7 +40,7 @@ class InventoryItemCreateSerializer(serializers.ModelSerializer):
     class Meta:
         model = InventoryItem
         fields = [
-            'id', 'product', 'quantity', 'track_code', 
+            'id', 'product', 'product_var', 'quantity', 'track_code', 
             'notes', 'location', 'quantity_on_hand', 'quantity_reserved',
             'unit_cost', 'unit_price', 'reorder_level' 
         ]

@@ -666,14 +666,17 @@ class ReturnedItemCreateUpdateSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = ReturnedItem
-        fields = ['id', 'invoice_item', 'reason']
+        fields = ['id', 'invoice_item', 'reason', 'quantity', 'is_damaged']
 
     def create(self, validated_data):
-        return ReturnedItem.objects.create(
-            business_id = self.context['business_id'],
-            invoice_item_id = self.context['invoice_item_id'],
-            **validated_data
-        )
+
+            returned_item = ReturnedItem.objects.create(
+                business_id = self.context['business_id'],
+                invoice_item_id = self.context["invoice_item_id"],
+                **validated_data
+            )
+            
+            return returned_item
     
     def update(self, instance, validated_data):
         for attr, value in validated_data.items():

@@ -1,15 +1,19 @@
 from rest_framework import serializers
+from django.db import transaction
 from .models import (
-    City, 
+    City,
     Category,
     Expense,
     Product,
+    ProductVariantType,
+    ProductVariant,
     Supplier,
     Unit,
-    Business, 
+    Business,
     Customer,
     Location,
 )
+from .utils import generate_sku, generate_variant_name
 
 
 class CitySerializer(serializers.ModelSerializer):
@@ -37,7 +41,8 @@ class BusinessSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Business
-        fields = ['id', 'name', 'owner', 'phone', 'address', 'logo', 'is_active']
+        fields = ['id', 'name', 'owner', 'phone',
+                  'address', 'logo', 'is_active']
 
 
 class BusinessCreateSerializer(serializers.ModelSerializer):
@@ -48,7 +53,7 @@ class BusinessCreateSerializer(serializers.ModelSerializer):
 
     def save(self, **kwargs):
         return Business.objects.create(owner_id=self.context['owner_id'], **self.validated_data)
-    
+
 
 class SimpleBusinessSerializer(serializers.ModelSerializer):
 
@@ -61,7 +66,7 @@ class CustomerSerializer(serializers.ModelSerializer):
 
     business = SimpleBusinessSerializer(read_only=True)
     total_sales = serializers.FloatField(read_only=True)
-    
+
     class Meta:
         model = Customer
         fields = [
@@ -72,12 +77,12 @@ class CustomerSerializer(serializers.ModelSerializer):
 
     def create(self, validated_data):
         return Customer.objects.create(
-            business_id = self.context['business_id'],
+            business_id=self.context['business_id'],
             **self.validated_data
         )
-    
+
     def update(self, instance, validated_data):
-        
+
         for attr, value in validated_data.items():
             setattr(instance, attr, value)
 
@@ -91,8 +96,8 @@ class SimpleCustomerSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Customer
-        fields =  [
-            'id', 'name', 'phone', 
+        fields = [
+            'id', 'name', 'phone',
             'email', 'address', 'city'
         ]
 
@@ -107,10 +112,10 @@ class LocationSerializer(serializers.ModelSerializer):
 
     def create(self, validated_data):
         return Location.objects.create(
-            business_id = self.context['business_id'],
+            business_id=self.context['business_id'],
             **validated_data
         )
-    
+
     def update(self, instance, validated_data):
         return super().update(instance, validated_data)
 
@@ -122,16 +127,32 @@ class SimpleLocationSerializer(serializers.Serializer):
         fields = ['id', 'name', 'address']
 
 
+class ProductVariantTypeSerializer(serializers.ModelSerializer):
+
+    class Meta:
+        model = ProductVariantType
+        fields = ['id', 'name']
+
+
+class SimpleProductVariantSerializer(serializers.ModelSerializer):
+
+    class Meta:
+        model = ProductVariant
+        fields = ['id', 'name', 'sku', 'attributes', 'is_active']
+
+
 class ProductSerializer(serializers.ModelSerializer):
 
     business = SimpleBusinessSerializer(read_only=True)
+    code = serializers.CharField()
     unit = UnitSerializer(read_only=True)
+    variants = SimpleProductVariantSerializer(many=True)
 
     class Meta:
         model = Product
         fields = [
-            'id', 'business', 'name', 'desc', 
-            'unit', 'created_at', 'updated_at',
+            'id', 'business', 'code', 'name', 'desc',
+            'unit', 'created_at', 'updated_at', 'variants'
         ]
 
 
@@ -139,7 +160,7 @@ class SimpleProductSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Product
-        fields = ['id', 'name', 'unit', 'desc']
+        fields = ['id', 'name', 'code', 'unit', 'desc']
 
 
 class ProductCreateUpdateSerializer(serializers.ModelSerializer):
@@ -147,22 +168,176 @@ class ProductCreateUpdateSerializer(serializers.ModelSerializer):
     class Meta:
         model = Product
         fields = [
-            'id', 'name', 'desc', 
+            'id', 'name', 'desc', 'code',
             'unit', 'created_at', 'updated_at',
         ]
 
     def create(self, validated_data):
         return Product.objects.create(
-            business_id=self.context['business_id'], 
+            business_id=self.context['business_id'],
             **validated_data
         )
-    
+
     def update(self, instance, validated_data):
         for attr, value in validated_data.items():
             setattr(instance, attr, value)
 
         instance.save()
         return instance
+
+
+class ProductVariantSerializer(serializers.ModelSerializer):
+
+    product = SimpleProductSerializer(read_only=True)
+
+    class Meta:
+        model = ProductVariant
+        fields = ['id', 'product', 'name', 'sku', 'attributes', 'is_active']
+
+
+class ProductVariantCreateSerializer(serializers.ModelSerializer):
+
+    name = serializers.CharField(required=False)
+
+    def save(self, **kwargs):
+
+        if not self.validated_data.get("name"):
+            self.validated_data['name'] = generate_variant_name(
+                self.validated_data.get('attributes')
+            )
+
+        sku = generate_sku(self.context['business_id'])
+        return ProductVariant.objects.create(
+            product_id=self.context['product_id'],
+            sku=sku,
+            **self.validated_data
+        )
+
+    class Meta:
+        model = ProductVariant
+        fields = ['id', 'name', 'attributes']
+
+
+class ProductAndVariantUpdateSerializer(serializers.ModelSerializer):
+
+    variants = serializers.ListField()
+
+    def save(self, **kwargs):
+
+        variants = self.validated_data.pop('variants', [])
+        instance = self.instance
+
+        if variants:
+            # separate new and old variants
+            new_variants = [v for v in variants if not v.get("id")]
+            existing_variants = ProductVariant.objects.filter(product=instance)
+            existing_variant_ids = set([var.id for var in existing_variants])
+            existing_variant_pData = [v for v in variants if v.get("id")]
+            existing_variant_pIds = set([v['id'] for v in variants if v.get("id")])
+
+            # Determine variants to be deleted
+            tbd_variants = existing_variant_ids - existing_variant_pIds
+
+            # create old variants id map
+            existing_variants_map = {var.id: var for var in existing_variants}
+
+            # update product attrs
+            for attr, value in self.validated_data.items():
+                setattr(instance, attr, value)
+
+            # create new variant objects list
+            tbc_variants = [ProductVariant(
+                name=generate_variant_name(var['attributes']),
+                sku=generate_sku(self.context['business_id']),
+                product=instance,
+                **var
+            ) for var in new_variants]
+
+            tbu_variants = []
+            for data in existing_variant_pData:
+                variant = existing_variants_map[data['id']]
+                attributes = data.pop('attributes', {})
+                variant.name = generate_variant_name(attributes)
+                variant.attributes = attributes
+                tbu_variants.append(variant)
+
+            try:
+                with transaction.atomic():
+                    ProductVariant.objects.filter(id__in=tbd_variants).delete()
+                    ProductVariant.objects.bulk_create(tbc_variants)
+                    ProductVariant.objects.bulk_update(
+                        tbu_variants, fields=['name', 'attributes']
+                    )
+                    instance.save()
+            except Exception as error:
+                print(f"Error updating objects: {error}")
+                return None
+        else:
+            try:
+                with transaction.atomic():
+                    ProductVariant.objects.filter(product=instance).delete()
+                    ProductVariant.objects.create(
+                        product=instance,
+                        sku=generate_sku(business_id=self.context['business_id']),
+                        name=generate_variant_name(),
+                    )
+            except Exception as error:
+                print(f"Error updating objects: {error}")
+                return None
+
+        return instance
+
+    class Meta:
+        model = Product
+        fields = ['id', 'name', 'unit', 'desc', 'variants']
+
+
+class ProductAndVariantCreateSerializer(serializers.ModelSerializer):
+
+    variants = serializers.ListField()
+
+    def save(self, **kwargs):
+
+        sku_count = 0
+        try:
+            with transaction.atomic():
+                variants = self.validated_data.pop('variants', [])
+                product = Product.objects.create(
+                    business_id=self.context['business_id'], **self.validated_data
+                )
+
+                if variants:
+                    new_variants = []
+                    for variant in variants:
+                        new_variants.append(ProductVariant(
+                            product=product,
+                            sku=generate_sku(
+                                business_id=self.context['business_id']),
+                            name=generate_variant_name(variant['attributes']),
+                            **variant
+                        ))
+                        sku_count += 1
+
+                    ProductVariant.objects.bulk_create(new_variants)
+                else:
+                    ProductVariant.objects.create(
+                        product=product,
+                        sku=generate_sku(business_id=self.context['business_id']),
+                        name=generate_variant_name(),
+                    )
+
+        except Exception as error:
+            print(f"Error creating product variants: {error}")
+
+            business = Business.objects.get(self.context['business_id'])
+            business.sku_counter -= sku_count
+            business.save(update_fields=['sku_counter'])
+
+        return product
+
+    class Meta:
+        model = Product
+        fields = ['id', 'name', 'desc', 'unit', 'variants']
 
 
 class SupplierSerializer(serializers.ModelSerializer):
@@ -172,7 +347,7 @@ class SupplierSerializer(serializers.ModelSerializer):
     class Meta:
         model = Supplier
         fields = [
-            'id', 'business' ,'name', 'business_name', 'phone', 'email', 'notes'
+            'id', 'business', 'name', 'business_name', 'phone', 'email', 'notes'
         ]
 
     def create(self, validated_data):
@@ -196,30 +371,40 @@ class BaseItemSerializer(serializers.Serializer):
 
     id = serializers.IntegerField(read_only=True)
     business = SimpleBusinessSerializer(read_only=True)
-    product = serializers.PrimaryKeyRelatedField(queryset=Product.objects.none())
+    product = serializers.PrimaryKeyRelatedField(
+        queryset=Product.objects.none()
+    )
+    product_var = serializers.PrimaryKeyRelatedField(
+        queryset=ProductVariant.objects.none()
+    )
     quantity = serializers.IntegerField()
     track_code = serializers.CharField(required=False, allow_blank=True)
     notes = serializers.CharField(required=False, allow_blank=True)
     created_at = serializers.DateTimeField(read_only=True)
     updated_at = serializers.DateTimeField(read_only=True)
 
-    def  __init__(self, *args, **kwargs):
+    def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
         business_id = self.context.get('business_id')
         if business_id:
-            self.fields['product'].queryset = Product.objects.filter(business_id=business_id)
+            self.fields['product'].queryset = Product.objects.filter(
+                business_id=business_id)
+            self.fields['product_var'].queryset = ProductVariant.objects.filter(
+                product__business_id=business_id)
 
             if self.fields.get('location'):
-                self.fields['location'].queryset = Location.objects.filter(business_id=business_id)        
+                self.fields['location'].queryset = Location.objects.filter(
+                    business_id=business_id)
 
 
 class ExpenseSerializer(serializers.ModelSerializer):
 
     business = serializers.PrimaryKeyRelatedField(read_only=True)
-    
+
     def create(self, validated_data):
-        return Expense.objects.create(business_id = self.context['business_id'], **validated_data)
+        return Expense.objects.create(business_id=self.context['business_id'], **validated_data)
+
     class Meta:
         model = Expense
         fields = ['id', 'business', 'name', 'desc', 'amount', 'created_at']

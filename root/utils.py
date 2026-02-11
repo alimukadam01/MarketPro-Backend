@@ -1,6 +1,7 @@
 from datetime import datetime
 from django.template.loader import get_template
 from django.conf import settings
+from django.db import transaction
 from django.db.models import Q, Model
 from rest_framework.viewsets import ModelViewSet
 from .models import Business
@@ -63,3 +64,37 @@ def serialize_queryset(qs, serializer_class, result_type, many=True, limit=None)
     for item in serialized:
         item["type"] = result_type
     return serialized
+
+def generate_sku(business_id, prefix="MP"):
+    """
+    Generates a business-level unique SKU.
+    Example: MP-000001
+    """
+
+    with transaction.atomic():
+        # Lock the business row
+        business = Business.objects.get(id=business_id)
+
+        sequence = business.sku_counter
+        sku = f"{prefix}-{sequence:06d}"
+
+        business.sku_counter += 1
+        business.save(update_fields=["sku_counter"])
+
+    return sku
+
+def generate_variant_name(attributes = None):
+
+    if not attributes:
+        return 'default'
+    
+    values = [
+        str(attributes[key]).strip()
+        for key in attributes.keys()
+        if attributes[key] not in (None, "", [])
+    ]
+
+
+    return " / ".join(values)
+    
+

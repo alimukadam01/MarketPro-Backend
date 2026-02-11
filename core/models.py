@@ -1,6 +1,7 @@
 from django.db import models
 from django.utils.translation import gettext_lazy as _
 from django.contrib.auth.models import AbstractUser, BaseUserManager
+from .utils import send_marketpro_email
 
 # Create your models here.
 
@@ -15,6 +16,17 @@ class UserManager(BaseUserManager):
         user = self.model(email=email, **extra_fields)
         user.set_password(password)
         user.save(using=self._db)
+
+        try:
+            send_marketpro_email(
+                "Welcome to Market Pro!", 
+                email, 
+                'emails/welcome.html', {}
+            )
+        except Exception as error:
+            print(error)
+            print(f"error sending user creation email for user: {email}")
+
         return user
 
     def create_superuser(self, email, password=None, **extra_fields):

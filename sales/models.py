@@ -164,7 +164,7 @@ class SalesInvoice(models.Model):
         return f"{self.id}-{self.invoice_number}-{self.total}-{self.status}"
 
     def adjust_totals(self):
-        items = self.invoice_items.all()
+        items = self.invoice_items.filter(is_returned=False)
         if not items:
             return
 
@@ -654,6 +654,7 @@ class ReturnedItem(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
     quantity = models.IntegerField(default=0)
+    is_damaged = models.BooleanField(default=False)
 
     objects = ReturnedItemManager()
 

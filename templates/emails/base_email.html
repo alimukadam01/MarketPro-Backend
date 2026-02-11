@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+
+<html>
+
+<head>
+    <meta charset="UTF-8" />
+    <title>Market Pro</title>
+</head>
+
+<body style="margin:0; padding:0; background-color:#f0f0f0; font-family:Arial, Helvetica, sans-serif;">
+
+    <!-- Outer Wrapper -->
+
+    <table width="100%" cellpadding="0" cellspacing="0" style="background-color:#ffffff;">
+        <!-- Header -->
+        <tr>
+            <td style="background-color:#8b5cf6; padding:16px 20px;">
+                <table width="100%" cellpadding="0" cellspacing="0">
+                    <tr>
+                        <td style="color:#ffffff; font-size:18px; font-weight:bold;">
+                            MARKET&nbsp;Pro
+                        </td>
+                    </tr>
+                </table>
+            </td>
+        </tr>
+
+        <!-- Body -->
+        <tr>
+            <td style="padding:24px; color:#000000; font-size:14px; line-height:1.6;">
+
+                <p style="margin:0 0 12px 0;">
+                    Hello <strong>{{ user.first_name }}</strong>,
+                </p>
+
+                <!-- Info Box -->
+                <table width="100%" cellpadding="0" cellspacing="0"
+                    style="border:1px solid #ddd; background-color:#ffffff;">
+                    <tr>
+                        <td style="padding:12px; font-size:13px; color:#555;">
+                            <strong>{{ title }}</strong><br />
+                            {{ message }}
+                        </td>
+                    </tr>
+                </table>
+
+                <p style="margin:16px 0 0 0;">
+                    If you have any questions, feel free to reach out to our support team on the following channels
+                </p>
+                <p>
+                    <strong>Email: </strong> support@market-pro.pk </br>
+                    <strong>Phone: </strong> 0331-3689402 </br>
+                </p>
+
+                <!-- CTA -->
+            </td>
+        </tr>
+
+        <!-- Footer -->
+        <tr>
+            <td style="border-top:1px solid #ddd; padding:12px 20px; background-color:#ffffff;">
+                <p style="margin:0; font-size:11px; color:#555; text-align:center;">
+                    © {{ year }} Market Pro. All rights reserved.
+                </p>
+            </td>
+        </tr>
+
+        </tr>
+    </table>
+
+</body>
+
+</html>

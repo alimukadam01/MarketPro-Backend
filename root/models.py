@@ -101,6 +101,7 @@ class Business(models.Model):
     phone = models.CharField(max_length=256)
     address = models.TextField(null=True, blank=True)
     logo = models.ImageField(upload_to="business_logos/", null=True, blank=True)
+    sku_counter = models.PositiveIntegerField(default=0)
     is_active = models.BooleanField(default=False)
 
     def __str__(self):
@@ -195,9 +196,17 @@ class ProductManager(models.Manager):
         return self.get_queryset().for_business(business_id).count()
 
 
+class ProductVariantType(models.Model):
+    name = models.CharField(max_length=256)
+
+    def __str__(self):
+        return self.name
+
+
 class Product(models.Model):
     business = models.ForeignKey(Business, models.CASCADE, related_name='products')
     name = models.CharField(max_length=256)
+    code = models.CharField(max_length=256, null=True, blank=True)
     desc = models.TextField(null=True, blank=True)
     unit = models.ForeignKey(Unit, models.DO_NOTHING)
     is_active = models.BooleanField(default=True)
@@ -210,10 +219,25 @@ class Product(models.Model):
         return f"{self.name}"
 
 
+class ProductVariant(models.Model):
+    
+    name = models.CharField(max_length=256, null=True, blank=True)
+    product = models.ForeignKey(Product, on_delete=models.CASCADE, related_name='variants')
+    sku = models.CharField(max_length=256)
+    attributes = models.JSONField(default=dict, blank=True, null=True)
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f"{self.product.name} - {self.name}"
+
+
 class BaseItem(models.Model):
 
     business = models.ForeignKey(Business, models.CASCADE)
     product = models.ForeignKey(Product, models.CASCADE)
+    product_var = models.ForeignKey(ProductVariant, models.CASCADE, null=True, blank=True)
     quantity = models.IntegerField(default=0)
     track_code = models.CharField(max_length=256, null=True, blank=True)
     notes = models.TextField(null=True, blank=True)
@@ -281,6 +305,7 @@ class ExpenseManager(models.Manager):
 
     def monthly_expenses_trend(self, business_id):
         return self.get_queryset().monthly_trend(business_id, 'amount')
+
 
 class Expense(models.Model):
     business = models.ForeignKey(Business, on_delete=models.CASCADE, related_name='expenses')

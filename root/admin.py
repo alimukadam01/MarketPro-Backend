@@ -2,7 +2,8 @@ from django.contrib import admin
 from .models import (
     City, Category, Customer, Location, 
     Product, Supplier, Unit, Business,
-    Expense
+    Expense, ProductVariantType, 
+    ProductVariant
 )
 
 admin.site.register(City)
@@ -12,6 +13,8 @@ admin.site.register(Business)
 admin.site.register(Customer)
 admin.site.register(Location)
 admin.site.register(Product)
+admin.site.register(ProductVariant)
+admin.site.register(ProductVariantType)
 admin.site.register(Supplier)
 admin.site.register(Expense)
 

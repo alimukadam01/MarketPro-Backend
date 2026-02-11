@@ -101,6 +101,7 @@ def mark_item_as_returned(sender, instance: ReturnedItem, created, **kwargs):
         
         invoice_item.is_returned = True
         invoice_item.save(update_fields=['is_returned'])
+        invoice_item.sales_invoice.adjust_totals()
 
 
 @receiver(post_delete, sender=ReturnedItem)

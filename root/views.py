@@ -6,14 +6,19 @@ from rest_framework.response import Response
 from rest_framework.decorators import action
 from rest_framework.filters import SearchFilter
 from django_filters.rest_framework import DjangoFilterBackend
+from core.utils import send_marketpro_email
 
 from .utils import get_active_business
 from .serializers import (
-    BusinessCreateSerializer, CategorySerializer, CitySerializer, CustomerSerializer, ExpenseSerializer, LocationSerializer, SimpleCustomerSerializer, SupplierSerializer, UnitSerializer,
-    BusinessSerializer,
-    ProductCreateUpdateSerializer, ProductSerializer
+    BusinessCreateSerializer, CategorySerializer, CitySerializer, CustomerSerializer, ExpenseSerializer, LocationSerializer, 
+    BusinessSerializer, ProductAndVariantCreateSerializer, ProductAndVariantUpdateSerializer, ProductVariantTypeSerializer, SimpleCustomerSerializer, SupplierSerializer, UnitSerializer,
+    ProductCreateUpdateSerializer, ProductSerializer, ProductVariantCreateSerializer, ProductVariantSerializer
 )
-from .models import Business, Category, City, Customer, Expense, Location, Product, Supplier, Unit
+from .models import (
+    Business, Category, City, 
+    Customer, Expense, Location, 
+    Product, ProductVariant, ProductVariantType, Supplier, Unit
+)
 from .filters import GlobalSearch
 
 
@@ -85,6 +90,12 @@ class BusinessViewSet(ModelViewSet):
             }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
+class ProductVariantTypeViewSet(ReadOnlyModelViewSet):
+
+    queryset = ProductVariantType.objects.all()
+    serializer_class = ProductVariantTypeSerializer
+
+
 class ProductViewSet(ModelViewSet):
 
     filter_backends = [SearchFilter, DjangoFilterBackend]
@@ -101,9 +112,14 @@ class ProductViewSet(ModelViewSet):
         return Product.objects.filter(business_id=business.id).order_by('name')
 
     def get_serializer_class(self):
+        
+        method = self.request.method
 
-        if self.request.method in ('POST', 'PUT', 'PATCH'):
-            return ProductCreateUpdateSerializer
+        if self.action == 'create_product_and_variants' and method == 'POST':
+            return ProductAndVariantCreateSerializer
+
+        if method in ('PUT', 'PATCH'):
+            return ProductAndVariantUpdateSerializer
         return ProductSerializer
 
     def get_serializer_context(self):
@@ -136,6 +152,123 @@ class ProductViewSet(ModelViewSet):
             return Response({
                 'detail': 'Internal Server Error.'
             }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    
+    @action(['POST'], detail=False, url_path='create-with-variants', url_name='create-with-variants')
+    def create_product_and_variants(self, request):
+
+        try:
+            business = get_active_business(request)
+            if not business:
+                return Response({
+                    'detail': 'No active business exists. Please contact admin.'
+                }, status=status.HTTP_400_BAD_REQUEST)
+
+            serializer = ProductAndVariantCreateSerializer(
+                data=request.data, context={
+                'business_id': business.id,
+            })
+            serializer.is_valid(raise_exception=True)
+            product = serializer.save()
+
+            if not product:
+                return Response({
+                    'detail': 'Bad Request.'
+                }, status=status.HTTP_400_BAD_REQUEST)
+
+            res_serializer = ProductSerializer(product)
+            return Response(res_serializer.data, status=status.HTTP_201_CREATED)
+
+        except Exception as error:
+            print(error)
+            return Response({
+                'detail': 'Internal Server Error.'
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    
+    @action(['POST'], detail=True, url_path='update-with-variants', url_name='update-with-variants')
+    def update_product_and_variants(self, request, pk=None):
+
+        try:
+            business = get_active_business(request)
+            if not business:
+                return Response({
+                    'detail': 'No active business exists. Please contact admin.'
+                }, status=status.HTTP_400_BAD_REQUEST)
+
+            instance = self.get_object()
+
+            serializer = ProductAndVariantUpdateSerializer(
+                data=request.data, 
+                instance=instance,
+                context={
+                'business_id': business.id,
+                }
+            )
+            serializer.is_valid(raise_exception=True)
+            product = serializer.save()
+
+            if not product:
+                return Response({
+                    'detail': 'Bad Request.'
+                }, status=status.HTTP_400_BAD_REQUEST)
+
+            res_serializer = ProductSerializer(product)
+            return Response(res_serializer.data, status=status.HTTP_201_CREATED)
+
+        except Exception as error:
+            print(error)
+            return Response({
+                'detail': 'Internal Server Error.'
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+class ProductVariantViewSet(ModelViewSet):
+
+    def get_queryset(self):
+        business = get_active_business(self.request)
+        if not business:
+            return []
+
+        return ProductVariant.objects.filter(product__business=business).order_by('name')
+    
+    def get_serializer_class(self):
+        method = self.request.method
+
+        if method == 'POST':
+            return ProductVariantCreateSerializer
+        return ProductVariantSerializer
+
+    def get_serializer_context(self):
+        business = get_active_business(self.request)
+        if not business:
+            return {}
+        
+        return {
+            'business_id': business.id
+        }
+
+
+class ProductRelatedVariantViewSet(ModelViewSet):
+
+    def get_queryset(self):
+        return ProductVariant.objects.filter(product_id = self.kwargs['product_pk'])
+    
+    def get_serializer_class(self, *args, **kwargs):
+
+        method = self.request.method
+
+        if method == 'POST':
+            return ProductVariantCreateSerializer
+        return ProductVariantSerializer
+
+    def get_serializer_context(self):
+        business = get_active_business(self.request)
+        if not business:
+            return {}
+
+        return {
+            'business_id': business.id,
+            'product_id': self.kwargs['product_pk']
+        }
 
 
 class ProductKPIViewSet(GenericViewSet):
@@ -516,4 +649,27 @@ class MultiModelSearchView(APIView):
 class KeyPerformanceIndicatorsViewSet(ViewSet):
 
     pass   
-    
+
+
+class EmailTestingView(APIView):
+
+    def get(self, request):
+
+        business = get_active_business(request)
+        if not business:
+            return Response({
+                'detail': 'No active business exists. Please contact admin.'
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+
+        user = self.request.user
+        try:
+            send_marketpro_email(
+                "Welcome to Market Pro!", 
+                self.request.user.email, 
+                'emails/welcome.html', {}
+            )
+        except:
+            return Response({"detail": "Internal Server Error"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+            
+        return Response({"detail": "OK"}, status=status.HTTP_200_OK)
