@@ -59,7 +59,7 @@ class InventoryItemUpdateSerializer(serializers.ModelSerializer):
     class Meta:
         model = InventoryItem
         fields = [
-            'id', 'location', 'quantity', 'quantity_on_hand', 'quantity_reserved','track_code', 
+            'id', 'product_var', 'location', 'quantity', 'quantity_on_hand', 'quantity_reserved','track_code', 
             'notes', 'unit_cost', 'unit_price', 'reorder_level'
         ]
 
