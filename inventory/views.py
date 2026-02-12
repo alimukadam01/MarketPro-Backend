@@ -105,7 +105,6 @@ class InventoryItemsViewSet(ModelViewSet):
             return Response({
                 'detail': 'Internal Server Error.'
             }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-        
 
 class InventoryKPIViewSet(GenericViewSet):
     serializer_class = None

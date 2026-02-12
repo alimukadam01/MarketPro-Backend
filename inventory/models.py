@@ -61,7 +61,7 @@ class InventoryItem(BaseItem):
     last_transaction = models.CharField(max_length=256, null=True, blank=True)
 
     def __str__(self):
-        return f"{self.quantity} x {self.product.name}"
+        return f"{self.quantity} x {self.product_var.name if self.product_var else 'None'}"
     
     def apply_restock_delta(self, is_sold, delta: int, last_transaction: str ):
         """
@@ -78,7 +78,7 @@ class InventoryItem(BaseItem):
         self.save(update_fields=['quantity', 'quantity_on_hand', 'last_transaction'])
     
     class Meta:
-        unique_together = [('inventory', 'product')]
+        unique_together = [('inventory', 'product_var')]
 
 
 class InventoryItemHistory(InventoryItem):

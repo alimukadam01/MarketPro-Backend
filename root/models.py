@@ -236,7 +236,6 @@ class ProductVariant(models.Model):
 class BaseItem(models.Model):
 
     business = models.ForeignKey(Business, models.CASCADE)
-    product = models.ForeignKey(Product, models.CASCADE)
     product_var = models.ForeignKey(ProductVariant, models.CASCADE, null=True, blank=True)
     quantity = models.IntegerField(default=0)
     track_code = models.CharField(max_length=256, null=True, blank=True)

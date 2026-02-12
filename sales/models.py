@@ -259,7 +259,8 @@ class SalesInvoiceItemManager(models.Manager):
 
 class SalesInvoiceItem(BaseItem):
     sales_invoice = models.ForeignKey(
-        SalesInvoice, models.CASCADE, related_name='invoice_items')
+        SalesInvoice, models.CASCADE, related_name='invoice_items'
+    )
     unit_price = models.FloatField(null=True, blank=True)
     discount = models.JSONField(
         null=True,
@@ -294,9 +295,9 @@ class SalesInvoiceItem(BaseItem):
         self.save(update_fields=['is_deducted', 'is_partially_deducted'])
 
     def __str__(self):
-        return f'{self.id}_{self.product.name}_{self.sales_invoice.id}_{self.sales_invoice.invoice_number}'
+        f"{self.id}_{f'{self.product_var.name}_' if self.product_var else '_'}{self.sales_invoice.id}_{self.sales_invoice.invoice_number}"
     class Meta:
-        unique_together = [('sales_invoice', 'product')]
+        unique_together = [('sales_invoice', 'product_var')]
         # constraints = [
         #     '''
         #     models.CheckConstraint(
@@ -384,7 +385,8 @@ class PurchaseInvoice(models.Model):
     goods_received = models.IntegerField(null=True, blank=True)
     delivery = models.DateField(null=True, blank=True)
     created_by = models.ForeignKey(
-        settings.AUTH_USER_MODEL, models.DO_NOTHING, related_name='created_purchase_invoices')
+        settings.AUTH_USER_MODEL, models.DO_NOTHING, related_name='created_purchase_invoices'
+    )
     notes = models.TextField(null=True, blank=True)
     is_restocked = models.BooleanField(default=False)
     is_partially_restocked = models.BooleanField(default=False)
@@ -463,11 +465,15 @@ class PurchaseInvoice(models.Model):
 
 class PurchaseInvoiceItem(BaseItem):
     purchase_invoice = models.ForeignKey(
-        PurchaseInvoice, models.CASCADE, related_name='invoice_items')
+        PurchaseInvoice, models.CASCADE, related_name='invoice_items'
+    )
     unit_cost = models.FloatField()
     quantity_received = models.IntegerField(default=0)
     is_restocked = models.BooleanField(default=False)
     is_partially_restocked = models.BooleanField(default=False)
+
+    def __str__(self):
+        return f"{self.id}_{f'{self.product_var.name}_' if self.product_var else '_'}{self.purchase_invoice.id}_{self.purchase_invoice.invoice_number}"
 
     def clean(self):
         super().clean()
@@ -518,7 +524,7 @@ class PurchaseInvoiceItem(BaseItem):
         self.save(update_fields=['is_restocked', 'is_partially_restocked'])
 
     class Meta:
-        unique_together = [('purchase_invoice', 'product')]
+        unique_together = [('purchase_invoice', 'product_var')]
         # constraints = [
             
         #     models.CheckConstraint(
