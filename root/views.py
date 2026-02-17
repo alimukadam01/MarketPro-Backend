@@ -1,4 +1,5 @@
 from datetime import datetime
+from django.db.models import QuerySet
 from rest_framework import status
 from rest_framework.views import APIView
 from rest_framework.viewsets import ReadOnlyModelViewSet, ModelViewSet, GenericViewSet, ViewSet
@@ -6,8 +7,8 @@ from rest_framework.response import Response
 from rest_framework.decorators import action
 from rest_framework.filters import SearchFilter
 from django_filters.rest_framework import DjangoFilterBackend
-from core.utils import send_marketpro_email
 
+from core.utils import send_marketpro_email
 from .utils import get_active_business
 from .serializers import (
     BusinessCreateSerializer, CategorySerializer, CitySerializer, CustomerSerializer, ExpenseSerializer, LocationSerializer, 
@@ -117,9 +118,12 @@ class ProductViewSet(ModelViewSet):
 
         if self.action == 'create_product_and_variants' and method == 'POST':
             return ProductAndVariantCreateSerializer
+        
+        if self.action == 'update_product_and_variants' and method == 'POST':
+            return ProductAndVariantUpdateSerializer
 
         if method in ('PUT', 'PATCH'):
-            return ProductAndVariantUpdateSerializer
+            return ProductCreateUpdateSerializer
         return ProductSerializer
 
     def get_serializer_context(self):
@@ -224,12 +228,16 @@ class ProductViewSet(ModelViewSet):
 class ProductVariantViewSet(ModelViewSet):
 
     def get_queryset(self):
-        business = get_active_business(self.request)
-        if not business:
-            return []
+        try:
+            business = get_active_business(self.request)
+            if not business:
+                return []
 
-        return ProductVariant.objects.filter(product__business=business).order_by('name')
-    
+            return ProductVariant.objects.filter(base__business=business).order_by('base__name')
+        
+        except Exception as error:
+            return None
+        
     def get_serializer_class(self):
         method = self.request.method
 

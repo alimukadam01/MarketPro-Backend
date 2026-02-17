@@ -38,7 +38,7 @@ def updateInventoryOnPurchase(sender, instance: PurchaseInvoice, **kwargs):
             morphed_item = item.morph()
             delta = item.compute_restock_delta()
             if delta > 0:
-                inventory_item.apply_restock_delta(False, delta, morphed_item['last_transaction'])
+                inventory_item.apply_restock_delta(False, delta, morphed_item['last_transaction'], morphed_item['unit_cost'])
                 logRestockEvent(item, delta, instance)
                 item.update_restock_flags()
 

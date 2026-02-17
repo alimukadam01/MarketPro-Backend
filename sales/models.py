@@ -69,7 +69,7 @@ class SalesInvoiceManager(models.Manager):
             for item in invoice_items:
                 res.append({
                     "id": sale.id,
-                    "product": item.product.name,
+                    "product": f"{item.product.base.name} ({item.product.name})",
                     "quantity": item.quantity,
                     "price": item.unit_price
                 })
@@ -295,9 +295,9 @@ class SalesInvoiceItem(BaseItem):
         self.save(update_fields=['is_deducted', 'is_partially_deducted'])
 
     def __str__(self):
-        f"{self.id}_{f'{self.product_var.name}_' if self.product_var else '_'}{self.sales_invoice.id}_{self.sales_invoice.invoice_number}"
+        return f'{self.id}_{self.product.base.name} ({self.product.name})_{self.sales_invoice.id}_{self.sales_invoice.invoice_number}'
     class Meta:
-        unique_together = [('sales_invoice', 'product_var')]
+        unique_together = [('sales_invoice', 'product')]
         # constraints = [
         #     '''
         #     models.CheckConstraint(
@@ -385,8 +385,7 @@ class PurchaseInvoice(models.Model):
     goods_received = models.IntegerField(null=True, blank=True)
     delivery = models.DateField(null=True, blank=True)
     created_by = models.ForeignKey(
-        settings.AUTH_USER_MODEL, models.DO_NOTHING, related_name='created_purchase_invoices'
-    )
+        settings.AUTH_USER_MODEL, models.DO_NOTHING, related_name='created_purchase_invoices')
     notes = models.TextField(null=True, blank=True)
     is_restocked = models.BooleanField(default=False)
     is_partially_restocked = models.BooleanField(default=False)
@@ -397,11 +396,9 @@ class PurchaseInvoice(models.Model):
         return f"{self.id}-{self.invoice_number}-{self.total}-{self.status}"
 
     def adjust_totals(self):
-        # Assuming related_name='items' in SalesInvoiceItem
         items = self.invoice_items.all()
         subtotal = sum(item.quantity * item.unit_cost for item in items)
 
-        # Calculate tax on the Invoice
         tax = 0
         if self.tax:
             if self.tax["type"] == "percentage":
@@ -465,15 +462,11 @@ class PurchaseInvoice(models.Model):
 
 class PurchaseInvoiceItem(BaseItem):
     purchase_invoice = models.ForeignKey(
-        PurchaseInvoice, models.CASCADE, related_name='invoice_items'
-    )
+        PurchaseInvoice, models.CASCADE, related_name='invoice_items')
     unit_cost = models.FloatField()
     quantity_received = models.IntegerField(default=0)
     is_restocked = models.BooleanField(default=False)
     is_partially_restocked = models.BooleanField(default=False)
-
-    def __str__(self):
-        return f"{self.id}_{f'{self.product_var.name}_' if self.product_var else '_'}{self.purchase_invoice.id}_{self.purchase_invoice.invoice_number}"
 
     def clean(self):
         super().clean()
@@ -486,6 +479,10 @@ class PurchaseInvoiceItem(BaseItem):
         super().save(*args, **kwargs)
 
     def morph(self):
+        
+        '''
+        converts purchase invoice item into inventory item
+        '''
 
         try:
             location = self.business.locations.get(is_default=True)
@@ -524,7 +521,7 @@ class PurchaseInvoiceItem(BaseItem):
         self.save(update_fields=['is_restocked', 'is_partially_restocked'])
 
     class Meta:
-        unique_together = [('purchase_invoice', 'product_var')]
+        unique_together = [('purchase_invoice', 'product')]
         # constraints = [
             
         #     models.CheckConstraint(
@@ -543,7 +540,7 @@ class PurchaseInvoiceItemRestock(BaseRestock):
         PurchaseInvoiceItem, models.CASCADE, related_name='restocks')
 
     def __str__(self):
-        return f"{self.purchase_invoice.id}: {self.purchase_invoice_item.product.name} x {self.quantity}"
+        return f"{self.purchase_invoice.id}: {self.purchase_invoice_item.product.base.name} ({self.purchase_invoice_item.product.name}) x {self.quantity}"
 
 
 class SalesInvoiceItemDeduction(BaseRestock):
@@ -553,7 +550,7 @@ class SalesInvoiceItemDeduction(BaseRestock):
         SalesInvoiceItem, models.CASCADE, related_name='restocks')
 
     def __str__(self):
-        return f"{self.sales_invoice.id}: {self.sales_invoice_item.product.name} x {self.quantity}"
+        return f"{self.sales_invoice.id}: {self.sales_invoice_item.product.base.name} ({self.sales_invoice_item.product.name}) x {self.quantity}"
 
 
 class SalesReservation(BaseRestock):
@@ -563,7 +560,7 @@ class SalesReservation(BaseRestock):
         SalesInvoiceItem, models.CASCADE, related_name='deductions')
 
     def __str__(self):
-        return f"{self.sales_invoice.id}: {self.sales_invoice_item.product.name} x {self.quantity}"
+        return f"{self.sales_invoice.id}: {self.sales_invoice_item.product.base.name} ({self.sales_invoice_item.product.name}) x {self.quantity}"
 
 
 class PurchaseQuotation(models.Model):
@@ -665,4 +662,4 @@ class ReturnedItem(models.Model):
     objects = ReturnedItemManager()
 
     def __str__(self):
-        return f"Return for {self.invoice_item.product.name} from Invoice {self.invoice_item.sales_invoice.invoice_number}"
+        return f"Return for {self.invoice_item.product.base.name} ({self.invoice_item.product.name}) from Invoice {self.invoice_item.sales_invoice.invoice_number}"

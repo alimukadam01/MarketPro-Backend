@@ -27,10 +27,10 @@ class InventoryItemsViewSet(ModelViewSet):
 
     filter_backends = [SearchFilter, DjangoFilterBackend]
     filterset_fields = [
-        'inventory__id', 'location__name', 'product__name', 'track_code',
+        'inventory__id', 'location__name', 'product__base__name', 'product__name', 'track_code',
     ]
     search_fields = [
-        'id', 'location__name', 'product__name', 'track_code', 'unit_cost', 'unit_price'
+        'id', 'location__name', 'product__base__name', 'product__name', 'track_code', 'unit_cost', 'unit_price'
     ]
 
     def get_queryset(self):
@@ -60,7 +60,6 @@ class InventoryItemsViewSet(ModelViewSet):
     
     @action(['GET'], False)
     def get_available_items(self, pk=None, inventory_pk=None):
-
         try:
             available_items = InventoryItem.objects.filter(
                 inventory_id=self.kwargs['inventory_pk'],
@@ -87,8 +86,9 @@ class InventoryItemsViewSet(ModelViewSet):
             }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
         
     @action(['POST'], detail=False, url_path='bulk-delete', url_name='bulk-delete')
-    def bulk_delete(self, request):
-        item_ids = request.data.get('items_ids', [])
+    def bulk_delete(self, request, inventory_pk=None):
+        item_ids = request.data.get('item_ids', [])
+        print(item_ids)
         if not item_ids:
             return Response({
                 'detail': 'Bad Request.'
@@ -105,6 +105,7 @@ class InventoryItemsViewSet(ModelViewSet):
             return Response({
                 'detail': 'Internal Server Error.'
             }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
 
 class InventoryKPIViewSet(GenericViewSet):
     serializer_class = None

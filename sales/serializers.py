@@ -4,7 +4,8 @@ from rest_framework import serializers
 from core.serializers import SimpleUserSerializer
 from root.models import Location
 from root.serializers import (
-    BusinessSerializer, CustomerSerializer, SimpleBusinessSerializer, SimpleCustomerSerializer, SimpleProductSerializer, SimpleSupplierSerializer, 
+    BusinessSerializer, ProductVariantSerializer, SimpleBusinessSerializer, 
+    SimpleCustomerSerializer, SimpleSupplierSerializer, 
     SupplierSerializer, BaseItemSerializer
 )
 from inventory.models import InventoryItem
@@ -19,7 +20,7 @@ from .utils import (
 class PurchaseInvoiceItemSerializer(BaseItemSerializer):
 
     purchase_invoice = serializers.PrimaryKeyRelatedField(read_only=True) 
-    product = SimpleProductSerializer()
+    product = ProductVariantSerializer()
     unit_cost = serializers.FloatField()
     quantity_received = serializers.IntegerField(default=True)
     is_restocked = serializers.BooleanField(read_only=True)
@@ -84,7 +85,7 @@ class PurchaseInvoiceItemUpdateSerializer(serializers.Serializer):
 
 class SimplePurchaseInvoiceItemSerializer(serializers.ModelSerializer):
 
-    product = SimpleProductSerializer(read_only=True)
+    product = ProductVariantSerializer(read_only=True)
 
     class Meta:
         model = PurchaseInvoiceItem
@@ -168,6 +169,7 @@ class PurchaseInvoiceUpdateSerializer(serializers.ModelSerializer):
             setattr(instance, attr, value)
 
         instance.save()
+        instance.adjust_totals()
         return instance
 
 
@@ -299,7 +301,7 @@ class PurchaseInvoiceAndItemsUpdateSerializer(serializers.ModelSerializer):
 
 class SalesInvoiceItemSerializer(serializers.ModelSerializer):
 
-    product = SimpleProductSerializer(read_only=True)
+    product = ProductVariantSerializer(read_only=True)
 
     class Meta:
         model = SalesInvoiceItem
@@ -319,7 +321,7 @@ class SalesInvoiceItemSerializer(serializers.ModelSerializer):
 
 class SimpleSalesInvoiceItemSerializer(serializers.ModelSerializer):
 
-    product = SimpleProductSerializer(read_only=True)
+    product = ProductVariantSerializer(read_only=True)
 
     class Meta:
         model = SalesInvoiceItem
@@ -330,7 +332,7 @@ class SimpleSalesInvoiceItemSerializer(serializers.ModelSerializer):
 
 
 class BasicSalesInvoiceItemSerializer(serializers.ModelSerializer):
-    product = SimpleProductSerializer(read_only=True)
+    product = ProductVariantSerializer(read_only=True)
 
     class Meta:
         model = SalesInvoiceItem

@@ -222,7 +222,7 @@ class Product(models.Model):
 class ProductVariant(models.Model):
     
     name = models.CharField(max_length=256, null=True, blank=True)
-    product = models.ForeignKey(Product, on_delete=models.CASCADE, related_name='variants')
+    base = models.ForeignKey(Product, on_delete=models.CASCADE, related_name='variants')
     sku = models.CharField(max_length=256)
     attributes = models.JSONField(default=dict, blank=True, null=True)
     is_active = models.BooleanField(default=True)
@@ -230,13 +230,13 @@ class ProductVariant(models.Model):
     updated_at = models.DateTimeField(auto_now=True)
 
     def __str__(self):
-        return f"{self.product.name} - {self.name}"
+        return f"{self.base.name} - {self.name}"
 
 
 class BaseItem(models.Model):
 
     business = models.ForeignKey(Business, models.CASCADE)
-    product_var = models.ForeignKey(ProductVariant, models.CASCADE, null=True, blank=True)
+    product = models.ForeignKey(ProductVariant, models.CASCADE, null=True, blank=True)
     quantity = models.IntegerField(default=0)
     track_code = models.CharField(max_length=256, null=True, blank=True)
     notes = models.TextField(null=True, blank=True)

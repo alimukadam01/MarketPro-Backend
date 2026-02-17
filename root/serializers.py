@@ -158,6 +158,8 @@ class ProductSerializer(serializers.ModelSerializer):
 
 class SimpleProductSerializer(serializers.ModelSerializer):
 
+    unit = UnitSerializer()
+
     class Meta:
         model = Product
         fields = ['id', 'name', 'code', 'unit', 'desc']
@@ -188,11 +190,11 @@ class ProductCreateUpdateSerializer(serializers.ModelSerializer):
 
 class ProductVariantSerializer(serializers.ModelSerializer):
 
-    product = SimpleProductSerializer(read_only=True)
+    base = SimpleProductSerializer(read_only=True)
 
     class Meta:
         model = ProductVariant
-        fields = ['id', 'product', 'name', 'sku', 'attributes', 'is_active']
+        fields = ['id', 'base', 'name', 'sku', 'attributes', 'is_active']
 
 
 class ProductVariantCreateSerializer(serializers.ModelSerializer):
@@ -208,7 +210,7 @@ class ProductVariantCreateSerializer(serializers.ModelSerializer):
 
         sku = generate_sku(self.context['business_id'])
         return ProductVariant.objects.create(
-            product_id=self.context['product_id'],
+            base_id=self.context['product_id'],
             sku=sku,
             **self.validated_data
         )
@@ -230,7 +232,7 @@ class ProductAndVariantUpdateSerializer(serializers.ModelSerializer):
         if variants:
             # separate new and old variants
             new_variants = [v for v in variants if not v.get("id")]
-            existing_variants = ProductVariant.objects.filter(product=instance)
+            existing_variants = ProductVariant.objects.filter(base=instance)
             existing_variant_ids = set([var.id for var in existing_variants])
             existing_variant_pData = [v for v in variants if v.get("id")]
             existing_variant_pIds = set([v['id'] for v in variants if v.get("id")])
@@ -249,7 +251,7 @@ class ProductAndVariantUpdateSerializer(serializers.ModelSerializer):
             tbc_variants = [ProductVariant(
                 name=generate_variant_name(var['attributes']),
                 sku=generate_sku(self.context['business_id']),
-                product=instance,
+                base=instance,
                 **var
             ) for var in new_variants]
 
@@ -275,9 +277,9 @@ class ProductAndVariantUpdateSerializer(serializers.ModelSerializer):
         else:
             try:
                 with transaction.atomic():
-                    ProductVariant.objects.filter(product=instance).delete()
+                    ProductVariant.objects.filter(base=instance).delete()
                     ProductVariant.objects.create(
-                        product=instance,
+                        base=instance,
                         sku=generate_sku(business_id=self.context['business_id']),
                         name=generate_variant_name(),
                     )
@@ -310,7 +312,7 @@ class ProductAndVariantCreateSerializer(serializers.ModelSerializer):
                     new_variants = []
                     for variant in variants:
                         new_variants.append(ProductVariant(
-                            product=product,
+                            base=product,
                             sku=generate_sku(
                                 business_id=self.context['business_id']),
                             name=generate_variant_name(variant['attributes']),
@@ -321,7 +323,7 @@ class ProductAndVariantCreateSerializer(serializers.ModelSerializer):
                     ProductVariant.objects.bulk_create(new_variants)
                 else:
                     ProductVariant.objects.create(
-                        product=product,
+                        base=product,
                         sku=generate_sku(business_id=self.context['business_id']),
                         name=generate_variant_name(),
                     )
@@ -372,9 +374,6 @@ class BaseItemSerializer(serializers.Serializer):
     id = serializers.IntegerField(read_only=True)
     business = SimpleBusinessSerializer(read_only=True)
     product = serializers.PrimaryKeyRelatedField(
-        queryset=Product.objects.none()
-    )
-    product_var = serializers.PrimaryKeyRelatedField(
         queryset=ProductVariant.objects.none()
     )
     quantity = serializers.IntegerField()
@@ -388,10 +387,8 @@ class BaseItemSerializer(serializers.Serializer):
 
         business_id = self.context.get('business_id')
         if business_id:
-            self.fields['product'].queryset = Product.objects.filter(
-                business_id=business_id)
-            self.fields['product_var'].queryset = ProductVariant.objects.filter(
-                product__business_id=business_id)
+            self.fields['product'].queryset = ProductVariant.objects.filter(
+                base__business_id=business_id)
 
             if self.fields.get('location'):
                 self.fields['location'].queryset = Location.objects.filter(

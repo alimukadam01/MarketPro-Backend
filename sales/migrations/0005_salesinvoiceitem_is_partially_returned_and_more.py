@@ -13,6 +13,7 @@ class Migration(migrations.Migration):
     ]
 
     operations = [
+        '''
         migrations.AddField(
             model_name='salesinvoiceitem',
             name='is_partially_returned',
@@ -38,4 +39,5 @@ class Migration(migrations.Migration):
             model_name='salesinvoiceitem',
             constraint=models.CheckConstraint(condition=models.Q(('is_deducted', True), ('is_partially_deducted', True), _negated=True), name='is_deducted_and_is_partially_deducted_mutually_exclusive_sii'),
         ),
+        '''
     ]
