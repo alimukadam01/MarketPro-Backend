@@ -131,7 +131,7 @@ GlobalSearch.set_models({
         'id', 'invoice_number', 'customer__name', 'status', 'payment_status', 'sub_total', 'total', 'discount', 'tax', 'notes', 'created_by__email'
     ],
     SalesInvoiceItem: [
-        'id', 'sales_invoice__id', 'sales_invoice__invoice_number', 'product__name', 'track_code', 'quantity_received', 'unit_price', 'discount'
+        'id', 'sales_invoice__id', 'sales_invoice__invoice_number', 'product__name', 'product__base__name', 'track_code', 'quantity_received', 'unit_price', 'discount'
     ],
     PurchaseInvoice: [
         'id', 'invoice_number', 'supplier__name', 'status', 'payment_status',
@@ -139,16 +139,16 @@ GlobalSearch.set_models({
     ],
     PurchaseInvoiceItem: [
         'id', 'purchase_invoice__id', 'purchase_invoice__invoice_number', 'product__name',
-        'track_code', 'notes', 'unit_cost', 'quantity_received'
+        'product__base__name', 'track_code', 'notes', 'unit_cost', 'quantity_received'
     ],
     InventoryItem: [
-        'id', 'location__name', 'product__name', 'track_code', 'unit_cost', 'unit_price'
+        'id', 'location__name', 'product__name', 'product__base__name', 'track_code', 'unit_cost', 'unit_price'
     ],
     ReturnedItem: [
-        'id', 'invoice_item__sales_invoice__id', 'invoice_item__product__name'
+        'id', 'invoice_item__sales_invoice__id', 'product__base__name', 'invoice_item__product__name'
     ],
     Product: [
-        'id', 'name', 'desc', 'unit__name'
+        'id', 'base__name', 'name', 'desc', 'unit__name'
     ],
     Customer: [
         'id', 'name', 'phone', 'email', 'address', 'city__name'

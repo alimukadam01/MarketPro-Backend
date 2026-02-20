@@ -269,11 +269,11 @@ class PurchaseInvoiceItemViewSet(ModelViewSet):
     filter_backends = [SearchFilter, DjangoFilterBackend]
     filterset_fields = [
         'purchase_invoice__id', 'purchase_invoice__invoice_number', 'is_restocked', 'is_partially_restocked',
-        'product__name', 'track_code', 'unit_cost', 'quantity_received',
+        'product__name', 'product__base__name', 'track_code', 'unit_cost', 'quantity_received',
     ]
     search_fields = [
         'id', 'purchase_invoice__id', 'purchase_invoice__invoice_number', 'product__name', 
-        'track_code', 'notes', 'unit_cost', 'quantity_received'
+        'product__base__name', 'track_code', 'notes', 'unit_cost', 'quantity_received'
     ]
 
     def get_serializer_class(self):
@@ -693,10 +693,10 @@ class SalesInvoiceItemViewSet(ModelViewSet):
     filter_backends = [SearchFilter, DjangoFilterBackend]
     filterset_fields = [
         'sales_invoice__id', 'sales_invoice__invoice_number', 'is_deducted', 'is_partially_deducted',
-        'product__name', 'track_code', 'unit_price', 'quantity_received'
+        'product__name', 'product__base__name', 'track_code', 'unit_price', 'quantity_received'
     ]
     search_fields = [
-       'id', 'sales_invoice__id', 'sales_invoice__invoice_number', 'product__name', 'track_code', 'quantity_received', 'unit_price', 'discount'
+       'id', 'sales_invoice__id', 'sales_invoice__invoice_number', 'product__name', 'product__base__name', 'track_code', 'quantity_received', 'unit_price', 'discount'
     ]
 
     def get_queryset(self):
@@ -773,10 +773,10 @@ class ReturnedItemsViewSet(ModelViewSet):
 
     filter_backends = [SearchFilter, DjangoFilterBackend]
     filterset_fields = [
-        'invoice_item__sales_invoice__id', 'invoice_item__product__name', 'quantity'
+        'invoice_item__sales_invoice__id', 'invoice_item__product__name', 'invoice_item__product__base__name', 'quantity'
     ]
     search_fields = [
-       'id', 'invoice_item__sales_invoice__id', 'invoice_item__product__name'
+       'id', 'invoice_item__sales_invoice__id', 'invoice_item__product__name', 'invoice_item__product__base__name'
     ]
 
     def get_queryset(self):
@@ -784,7 +784,7 @@ class ReturnedItemsViewSet(ModelViewSet):
         if not business:
             return []
 
-        return ReturnedItem.objects.filter(business_id=business.id)
+        return ReturnedItem.objects.filter(business_id=business.id).order_by('-created_at')
     
     def get_serializer_class(self):
         if self.request.method in ('POST', 'PUT', 'PATCH'):
