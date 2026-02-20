@@ -11,6 +11,7 @@ from rest_framework.filters import SearchFilter
 from django_filters.rest_framework import DjangoFilterBackend
 
 from root.utils import get_active_business
+from inventory.models import InventoryItem
 from .models import PurchaseInvoice, PurchaseInvoiceItem, ReturnedItem, SalesInvoice, SalesInvoiceItem
 from .serializers import (
     PurchaseInvoiceAndItemsCreateSerializer,
@@ -541,7 +542,6 @@ class SalesInvoiceViewSet(ModelViewSet):
             serializer = GenerateInvoiceSerializer(sales_invoice)
 
             return Response(serializer.data, status=status.HTTP_200_OK)
-    
 
 
 class SalesKPIViewSet(GenericViewSet):
@@ -818,7 +818,65 @@ class ReturnedItemsViewSet(ModelViewSet):
             return Response({
                 'detail': 'Internal Server Error.'
             }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-        
+
+    @action(['POST'], detail=True, url_path='sales-invoice-return', url_name='sales-invoice-return')
+    def sales_invoice_return(self, request, pk=None):
+        try:
+            instance: ReturnedItem = self.get_object()
+
+            if instance.is_returned:
+                return Response({
+                    "detail": "Item already returned"
+                }, status=status.HTTP_400_BAD_REQUEST)
+
+            instance.return_type = 'to_invoice'
+
+            invoice_item: SalesInvoiceItem = instance.invoice_item
+            invoice_item.returned_quantity -= instance.quantity
+            
+            with transaction.atomic():
+                instance.save()
+                invoice_item.save(update_fields=['returned_quantity'])
+            
+            return Response({
+                "detail": "OK"
+            }, status=status.HTTP_200_OK)
+        except Exception as error:
+            print(error)
+            return Response({
+                "detail": "Internal Server Error"
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    ### Implement properly, discussed with GPT in MarketPro 04. Search Keyword: You adjust quantities.
+    @action(['POST'], detail=True, url_path='inventory-return', url_name='inventory-return')
+    def inventory_return(self, request, pk=None):
+        try:
+            instance: ReturnedItem = self.get_object()
+            
+            if instance.is_returned:
+                return Response({
+                    "detail": "Item already returned"
+                }, status=status.HTTP_400_BAD_REQUEST)
+            
+            instance.return_type = 'to_inventory'
+
+            inventory_item = InventoryItem.objects.get(product = instance.invoice_item.product)
+            inventory_item.quantity += instance.quantity
+            inventory_item.quantity_on_hand += instance.quantity
+            
+            with transaction.atomic():
+                instance.save()
+                inventory_item.save()
+                
+            return Response({
+                "detail": "OK"
+            }, status=status.HTTP_200_OK)
+        except Exception as error:
+            print(error)
+            return Response({
+                "detail": "Internal Server Error"
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
 
 class ReturnedItemsKPIViewSet(GenericViewSet):
 

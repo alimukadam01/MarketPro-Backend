@@ -306,8 +306,8 @@ class SalesInvoiceItemSerializer(serializers.ModelSerializer):
     class Meta:
         model = SalesInvoiceItem
         fields = [
-            'id', 'sales_invoice', 'product', 'unit_price', 'quantity', 'quantity_received', 'track_code', 
-            'notes', 'quantity_received', 'is_deducted', 'is_partially_deducted', 'is_returned'
+            'id', 'sales_invoice', 'product', 'unit_price', 'quantity', 'returned_quantity', 'net_quantity', 
+            'track_code', 'notes', 'quantity_received', 'is_deducted', 'is_partially_deducted', 'is_returned'
         ]
 
     def update(self, instance, validated_data):
@@ -326,7 +326,7 @@ class SimpleSalesInvoiceItemSerializer(serializers.ModelSerializer):
     class Meta:
         model = SalesInvoiceItem
         fields = [
-            'id', 'sales_invoice', 'product', 'unit_price', 'quantity', 
+            'id', 'sales_invoice', 'product', 'unit_price', 'quantity', 'returned_quantity', 'net_quantity', 
             'quantity_received', 'discount', 'is_deducted', 'is_partially_deducted', 'is_returned'
         ]
 
@@ -337,7 +337,7 @@ class BasicSalesInvoiceItemSerializer(serializers.ModelSerializer):
     class Meta:
         model = SalesInvoiceItem
         fields = [
-            'id', 'product', 'unit_price', 'quantity'
+            'id', 'product', 'unit_price', 'quantity', 'returned_quantity', 'net_quantity'
         ]
 
 
@@ -571,66 +571,74 @@ class SalesInvoiceAndItemsUpdateSerializer(serializers.ModelSerializer):
 
     items = serializers.ListField()
 
+    ### Error here please debug
     def save(self, **kwargs):
         items = self.validated_data.pop('items')
 
         try:
-            # with transaction.atomic():
-            for attr, value in self.validated_data.items():
-                setattr(self.instance, attr, value)
-            self.instance.save()
+            with transaction.atomic():
+                for attr, value in self.validated_data.items():
+                    setattr(self.instance, attr, value)
+                self.instance.save()
 
-            existing_items = SalesInvoiceItem.objects.filter(
-                sales_invoice_id = self.instance.id
-            )
-            existing_items_map = {
-                item.id: item for item in existing_items
-            }
-            existing_item_ids = set(existing_items.values_list('id', flat=True))
+                existing_items = SalesInvoiceItem.objects.filter(
+                    sales_invoice_id = self.instance.id
+                )
+                existing_items_map = {
+                    item.id: item for item in existing_items
+                }
+                existing_item_ids = set(existing_items.values_list('id', flat=True))
 
-            new_items = []
-            updated_items = []
+                new_items = []
+                updated_items = []
 
-            for item in items:
-                print(item)
-                if item['id'] in existing_item_ids:
-                    invoice_item = existing_items_map.get(item['id'])
-                    invoice_item.product_id = item['product_id']
-                    invoice_item.quantity = item['quantity']
-                    invoice_item.unit_price = item['unit_price']
-                    updated_items.append(invoice_item)
-                else:
-                    new_items.append(SalesInvoiceItem(
-                        business_id = self.context['business_id'],
-                        sales_invoice = self.instance,
-                        product_id = item['product_id'],
-                        quantity = item['quantity'],
-                        unit_price = item['unit_price']
-                    ))
+                for item in items:
+                    ### this block essentially does nothing as invoice items 
+                    ### can't be updated on the frontend currently.
+                    ### attr updation commented as functionality not on frontend yet.
+                    if item['id'] in existing_item_ids:
+                        invoice_item = existing_items_map.get(item['id'])
+                        # invoice_item.product_id = item['product_id']
+                        # invoice_item.quantity = item['quantity']
+                        # invoice_item.unit_price = item['unit_price']
+                        updated_items.append(invoice_item)
+                    else:
+                        new_items.append(SalesInvoiceItem(
+                            business_id = self.context['business_id'],
+                            sales_invoice = self.instance,
+                            product_id = item['product_id'],
+                            quantity = item['quantity'],
+                            unit_price = item['unit_price']
+                        ))
 
-            if new_items:
-                print("Creating new items:", new_items)
-                for item in new_items:
-                    for attr, value in item.__dict__.items():
-                        print(f"{attr}: {value}")
+                if new_items:
+                    print("Creating new items:", new_items)
+                    for item in new_items:
+                        for attr, value in item.__dict__.items():
+                            print(f"{attr}: {value}")
 
-                new_items = SalesInvoiceItem.objects.bulk_create(new_items)
+                    new_items = SalesInvoiceItem.objects.bulk_create(new_items)
+                
+
+
+                ### Items on the frontend can't be updated,
+                ### They can either be created or deleted.
+
+                # if updated_items:
+                #     SalesInvoiceItem.objects.bulk_update(updated_items, [
+                #         'product', 'quantity', 'unit_price'
+                #     ])
+
+                updated_ids = [item.id for item in updated_items]
+                new_ids = [item.id for item in new_items]
+                existing_items = existing_items.exclude(id__in=updated_ids+new_ids)
+                existing_items.delete()
+                
+                self.instance.refresh_from_db()
+                self.instance.adjust_totals()
+                updateInventoryOnSale(self.instance)
+                return self.instance
             
-            if updated_items:
-                SalesInvoiceItem.objects.bulk_update(updated_items, [
-                    'product', 'quantity', 'unit_price'
-                ])
-
-            updated_ids = [item.id for item in updated_items]
-            new_ids = [item.id for item in new_items]
-            existing_items = existing_items.exclude(id__in=updated_ids+new_ids,)
-            existing_items.delete()
-            
-            self.instance.refresh_from_db()
-            self.instance.adjust_totals()
-            updateInventoryOnSale(self.instance)
-            return self.instance
-        
         except Exception as error:
             print(error)
             return None
@@ -647,7 +655,7 @@ class SalesInvoiceAndItemsUpdateSerializer(serializers.ModelSerializer):
             'tax',
             'payment_status',
             'status',
-            'items'
+            'items',
         ]
 
 
@@ -658,7 +666,8 @@ class ReturnedItemSerializer(serializers.ModelSerializer):
     class Meta:
         model = ReturnedItem
         fields = [
-            'id', 'invoice_item', 'reason', 'quantity', 'created_at', 'updated_at'
+            'id', 'invoice_item', 'is_damaged', 'reason', 'is_returned',
+            'return_type', 'quantity', 'created_at', 'updated_at'
         ]
 
 
@@ -672,21 +681,36 @@ class ReturnedItemCreateUpdateSerializer(serializers.ModelSerializer):
 
     def create(self, validated_data):
 
+        invoice_item = SalesInvoiceItem.objects.get(id=self.context["invoice_item_id"])
+        invoice_item.returned_quantity += validated_data['quantity']
+            
+        with transaction.atomic():
             returned_item = ReturnedItem.objects.create(
                 business_id = self.context['business_id'],
                 invoice_item_id = self.context["invoice_item_id"],
                 **validated_data
             )
+            invoice_item.save()
             
-            return returned_item
+        return returned_item
     
-    def update(self, instance, validated_data):
+    def update(self, instance: ReturnedItem, validated_data):
+
+        old_quantity = instance.quantity
+
         for attr, value in validated_data.items():
             setattr(instance, attr, value)
 
-        instance.save()
+        invoice_item = SalesInvoiceItem.objects.get(id=self.context["invoice_item_id"])
+        invoice_item.returned_quantity -= old_quantity
+        invoice_item.returned_quantity += instance.quantity
+
+        with transaction.atomic():
+            instance.save()
+            invoice_item.save()
+        
         return instance
-    
+
 
 class RecentSalesSerializer(serializers.ModelSerializer):
 

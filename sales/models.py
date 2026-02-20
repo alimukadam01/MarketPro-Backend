@@ -1,9 +1,7 @@
 from calendar import monthrange
 from typing import Dict
-from datetime import date, datetime, timedelta
 from django.db import models
-from django.db.models import Sum
-from django.db.models.functions import TruncDate
+from django.db.models import Sum, F
 from django.core.exceptions import ValidationError
 from django.conf import settings
 from root.utils import generateTransactionId
@@ -164,11 +162,11 @@ class SalesInvoice(models.Model):
         return f"{self.id}-{self.invoice_number}-{self.total}-{self.status}"
 
     def adjust_totals(self):
-        items = self.invoice_items.filter(is_returned=False)
+        items = self.invoice_items.exclude(returned_quantity = F("quantity"))
         if not items:
             return
 
-        subtotal = sum(item.quantity * item.unit_price for item in items)
+        subtotal = sum(item.net_quantity * item.unit_price for item in items)
 
         # Calculate total discount on the order.
         discount = 0
@@ -269,12 +267,23 @@ class SalesInvoiceItem(BaseItem):
         help_text='e.g., {"value": 10.0, "type": "percentage" or "amount"}'
     )
     quantity_received = models.IntegerField(default=0)
+    returned_quantity = models.PositiveIntegerField(default=0)
     is_deducted = models.BooleanField(default=False)
     is_partially_deducted = models.BooleanField(default=False)
-    is_returned = models.BooleanField(default=False)
-    is_partially_returned = models.BooleanField(default=False)
 
     objects = SalesInvoiceItemManager()
+
+    @property
+    def net_quantity(self):
+        return self.quantity - self.returned_quantity
+
+    @property
+    def is_returned(self):
+        return self.quantity == self.returned_quantity
+    
+    @property
+    def is_partially_returned(self):
+        return self.returned_quantity > 0 and not self.is_returned
 
     def compute_restock_delta(self) -> int:
         """
@@ -293,25 +302,12 @@ class SalesInvoiceItem(BaseItem):
         self.is_deducted = full
         self.is_partially_deducted = not full
         self.save(update_fields=['is_deducted', 'is_partially_deducted'])
-
+    
     def __str__(self):
         return f'{self.id}_{self.product.base.name} ({self.product.name})_{self.sales_invoice.id}_{self.sales_invoice.invoice_number}'
+    
     class Meta:
         unique_together = [('sales_invoice', 'product')]
-        # constraints = [
-        #     '''
-        #     models.CheckConstraint(
-        #         check=~(models.Q(is_returned=True) &
-        #                 models.Q(is_partially_returned=True)),
-        #         name='is_returned_and_is_partially_returned_mutually_exclusive'
-        #     ),
-        #     models.CheckConstraint(
-        #         check=~(models.Q(is_deducted=True) &
-        #                 models.Q(is_partially_deducted=True)),
-        #         name='is_deducted_and_is_partially_deducted_mutually_exclusive_sii'
-        #     )
-        #     '''
-        # ]
 
 
 class PurchaseInvoiceQuerySet(BaseQuerySet):
@@ -397,7 +393,7 @@ class PurchaseInvoice(models.Model):
 
     def adjust_totals(self):
         items = self.invoice_items.all()
-        subtotal = sum(item.quantity * item.unit_cost for item in items)
+        subtotal = sum(item.net_quantity * item.unit_cost for item in items)
 
         tax = 0
         if self.tax:
@@ -448,15 +444,7 @@ class PurchaseInvoice(models.Model):
             self.status = 'R'
 
     class Meta:
-        # constraints = [
-        #     '''
-        #     models.CheckConstraint(
-        #         check=~(models.Q(is_restocked=True) &
-        #                 models.Q(is_partially_restocked=True)),
-        #         name='is_restocked_and_is_partially_restocked_mutually_exclusive_pi'
-        #     )
-        #     '''
-        # ]
+
         pass
 
 
@@ -646,20 +634,39 @@ class ReturnedItemManager(models.Manager):
 
 
 class ReturnedItem(models.Model):
+
+    RETURN_TYPES = [
+        ("to_invoice", "To Invoice"),
+        ("to_inventory", "To Inventory"),
+    ]
+
     business = models.ForeignKey(
-        Business, on_delete=models.CASCADE, related_name='returned_items')
-    invoice_item = models.OneToOneField(
+        Business, 
+        on_delete=models.CASCADE, 
+        related_name='returned_items'
+    )
+    invoice_item = models.ForeignKey(
         SalesInvoiceItem,
         on_delete=models.CASCADE,
-        related_name='returned_item',
+        related_name='returns',
     )
     reason = models.TextField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
     quantity = models.IntegerField(default=0)
+    return_type = models.CharField(
+        max_length=256, choices=RETURN_TYPES, 
+        null=True, blank=True
+    )
     is_damaged = models.BooleanField(default=False)
-
     objects = ReturnedItemManager()
 
+    @property
+    def is_returned(self):
+        if self.return_type == None:
+            return False
+        
+        return True
+
     def __str__(self):
-        return f"Return for {self.invoice_item.product.base.name} ({self.invoice_item.product.name}) from Invoice {self.invoice_item.sales_invoice.invoice_number}"
+        return f"Return for {self.invoice_item.product.base.name} ({self.invoice_item.product.name}) from Invoice {self.invoice_item.sales_invoice.invoice_number} on {self.created_at.date()}"

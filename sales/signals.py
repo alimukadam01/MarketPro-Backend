@@ -88,23 +88,5 @@ def updateInventoryOnSale(sender, instance: SalesInvoice, **kwargs):
 
 
 @receiver(post_save, sender=ReturnedItem)
-def mark_item_as_returned(sender, instance: ReturnedItem, created, **kwargs):
-    if created:
-        invoice_item = instance.invoice_item
-        
-        '''
-        if instance.quantity < instance.invoice_item.quantity:
-            invoice_item.is_partially_returned = True
-            invoice_item.save(update_fields=['is_partially_returned'])
-            return
-        '''
-        
-        invoice_item.is_returned = True
-        invoice_item.save(update_fields=['is_returned'])
-        invoice_item.sales_invoice.adjust_totals()
-
-
-@receiver(post_delete, sender=ReturnedItem)
-def unmark_item_as_returned(sender, instance, **kwargs):
-    instance.invoice_item.is_returned = False
-    instance.invoice_item.save(update_fields=['is_returned'])
+def updateTotalsAfterReturnItem(sender, instance, created, **kwargs):
+    instance.invoice_item.sales_invoice.adjust_totals()
