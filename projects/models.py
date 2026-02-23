@@ -42,3 +42,15 @@ class ProjectPurchaseInvoice(models.Model):
 class ProjectPurchaseQuotation(models.Model):
     project = models.ForeignKey(Project, models.CASCADE, related_name='purchase_quotations')
     purchase_quotation = models.ForeignKey(PurchaseQuotation, models.CASCADE, related_name='projects')
+
+### Logic to be implemented later.
+class ProjectTask(models.Model):
+    project = models.ForeignKey(Project, on_delete=models.CASCADE)
+    name = models.CharField(max_length=256)
+    description = models.TextField(null=True, blank=True)
+    start = models.DateTimeField(null=True, blank=True)
+    end = models.DateTimeField(null=True, blank=True)
+    duration = models.PositiveIntegerField(null=True, blank=True)
+
+    def __str__(self):
+        return f"{self.project.title}-{self.name}"
