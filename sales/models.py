@@ -393,7 +393,7 @@ class PurchaseInvoice(models.Model):
 
     def adjust_totals(self):
         items = self.invoice_items.all()
-        subtotal = sum(item.net_quantity * item.unit_cost for item in items)
+        subtotal = sum(item.quantity * item.unit_cost for item in items)
 
         tax = 0
         if self.tax:
