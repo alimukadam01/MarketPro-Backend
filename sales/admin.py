@@ -8,6 +8,8 @@ from .models import (
     SalesInvoiceItemDeduction, 
     SalesReservation,
     ReturnedItem,
+    PurchaseQuotation,
+    PurchaseQuotationItem
 )
 
 
@@ -21,3 +23,5 @@ admin.site.register(PurchaseInvoiceItemRestock)
 admin.site.register(SalesInvoiceItemDeduction)
 admin.site.register(SalesReservation)
 admin.site.register(ReturnedItem)
+admin.site.register(PurchaseQuotation)
+admin.site.register(PurchaseQuotationItem)

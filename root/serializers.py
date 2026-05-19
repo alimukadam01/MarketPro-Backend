@@ -1,5 +1,6 @@
 from rest_framework import serializers
 from django.db import transaction
+from django.contrib.auth import get_user_model
 from .models import (
     City,
     Category,
@@ -12,8 +13,13 @@ from .models import (
     Business,
     Customer,
     Location,
+    Employee,
+    EmployeeAccess,
+    BusinessConfig,
 )
 from .utils import generate_sku, generate_variant_name
+
+User = get_user_model()
 
 
 class CitySerializer(serializers.ModelSerializer):
@@ -37,12 +43,69 @@ class UnitSerializer(serializers.ModelSerializer):
         fields = ['id', 'name', 'abv']
 
 
-class BusinessSerializer(serializers.ModelSerializer):
+# ── BusinessConfig ────────────────────────────────────────────────────────────
+
+class BusinessConfigSerializer(serializers.ModelSerializer):
 
     class Meta:
+        model = BusinessConfig
+        fields = [
+            'id', 'business',
+            'sales', 'purchases', 'projects',
+            'inventory', 'returned_items', 'quotations',
+        ]
+
+
+class SimpleBusinessConfigSerializer(serializers.ModelSerializer):
+
+    class Meta:
+        model = BusinessConfig
+        fields = [
+            'sales', 'purchases', 'projects',
+            'inventory', 'returned_items', 'quotations',
+        ]
+
+
+class BusinessConfigCreateSerializer(serializers.ModelSerializer):
+
+    class Meta:
+        model = BusinessConfig
+        fields = [
+            'sales', 'purchases', 'projects',
+            'inventory', 'returned_items', 'quotations',
+        ]
+
+    def create(self, validated_data):
+        return BusinessConfig.objects.create(
+            business_id=self.context['business_id'],
+            **validated_data,
+        )
+
+
+class BusinessConfigUpdateSerializer(serializers.ModelSerializer):
+
+    class Meta:
+        model = BusinessConfig
+        fields = [
+            'sales', 'purchases', 'projects',
+            'inventory', 'returned_items', 'quotations',
+        ]
+
+    def update(self, instance, validated_data):
+        for attr, value in validated_data.items():
+            setattr(instance, attr, value)
+        instance.save()
+        return instance
+
+
+class BusinessSerializer(serializers.ModelSerializer):
+    config = SimpleBusinessConfigSerializer()
+    class Meta:
         model = Business
-        fields = ['id', 'name', 'owner', 'phone',
-                  'address', 'logo', 'is_active']
+        fields = [
+            'id', 'name', 'owner', 'phone',
+            'address', 'logo', 'is_active', 'config'
+        ]
 
 
 class BusinessCreateSerializer(serializers.ModelSerializer):
@@ -405,3 +468,142 @@ class ExpenseSerializer(serializers.ModelSerializer):
     class Meta:
         model = Expense
         fields = ['id', 'business', 'name', 'desc', 'amount', 'created_at']
+
+
+# ── Employee ──────────────────────────────────────────────────────────────────
+
+class SimpleUserSerializer(serializers.ModelSerializer):
+
+    class Meta:
+        model = User
+        fields = ['id', 'email', 'first_name', 'last_name']
+
+
+class SimpleEmployeeAccessSerializer(serializers.ModelSerializer):
+
+    class Meta:
+        model = EmployeeAccess
+        fields = ['id', 'permissions']
+
+class EmployeeSerializer(serializers.ModelSerializer):
+
+    user = SimpleUserSerializer(read_only=True)
+    business = SimpleBusinessSerializer(read_only=True)
+    created_by = SimpleUserSerializer(read_only=True)
+    access = SimpleEmployeeAccessSerializer()
+
+    class Meta:
+        model = Employee
+        fields = ['id', 'user', 'business', 'created_by', 'created_at', 'updated_at', 'access']
+
+
+class EmployeeCreateSerializer(serializers.ModelSerializer):
+    
+    user = SimpleUserSerializer(read_only=True)
+    created_by = SimpleUserSerializer(read_only=True)
+
+    class Meta:
+        model = Employee
+        fields = ['user', 'business', 'created_by', 'created_at', 'updated_at']
+
+class EmployeeAndUserCreateSerializer(serializers.ModelSerializer):
+
+    first_name = serializers.CharField(max_length=256)
+    last_name = serializers.CharField(max_length=256)
+    email = serializers.EmailField()
+    password = serializers.CharField(max_length=256)
+    re_password = serializers.CharField(max_length=256)
+    permissions = serializers.DictField()
+
+    class Meta:
+        model = Employee
+        fields = ['first_name', 'last_name', 'email', 'password', 're_password', 'permissions']
+
+    def create(self, validated_data):
+
+        try:
+            with transaction.atomic():
+                email = validated_data.pop('email')
+                permissions = validated_data.pop('permissions')
+
+                user = User.objects.create_user(
+                    email,
+                    password=validated_data.pop('password'),
+                    first_name=validated_data.pop('first_name'),
+                    last_name=validated_data.pop('last_name'),
+                )
+
+                employee = Employee.objects.create(
+                    user=user,
+                    business_id=self.context['business_id'],
+                    created_by_id=self.context['created_by_id'],
+                )
+
+                permissions = EmployeeAccess.objects.create(
+                    employee = employee,
+                    permissions = permissions
+                )
+
+                return employee
+        except Exception as error:
+            print(error)
+            return None
+        
+
+class EmployeeUpdateSerializer(serializers.ModelSerializer):
+
+    access = SimpleEmployeeAccessSerializer()
+    class Meta:
+        model = Employee
+        fields = ['access']
+
+    def update(self, instance, validated_data):
+        access = instance.access
+        payload_access = validated_data.pop('access')
+
+        for attr, value in payload_access.items():
+            setattr(access, attr, value)
+        access.save()
+        instance.refresh_from_db()
+        return instance
+
+
+# ── EmployeeAccess ────────────────────────────────────────────────────────────
+
+class EmployeeAccessSerializer(serializers.ModelSerializer):
+
+    class Meta:
+        model = EmployeeAccess
+        fields = ['id', 'employee', 'permissions']
+
+
+class EmployeeAccessCreateSerializer(serializers.ModelSerializer):
+
+    class Meta:
+        model = EmployeeAccess
+        fields = ['permissions']
+
+    def create(self, validated_data):
+
+        employee_id=self.context['employee_id']
+        print(validated_data)
+        print(employee_id)
+
+        return EmployeeAccess.objects.create(
+            employee_id= employee_id,
+            **validated_data
+        )
+
+
+class EmployeeAccessUpdateSerializer(serializers.ModelSerializer):
+
+    class Meta:
+        model = EmployeeAccess
+        fields = ['permissions']
+
+    def update(self, instance, validated_data):
+        for attr, value in validated_data.items():
+            setattr(instance, attr, value)
+        instance.save()
+        return instance
+

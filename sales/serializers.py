@@ -1,33 +1,44 @@
 from django.db import transaction
+from django.db.models import Sum
 from rest_framework import serializers
 
+from projects.models import ProjectPurchaseInvoice, ProjectSalesInvoice
 from core.serializers import SimpleUserSerializer
 from root.models import Location
 from root.serializers import (
-    BusinessSerializer, ProductVariantSerializer, SimpleBusinessSerializer, 
-    SimpleCustomerSerializer, SimpleSupplierSerializer, 
+    BusinessSerializer, ProductVariantSerializer, SimpleBusinessSerializer,
+    SimpleCustomerSerializer, SimpleSupplierSerializer,
     SupplierSerializer, BaseItemSerializer
 )
 from inventory.models import InventoryItem
-from .models import PurchaseInvoice, PurchaseInvoiceItem, SalesInvoice, SalesInvoiceItem, ReturnedItem
+from .models import PurchaseInvoice, PurchaseInvoiceItem, PurchaseQuotation, PurchaseQuotationItem, PurchaseReceipt, SalesInvoice, SalesInvoiceItem, ReturnedItem, SalesReceipt
 from .utils import (
-    checkPurchaseInvoiceItemFields, 
+    checkPurchaseInvoiceItemFields,
     checkPurchaseInvoiceCreateFields,
     checkSalesInvoiceItemCreateFields,
     updateInventoryOnSale
 )
 
+
+class PaymentReceiptSerializer(serializers.Serializer):
+
+    id = serializers.IntegerField(read_only=True)
+    amount = serializers.FloatField()
+    desc = serializers.CharField(
+        required=False, allow_null=True, allow_blank=True)
+
+
 class PurchaseInvoiceItemSerializer(BaseItemSerializer):
 
-    purchase_invoice = serializers.PrimaryKeyRelatedField(read_only=True) 
+    purchase_invoice = serializers.PrimaryKeyRelatedField(read_only=True)
     product = ProductVariantSerializer()
     unit_cost = serializers.FloatField()
     quantity_received = serializers.IntegerField(default=True)
     is_restocked = serializers.BooleanField(read_only=True)
     is_partially_restocked = serializers.BooleanField(read_only=True)
-    
+
     def update(self, instance, validated_data):
-        
+
         for attr, value in validated_data.items():
             setattr(instance, attr, value)
 
@@ -58,11 +69,11 @@ class PurchaseInvoiceItemCreateSerializer(BaseItemSerializer):
 
         except PurchaseInvoiceItem.DoesNotExist:
             return PurchaseInvoiceItem.objects.create(
-                purchase_invoice_id = self.context['purchase_invoice_id'],
-                business_id = self.context['business_id'],
+                purchase_invoice_id=self.context['purchase_invoice_id'],
+                business_id=self.context['business_id'],
                 **validated_data
             )
-    
+
 
 class PurchaseInvoiceItemUpdateSerializer(serializers.Serializer):
     purchase_invoice = serializers.PrimaryKeyRelatedField(read_only=True)
@@ -75,7 +86,7 @@ class PurchaseInvoiceItemUpdateSerializer(serializers.Serializer):
         return super().validate(attrs)
 
     def update(self, instance, validated_data):
-        
+
         for attr, value in self.validated_data.items():
             setattr(instance, attr, value)
 
@@ -90,25 +101,33 @@ class SimplePurchaseInvoiceItemSerializer(serializers.ModelSerializer):
     class Meta:
         model = PurchaseInvoiceItem
         fields = [
-            'id', 'purchase_invoice', 'product', 'unit_cost', 'quantity' ,'track_code', 
+            'id', 'purchase_invoice', 'product', 'unit_cost', 'quantity', 'track_code',
             'notes', 'quantity_received', 'is_restocked', 'is_partially_restocked'
         ]
 
 
+class ProjectPurchaseInvoiceLinker(serializers.ModelSerializer):
+
+    class Meta:
+        model = ProjectSalesInvoice
+        fields = ['id', 'project']
+
+
 class PurchaseInvoiceSerializer(serializers.ModelSerializer):
 
-    invoice_items = SimplePurchaseInvoiceItemSerializer(many=True, read_only=True)
-    # business = SimpleBusinessSerializer(read_only=True)
-    # supplier = SupplierSerializer(read_only=True)
+    invoice_items = SimplePurchaseInvoiceItemSerializer(
+        many=True, read_only=True)
     created_by = SimpleUserSerializer(read_only=True)
+    projects = ProjectPurchaseInvoiceLinker(many=True)
+    payment_receipts = PaymentReceiptSerializer(many=True, read_only=True)
 
     class Meta:
         model = PurchaseInvoice
         fields = [
-            'id', 'invoice_number', 'business', 'supplier', 
-            'created_at', 'updated_at', 'date_due', 'status', 'payment_status', 
+            'id', 'invoice_number', 'business', 'supplier',
+            'created_at', 'updated_at', 'date_due', 'status', 'payment_status',
             'sub_total', 'tax',  'amount_paid', 'total', 'delivery', 'created_by',
-            'notes', 'invoice_items', 'is_restocked', 'is_partially_restocked'
+            'notes', 'invoice_items', 'is_restocked', 'is_partially_restocked', 'projects', 'payment_receipts'
         ]
 
 
@@ -116,17 +135,23 @@ class SimplePurchaseInvoiceSerializer(serializers.ModelSerializer):
 
     supplier = SimpleSupplierSerializer(read_only=True, required=False)
     total_items = serializers.SerializerMethodField()
+    projects = ProjectPurchaseInvoiceLinker(many=True)
 
     def get_total_items(self, obj):
-        return len(obj.invoice_items.all())
+
+        if type(obj) == PurchaseInvoice:
+            return obj.invoice_items.count()
+
+        if type(obj) == ProjectPurchaseInvoice:
+            return obj.purchase_invoice.invoice_items.count()
 
     class Meta:
         model = PurchaseInvoice
         fields = [
-            'id', 'invoice_number', 'supplier', 
-            'created_at', 'date_due', 'status', 
-            'payment_status', 'sub_total', 'tax', 'total', 
-            'delivery', 'total_items'
+            'id', 'invoice_number', 'supplier',
+            'created_at', 'date_due', 'status',
+            'payment_status', 'sub_total', 'tax', 'total',
+            'delivery', 'total_items', 'projects'
         ]
 
 
@@ -138,7 +163,7 @@ class PurchaseInvoiceCreateSerializer(serializers.ModelSerializer):
         model = PurchaseInvoice
         fields = [
             'id', 'invoice_number', 'business', 'supplier',
-            'created_at', 'updated_at', 'date_due', 'status', 
+            'created_at', 'updated_at', 'date_due', 'status',
             'payment_status', 'tax', 'delivery', 'notes'
         ]
 
@@ -148,21 +173,20 @@ class PurchaseInvoiceCreateSerializer(serializers.ModelSerializer):
 
     def save(self, **kwargs):
         return PurchaseInvoice.objects.create(
-            business_id = self.context['business_id'],
-            created_by_id = self.context['user_id'],
+            business_id=self.context['business_id'],
+            created_by_id=self.context['user_id'],
             **self.validated_data
         )
-    
+
 
 class PurchaseInvoiceUpdateSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = PurchaseInvoice
         fields = [
-            'id', 'invoice_number', 'supplier', 'date_due', 
-            'status', 'payment_status', 'sub_total', 'tax', 'total', 'delivery', 'notes', 
+            'id', 'invoice_number', 'supplier', 'date_due',
+            'status', 'payment_status', 'sub_total', 'tax', 'total', 'delivery', 'notes',
         ]
-
 
     def update(self, instance, validated_data):
         for attr, value in validated_data.items():
@@ -175,34 +199,44 @@ class PurchaseInvoiceUpdateSerializer(serializers.ModelSerializer):
 
 class PurchaseInvoiceAndItemsCreateSerializer(serializers.ModelSerializer):
     items = serializers.ListField()
+    project = serializers.IntegerField(required=False, allow_null=True)
 
     def save(self, **kwargs):
         items = self.validated_data.pop('items')
+        project_id = self.validated_data.pop('project')
+        project_id = int(project_id) if project_id else project_id
 
         try:
             with transaction.atomic():
                 purchase_invoice = PurchaseInvoice.objects.create(
-                    business_id = self.context['business_id'],
-                    created_by_id = self.context['user_id'],
+                    business_id=self.context['business_id'],
+                    created_by_id=self.context['user_id'],
                     **self.validated_data
                 )
-            
+
                 invoice_items = [PurchaseInvoiceItem(
-                    business_id = self.context['business_id'],
-                    purchase_invoice_id = purchase_invoice.id,
-                    product_id = item['product_id'],
-                    quantity = item['quantity'],
-                    unit_cost = item['unit_cost']
+                    business_id=self.context['business_id'],
+                    purchase_invoice_id=purchase_invoice.id,
+                    product_id=item['product_id'],
+                    quantity=item['quantity'],
+                    unit_cost=item['unit_cost']
                 ) for item in items]
-                invoice_items = PurchaseInvoiceItem.objects.bulk_create(invoice_items)
+                invoice_items = PurchaseInvoiceItem.objects.bulk_create(
+                    invoice_items)
+
+                if project_id:
+                    ProjectPurchaseInvoice.objects.create(
+                        project_id=project_id,
+                        purchase_invoice=purchase_invoice
+                    )
 
             purchase_invoice.adjust_totals()
             return purchase_invoice
-        
+
         except Exception as error:
             print(error)
             return None
-        
+
     class Meta:
         model = PurchaseInvoice
         fields = [
@@ -215,15 +249,19 @@ class PurchaseInvoiceAndItemsCreateSerializer(serializers.ModelSerializer):
             'payment_status',
             'tax',
             'delivery',
-            'items'
+            'items',
+            'project'
         ]
 
 
 class PurchaseInvoiceAndItemsUpdateSerializer(serializers.ModelSerializer):
     items = serializers.ListField()
+    project = serializers.IntegerField(required=False, allow_null=True)
 
     def save(self, **kwargs):
         items = self.validated_data.pop('items')
+        project_id = self.validated_data.pop('project')
+        project_id = int(project_id) if project_id else project_id
 
         try:
             with transaction.atomic():
@@ -233,18 +271,18 @@ class PurchaseInvoiceAndItemsUpdateSerializer(serializers.ModelSerializer):
                 self.instance.save()
 
                 existing_items = PurchaseInvoiceItem.objects.filter(
-                    purchase_invoice_id = self.instance.id
+                    purchase_invoice_id=self.instance.id
                 )
                 existing_items_map = {
                     item.id: item for item in existing_items
                 }
-                existing_item_ids = set(existing_items.values_list('id', flat=True))
+                existing_item_ids = set(
+                    existing_items.values_list('id', flat=True))
 
                 new_items = []
                 updated_items = []
 
                 for item in items:
-                    print(item)
                     if item['id'] in existing_item_ids:
                         invoice_item = existing_items_map.get(item['id'])
                         invoice_item.product_id = item['product_id']
@@ -253,36 +291,53 @@ class PurchaseInvoiceAndItemsUpdateSerializer(serializers.ModelSerializer):
                         updated_items.append(invoice_item)
                     else:
                         new_items.append(PurchaseInvoiceItem(
-                            business_id = self.context['business_id'],
-                            purchase_invoice = self.instance,
-                            product_id = item['product_id'],
-                            quantity = item['quantity'],
-                            unit_cost = item['unit_cost']
+                            business_id=self.context['business_id'],
+                            purchase_invoice=self.instance,
+                            product_id=item['product_id'],
+                            quantity=item['quantity'],
+                            unit_cost=item['unit_cost']
                         ))
 
                 if new_items:
-                    print("Creating new items:", new_items)
-                    for item in new_items:
-                        new_item = item.save()
-                        print(new_item)
+                    new_items = PurchaseInvoiceItem.objects.bulk_create(
+                        new_items)
 
-                
                 if updated_items:
                     PurchaseInvoiceItem.objects.bulk_update(updated_items, [
                         'product', 'quantity', 'unit_cost'
                     ])
 
                 updated_ids = [item.id for item in updated_items]
-                existing_items = existing_items.exclude(id__in=updated_ids)
+                new_ids = [item.id for item in new_items]
+                existing_items = existing_items.exclude(
+                    id__in=updated_ids+new_ids)
                 existing_items.delete()
-                
+
             self.instance.adjust_totals()
+            self.instance.refresh_from_db()
+
+            # Handle Projects Addition/Updation/Deletion Logic
+            if not project_id:
+                print(
+                    "printing from ProjectPurchaseInvoice deletion block. Project ID is: ", project_id)
+                ProjectPurchaseInvoice.objects.filter(
+                    purchase_invoice=self.instance).delete()
+            else:
+                print(
+                    "printing from ProjectPurchaseInvoice creation block. Project ID is: ", project_id)
+                ProjectPurchaseInvoice.objects.filter(
+                    purchase_invoice=self.instance).delete()
+                ProjectPurchaseInvoice.objects.get_or_create(
+                    project_id=project_id,
+                    purchase_invoice=self.instance
+                )
+
             return self.instance
-    
+
         except Exception as error:
             print(error)
             return None
-        
+
     class Meta:
         model = PurchaseInvoice
         fields = [
@@ -295,8 +350,36 @@ class PurchaseInvoiceAndItemsUpdateSerializer(serializers.ModelSerializer):
             'payment_status',
             'tax',
             'amount_paid',
-            'items'
+            'items',
+            'project'
         ]
+
+
+class PurchaseReceiptCreateSerializer(PaymentReceiptSerializer):
+
+    def is_valid(self, *, raise_exception=False):
+        purchase_invoice = SalesInvoice.objects.get(
+            id=self.context["purchase_invoice_id"]
+        )
+
+        total_paid = (
+            purchase_invoice.payment_receipts.aggregate(
+                total=Sum("amount")
+            )["total"] or 0
+        )
+
+        if float(self.initial_data["amount"]) + total_paid > purchase_invoice.total:
+            raise serializers.ValidationError({
+                "amount": "accumulated amount cannot exceed invoice total"
+            })
+
+        return super().is_valid(raise_exception=raise_exception)
+
+    def save(self, **kwargs):
+        return PurchaseReceipt.objects.create(
+            purchase_invoice_id=self.context['purchase_invoice_id'],
+            **self.validated_data
+        )
 
 
 class SalesInvoiceItemSerializer(serializers.ModelSerializer):
@@ -306,12 +389,12 @@ class SalesInvoiceItemSerializer(serializers.ModelSerializer):
     class Meta:
         model = SalesInvoiceItem
         fields = [
-            'id', 'sales_invoice', 'product', 'unit_price', 'quantity', 'returned_quantity', 'net_quantity', 
+            'id', 'sales_invoice', 'product', 'unit_price', 'quantity', 'returned_quantity', 'net_quantity',
             'track_code', 'notes', 'quantity_received', 'is_deducted', 'is_partially_deducted', 'is_returned'
         ]
 
     def update(self, instance, validated_data):
-        
+
         for attr, value in validated_data.items():
             setattr(instance, attr, value)
 
@@ -326,7 +409,7 @@ class SimpleSalesInvoiceItemSerializer(serializers.ModelSerializer):
     class Meta:
         model = SalesInvoiceItem
         fields = [
-            'id', 'sales_invoice', 'product', 'unit_price', 'quantity', 'returned_quantity', 'net_quantity', 
+            'id', 'sales_invoice', 'product', 'unit_price', 'quantity', 'returned_quantity', 'net_quantity',
             'quantity_received', 'discount', 'is_deducted', 'is_partially_deducted', 'is_returned'
         ]
 
@@ -353,8 +436,8 @@ class SalesInvoiceItemCreateSerializer(BaseItemSerializer):
     def create(self, validated_data):
 
         return SalesInvoiceItem.objects.create(
-            sales_invoice_id = self.context['sales_invoice_id'],
-            business_id = self.context['business_id'],
+            sales_invoice_id=self.context['sales_invoice_id'],
+            business_id=self.context['business_id'],
             **validated_data
         )
 
@@ -366,7 +449,7 @@ class SalesInvoiceItemUpdateSerializer(serializers.Serializer):
     quantity_received = serializers.IntegerField(default=True)
 
     def update(self, instance, validated_data):
-        
+
         for attr, value in self.validated_data.items():
             setattr(instance, attr, value)
 
@@ -374,17 +457,26 @@ class SalesInvoiceItemUpdateSerializer(serializers.Serializer):
         return instance
 
 
+class ProjectSalesInvoiceLinker(serializers.ModelSerializer):
+
+    class Meta:
+        model = ProjectSalesInvoice
+        fields = ['id', 'project']
+
+
 class SalesInvoiceSerializer(serializers.ModelSerializer):
 
     invoice_items = SimpleSalesInvoiceItemSerializer(many=True, read_only=True)
     customer = SimpleCustomerSerializer(read_only=True)
+    projects = ProjectSalesInvoiceLinker(many=True)
+    payment_receipts = PaymentReceiptSerializer(many=True)
 
     class Meta:
         model = SalesInvoice
         fields = [
             'id', 'invoice_number', 'business', 'customer', 'date_issued', 'date_due', 'payment_status',
-            'status', 'sub_total', 'tax', 'discount', 'total', 'created_by', 'created_at',
-            'notes', 'is_deducted', 'is_partially_deducted', 'invoice_items'
+            'status', 'sub_total', 'tax', 'discount', 'total', 'amount_paid' ,'created_by', 'created_at',
+            'notes', 'is_deducted', 'is_partially_deducted', 'invoice_items', 'projects', 'payment_receipts'
         ]
 
 
@@ -392,23 +484,28 @@ class SimpleSalesInvoiceSerializer(serializers.ModelSerializer):
 
     customer = SimpleCustomerSerializer(read_only=True)
     total_items = serializers.SerializerMethodField()
+    projects = ProjectSalesInvoiceLinker(many=True)
 
     def get_total_items(self, obj):
 
-        return len(obj.invoice_items.all())
+        if type(obj) == SalesInvoice:
+            return obj.invoice_items.count()
+
+        if type(obj) == ProjectSalesInvoice:
+            return obj.sales_invoice.invoice_items.count()
 
     class Meta:
         model = SalesInvoice
         fields = [
             'id', 'invoice_number', 'customer', 'date_issued', 'date_due',
-            'payment_status', 'status', 'sub_total', 'tax', 'discount', 'total', 'total_items'
+            'payment_status', 'status', 'sub_total', 'tax', 'discount', 'total', 'total_items', 'projects'
         ]
 
 
 class SalesInvoiceCreateSerializer(serializers.ModelSerializer):
 
     business = SimpleBusinessSerializer(read_only=True)
-    
+
     class Meta:
         model = SalesInvoice
         fields = [
@@ -421,8 +518,8 @@ class SalesInvoiceCreateSerializer(serializers.ModelSerializer):
 
     def save(self, **kwargs):
         return SalesInvoice.objects.create(
-            business_id = self.context['business_id'],
-            created_by_id = self.context['user_id'],
+            business_id=self.context['business_id'],
+            created_by_id=self.context['user_id'],
             **self.validated_data
         )
 
@@ -435,10 +532,9 @@ class SalesInvoiceUpdateSerializer(serializers.ModelSerializer):
             'id', 'invoice_number', 'customer', 'date_issued', 'date_due',
             'payment_status', 'status', 'sub_total', 'tax', 'discount', 'total', 'notes'
         ]
-    
 
     def save(self, **kwargs):
-        
+
         for attr, value in self.validated_data.items():
             setattr(self.instance, attr, value)
 
@@ -452,49 +548,52 @@ class CompleteSalesInvoiceItemSerializer(SimpleSalesInvoiceItemSerializer):
 
 class RestockSerializer(serializers.Serializer):
 
-    location = serializers.PrimaryKeyRelatedField(queryset=Location.objects.none())
+    location = serializers.PrimaryKeyRelatedField(
+        queryset=Location.objects.none())
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
         business_id = self.context.get('business_id')
         if business_id and self.fields.get('location'):
-            self.fields['location'].queryset = Location.objects.filter(business_id=business_id)
-
+            self.fields['location'].queryset = Location.objects.filter(
+                business_id=business_id)
 
     def save(self, **kwargs):
-        
+
         purchase_invoice_items = PurchaseInvoiceItem.objects.filter(
             purchase_invoice_id=self.context['purchase_invoice_id']
         )
 
         if not purchase_invoice_items:
             return False
-        
+
         invoice_items_map = {
             item.product.id: item for item in purchase_invoice_items
         }
 
         product_ids = [item.product.id for item in purchase_invoice_items]
-        product_ids = set(purchase_invoice_items.values_list('product_id', flat=True))
+        product_ids = set(purchase_invoice_items.values_list(
+            'product_id', flat=True))
         inventory_items = InventoryItem.objects.filter(
-            inventory_id = self.context['inventory_id'],
-            product_id__in = product_ids    
+            inventory_id=self.context['inventory_id'],
+            product_id__in=product_ids
         )
 
-        existing_products = set(inventory_items.values_list('product_id', flat=True))
+        existing_products = set(
+            inventory_items.values_list('product_id', flat=True))
         new_inventory_products = product_ids - existing_products
 
         new_inventory_items = [InventoryItem(
-            inventory_id = self.context['inventory_id'],
-            business_id = self.context['business_id'],
-            product_id = item.product.id,
-            location = self.validated_data['location'],
-            quantity = item.quantity,
-            track_code = item.track_code,
-            notes = item.notes,
-            quantity_on_hand = item.quantity,
-            unit_cost = item.unit_cost
+            inventory_id=self.context['inventory_id'],
+            business_id=self.context['business_id'],
+            product_id=item.product.id,
+            location=self.validated_data['location'],
+            quantity=item.quantity,
+            track_code=item.track_code,
+            notes=item.notes,
+            quantity_on_hand=item.quantity,
+            unit_cost=item.unit_cost
         ) for item in purchase_invoice_items if item.product.id in new_inventory_products]
 
         for item in inventory_items:
@@ -514,135 +613,51 @@ class RestockSerializer(serializers.Serializer):
             ])
 
         return True
-    
+
 
 class SalesInvoiceAndItemsCreateSerializer(serializers.ModelSerializer):
-    
+
     items = serializers.ListField()
+    project = serializers.IntegerField(required=False, allow_null=True)
 
     def save(self, **kwargs):
         items = self.validated_data.pop('items')
+        project_id = self.validated_data.pop('project', None)
 
         try:
             with transaction.atomic():
                 sales_invoice = SalesInvoice.objects.create(
-                    business_id = self.context['business_id'],
-                    created_by_id = self.context['user_id'],
+                    business_id=self.context['business_id'],
+                    created_by_id=self.context['user_id'],
                     **self.validated_data
                 )
-            
+
                 invoice_items = [SalesInvoiceItem(
-                    business_id = self.context['business_id'],
-                    sales_invoice_id = sales_invoice.id,
-                    product_id = item['product_id'],
-                    quantity = item['quantity'],
-                    quantity_received = item['quantity'],
-                    unit_price = item['unit_price']
+                    business_id=self.context['business_id'],
+                    sales_invoice_id=sales_invoice.id,
+                    product_id=item['product_id'],
+                    quantity=item['quantity'],
+                    quantity_received=item['quantity'],
+                    unit_price=item['unit_price']
                 ) for item in items]
-                invoice_items = SalesInvoiceItem.objects.bulk_create(invoice_items)
-            
+                SalesInvoiceItem.objects.bulk_create(invoice_items)
+
+                if project_id:
+                    ProjectSalesInvoice.objects.create(
+                        project_id=project_id,
+                        sales_invoice=sales_invoice
+                    )
+
             sales_invoice.refresh_from_db()
             sales_invoice.adjust_totals()
-            updateInventoryOnSale(sales_invoice) ### No need to call this, it's called in adjust_totals.
+            # No need to call this, it's called in adjust_totals.
+            updateInventoryOnSale(sales_invoice)
             return sales_invoice
-        
+
         except Exception as error:
             print(error)
             return None
-        
-    class Meta:
-        model = SalesInvoice
-        fields = [
-            'invoice_number',
-            'customer',
-            'notes',
-            'date_issued',
-            'date_due',
-            'discount',
-            'tax',
-            'payment_status',
-            'status',
-            'items'
-        ]
 
-
-class SalesInvoiceAndItemsUpdateSerializer(serializers.ModelSerializer):
-    
-
-    items = serializers.ListField()
-
-    ### Error here please debug
-    def save(self, **kwargs):
-        items = self.validated_data.pop('items')
-
-        try:
-            with transaction.atomic():
-                for attr, value in self.validated_data.items():
-                    setattr(self.instance, attr, value)
-                self.instance.save()
-
-                existing_items = SalesInvoiceItem.objects.filter(
-                    sales_invoice_id = self.instance.id
-                )
-                existing_items_map = {
-                    item.id: item for item in existing_items
-                }
-                existing_item_ids = set(existing_items.values_list('id', flat=True))
-
-                new_items = []
-                updated_items = []
-
-                for item in items:
-                    ### this block essentially does nothing as invoice items 
-                    ### can't be updated on the frontend currently.
-                    ### attr updation commented as functionality not on frontend yet.
-                    if item['id'] in existing_item_ids:
-                        invoice_item = existing_items_map.get(item['id'])
-                        # invoice_item.product_id = item['product_id']
-                        # invoice_item.quantity = item['quantity']
-                        # invoice_item.unit_price = item['unit_price']
-                        updated_items.append(invoice_item)
-                    else:
-                        new_items.append(SalesInvoiceItem(
-                            business_id = self.context['business_id'],
-                            sales_invoice = self.instance,
-                            product_id = item['product_id'],
-                            quantity = item['quantity'],
-                            unit_price = item['unit_price']
-                        ))
-
-                if new_items:
-                    print("Creating new items:", new_items)
-                    for item in new_items:
-                        for attr, value in item.__dict__.items():
-                            print(f"{attr}: {value}")
-
-                    new_items = SalesInvoiceItem.objects.bulk_create(new_items)
-                
-
-
-                ### Items on the frontend can't be updated,
-                ### They can either be created or deleted.
-
-                # if updated_items:
-                #     SalesInvoiceItem.objects.bulk_update(updated_items, [
-                #         'product', 'quantity', 'unit_price'
-                #     ])
-
-                updated_ids = [item.id for item in updated_items]
-                new_ids = [item.id for item in new_items]
-                existing_items = existing_items.exclude(id__in=updated_ids+new_ids)
-                existing_items.delete()
-                
-                self.instance.refresh_from_db()
-                self.instance.adjust_totals()
-                updateInventoryOnSale(self.instance)
-                return self.instance
-            
-        except Exception as error:
-            print(error)
-            return None
-        
     class Meta:
         model = SalesInvoice
         fields = [
@@ -656,7 +671,137 @@ class SalesInvoiceAndItemsUpdateSerializer(serializers.ModelSerializer):
             'payment_status',
             'status',
             'items',
+            'project'
         ]
+
+
+class SalesInvoiceAndItemsUpdateSerializer(serializers.ModelSerializer):
+
+    items = serializers.ListField()
+    project = serializers.IntegerField(required=False, allow_null=True)
+
+    def save(self, **kwargs):
+        items = self.validated_data.pop('items')
+        project_id = self.validated_data.pop('project', None)
+        project_id = int(project_id) if project_id else project_id
+
+        try:
+            with transaction.atomic():
+                for attr, value in self.validated_data.items():
+                    setattr(self.instance, attr, value)
+                self.instance.save()
+
+                existing_items = SalesInvoiceItem.objects.filter(
+                    sales_invoice_id=self.instance.id
+                )
+                existing_items_map = {
+                    item.id: item for item in existing_items
+                }
+                existing_item_ids = set(
+                    existing_items.values_list('id', flat=True))
+
+                new_items = []
+                updated_items = []
+
+                for item in items:
+                    # this block essentially does nothing as invoice items
+                    # can't be updated on the frontend currently.
+                    # attr updation commented as functionality not on frontend yet.
+
+                    if item['id'] in existing_item_ids:
+                        invoice_item = existing_items_map.get(item['id'])
+                        # invoice_item.product_id = item['product_id']
+                        # invoice_item.quantity = item['quantity']
+                        # invoice_item.unit_price = item['unit_price']
+                        updated_items.append(invoice_item)
+                    else:
+                        new_items.append(SalesInvoiceItem(
+                            business_id=self.context['business_id'],
+                            sales_invoice=self.instance,
+                            product_id=item['product_id'],
+                            quantity=item['quantity'],
+                            unit_price=item['unit_price']
+                        ))
+
+                if new_items:
+                    new_items = SalesInvoiceItem.objects.bulk_create(new_items)
+
+                # Items on the frontend can't be updated,
+                # They can either be created or deleted.
+
+                # if updated_items:
+                #     SalesInvoiceItem.objects.bulk_update(updated_items, [
+                #         'product', 'quantity', 'unit_price'
+                #     ])
+
+                updated_ids = [item.id for item in updated_items]
+                new_ids = [item.id for item in new_items]
+                existing_items = existing_items.exclude(
+                    id__in=updated_ids+new_ids)
+                existing_items.delete()
+
+                self.instance.refresh_from_db()
+                self.instance.adjust_totals()
+                updateInventoryOnSale(self.instance)
+
+                # Handle Projects Addition/Updation/Deletion Logic
+                if not project_id:
+                    print(
+                        "printing from ProjectPurchaseInvoice deletion block. Project ID is: ", project_id)
+                    ProjectSalesInvoice.objects.filter(
+                        sales_invoice=self.instance).delete()
+                else:
+                    print(
+                        "printing from ProjectPurchaseInvoice updation/creation block. Project ID is: ", project_id)
+                    ProjectSalesInvoice.objects.filter(
+                        sales_invoice=self.instance).exclude(project_id=project_id).delete()
+                    ProjectSalesInvoice.objects.get_or_create(
+                        project_id=project_id,
+                        sales_invoice=self.instance
+                    )
+
+                return self.instance
+
+        except Exception as error:
+            print(error)
+            return None
+
+    class Meta:
+        model = SalesInvoice
+        fields = [
+            'invoice_number',
+            'customer',
+            'notes',
+            'date_issued',
+            'date_due',
+            'discount',
+            'tax',
+            'payment_status',
+            'status',
+            'items',
+            'project'
+        ]
+
+
+class SalesReceiptCreateSerializer(PaymentReceiptSerializer):
+
+    def is_valid(self, *, raise_exception=False):
+        sales_invoice = SalesInvoice.objects.get(
+            id=self.context["sales_invoice_id"]
+        )
+
+        if float(self.initial_data["amount"]) + sales_invoice.total_paid > sales_invoice.total:
+            raise serializers.ValidationError({
+                "amount": "accumulated amount cannot exceed invoice total"
+            })
+
+        return super().is_valid(raise_exception=raise_exception)
+
+    def save(self, **kwargs):
+        return SalesReceipt.objects.create(
+            sales_invoice_id=self.context['sales_invoice_id'],
+            **self.validated_data
+        )
 
 
 class ReturnedItemSerializer(serializers.ModelSerializer):
@@ -681,19 +826,20 @@ class ReturnedItemCreateUpdateSerializer(serializers.ModelSerializer):
 
     def create(self, validated_data):
 
-        invoice_item = SalesInvoiceItem.objects.get(id=self.context["invoice_item_id"])
+        invoice_item = SalesInvoiceItem.objects.get(
+            id=self.context["invoice_item_id"])
         invoice_item.returned_quantity += validated_data['quantity']
-            
+
         with transaction.atomic():
             returned_item = ReturnedItem.objects.create(
-                business_id = self.context['business_id'],
-                invoice_item_id = self.context["invoice_item_id"],
+                business_id=self.context['business_id'],
+                invoice_item_id=self.context["invoice_item_id"],
                 **validated_data
             )
             invoice_item.save()
-            
+
         return returned_item
-    
+
     def update(self, instance: ReturnedItem, validated_data):
 
         old_quantity = instance.quantity
@@ -701,14 +847,15 @@ class ReturnedItemCreateUpdateSerializer(serializers.ModelSerializer):
         for attr, value in validated_data.items():
             setattr(instance, attr, value)
 
-        invoice_item = SalesInvoiceItem.objects.get(id=self.context["invoice_item_id"])
+        invoice_item = SalesInvoiceItem.objects.get(
+            id=self.context["invoice_item_id"])
         invoice_item.returned_quantity -= old_quantity
         invoice_item.returned_quantity += instance.quantity
 
         with transaction.atomic():
             instance.save()
             invoice_item.save()
-        
+
         return instance
 
 
@@ -730,4 +877,179 @@ class GenerateInvoiceSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'created_at', 'business', 'customer', 'invoice_number',
             'invoice_items', 'discount', 'tax', 'sub_total', 'total'
+        ]
+
+
+class PurchaseQuotationItemSerializer(BaseItemSerializer):
+    unit_price = serializers.FloatField()
+    supplier = SupplierSerializer()
+    is_fulfilled = serializers.BooleanField()
+
+
+class SimplePurchaseQuotationItemSerializer(serializers.ModelSerializer):
+    product = ProductVariantSerializer()
+    supplier = SimpleSupplierSerializer()
+
+    class Meta:
+        model = PurchaseQuotationItem
+        fields = ['id', 'purchase_quotation', 'supplier',
+                  'product', 'quantity', 'unit_price', 'is_fulfilled']
+
+
+class PurchaseQuotationItemCreateUpdateSerializer(serializers.ModelSerializer):
+
+    def save(self, **kwargs):
+        return PurchaseQuotationItem.objects.create(
+            business_id=self.context['business_id'],
+            purchase_quotation_id=self.context['purchase_quotation_id'],
+            **self.validated_data
+        )
+
+    def update(self, instance, validated_data):
+        return super().update(instance, validated_data)
+
+    class Meta:
+        model = PurchaseQuotationItem
+        fields = ['id', 'product', 'supplier',
+                  'quantity', 'unit_price', 'notes']
+
+
+class PurchaseQuotationSerializer(serializers.ModelSerializer):
+
+    created_by = SimpleUserSerializer(read_only=True)
+    items = SimplePurchaseQuotationItemSerializer(many=True)
+
+    class Meta:
+        model = PurchaseQuotation
+        fields = [
+            'id', 'business', 'quotation_no', 'created_by',
+            'created_at', 'updated_at', 'notes', 'status',
+            'items'
+        ]
+
+
+class PurchaseQuotationCreateSerializer(serializers.ModelSerializer):
+
+    def save(self, **kwargs):
+        return PurchaseQuotation.objects.create(
+            business_id=self.context['business_id'],
+            created_by_id=self.context['user_id'],
+            **self.validated_data
+        )
+
+    class Meta:
+        model = PurchaseQuotation
+        fields = ['id', 'quotation_no', 'status', 'notes']
+
+
+class PurchaseQuotationAndItemsCreateSerializer(serializers.ModelSerializer):
+    items = serializers.ListField()
+    created_by = SimpleUserSerializer(read_only=True)
+
+    def save(self, **kwargs):
+        items = self.validated_data.pop('items')
+
+        with transaction.atomic():
+            quotation = PurchaseQuotation.objects.create(
+                business_id=self.context['business_id'],
+                created_by_id=self.context['user_id'],
+                **self.validated_data
+            )
+
+            quotation_items = []
+            for item in items:
+                quotation_items.append(PurchaseQuotationItem(
+                    business_id=self.context['business_id'],
+                    purchase_quotation=quotation,
+                    **item
+                ))
+
+            PurchaseQuotationItem.objects.bulk_create(quotation_items)
+
+        return quotation
+
+    class Meta:
+        model = PurchaseQuotation
+        fields = [
+            'id', 'quotation_no', 'created_by',
+            'created_at', 'updated_at', 'notes', 'status',
+            'items'
+        ]
+
+
+class PurchaseQuotationAndItemsUpdateSerializer(serializers.ModelSerializer):
+
+    items = serializers.ListField()
+
+    def save(self, **kwargs):
+        items = self.validated_data.pop('items')
+
+        try:
+            with transaction.atomic():
+                for attr, value in self.validated_data.items():
+                    setattr(self.instance, attr, value)
+                self.instance.save()
+
+                existing_items = PurchaseQuotationItem.objects.filter(
+                    purchase_quotation_id=self.instance.id
+                )
+                existing_items_map = {
+                    item.id: item for item in existing_items
+                }
+                existing_item_ids = set(
+                    existing_items.values_list('id', flat=True))
+
+                new_items = []
+                updated_items = []
+
+                for item in items:
+                    # this block essentially does nothing as quotation items
+                    # can't be updated on the frontend currently.
+                    # attr updation commented as functionality not on frontend yet.
+
+                    if item.get('id', None) in existing_item_ids:
+                        quotation_item = existing_items_map.get(item['id'])
+                        # invoice_item.product_id = item['product_id']
+                        # invoice_item.quantity = item['quantity']
+                        # invoice_item.unit_price = item['unit_price']
+                        updated_items.append(quotation_item)
+                    else:
+                        new_items.append(PurchaseQuotationItem(
+                            business_id=self.context['business_id'],
+                            purchase_quotation=self.instance,
+                            product_id=item['product_id'],
+                            supplier_id=item['supplier_id'],
+                            quantity=item['quantity'],
+                            unit_price=item['unit_price']
+                        ))
+
+                if new_items:
+                    new_items = PurchaseQuotationItem.objects.bulk_create(
+                        new_items)
+
+                # Items on the frontend can't be updated,
+                # They can either be created or deleted.
+
+                # if updated_items:
+                #     SalesInvoiceItem.objects.bulk_update(updated_items, [
+                #         'product', 'quantity', 'unit_price'
+                #     ])
+
+                updated_ids = [item.id for item in updated_items]
+                new_ids = [item.id for item in new_items]
+                existing_items = existing_items.exclude(
+                    id__in=updated_ids+new_ids)
+                existing_items.delete()
+
+                self.instance.refresh_from_db()
+                return self.instance
+
+        except Exception as error:
+            print(error)
+            return None
+
+    class Meta:
+        model = PurchaseQuotation
+        fields = [
+            'id', 'quotation_no', 'notes', 'status', 'items'
         ]

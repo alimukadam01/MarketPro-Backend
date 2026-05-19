@@ -12,8 +12,9 @@ from django_filters.rest_framework import DjangoFilterBackend
 
 from root.utils import get_active_business
 from inventory.models import InventoryItem
-from .models import PurchaseInvoice, PurchaseInvoiceItem, ReturnedItem, SalesInvoice, SalesInvoiceItem
+from .models import PurchaseInvoice, PurchaseInvoiceItem, PurchaseQuotation, PurchaseQuotationItem, PurchaseReceipt, ReturnedItem, SalesInvoice, SalesInvoiceItem, SalesReceipt
 from .serializers import (
+    PaymentReceiptSerializer,
     PurchaseInvoiceAndItemsCreateSerializer,
     PurchaseInvoiceAndItemsUpdateSerializer,
     PurchaseInvoiceCreateSerializer,
@@ -22,6 +23,13 @@ from .serializers import (
     PurchaseInvoiceItemUpdateSerializer,
     PurchaseInvoiceUpdateSerializer,
     PurchaseInvoiceSerializer,
+    PurchaseQuotationAndItemsCreateSerializer,
+    PurchaseQuotationAndItemsUpdateSerializer,
+    PurchaseQuotationCreateSerializer,
+    PurchaseQuotationItemCreateUpdateSerializer,
+    PurchaseQuotationItemSerializer,
+    PurchaseQuotationSerializer,
+    PurchaseReceiptCreateSerializer,
     RestockSerializer,
     ReturnedItemCreateUpdateSerializer,
     SalesInvoiceAndItemsCreateSerializer,
@@ -33,8 +41,10 @@ from .serializers import (
     ReturnedItemSerializer,
     SalesInvoiceSerializer,
     SalesInvoiceUpdateSerializer,
+    SalesReceiptCreateSerializer,
     SimplePurchaseInvoiceItemSerializer,
     SimplePurchaseInvoiceSerializer,
+    SimplePurchaseQuotationItemSerializer,
     SimpleSalesInvoiceItemSerializer,
     SimpleSalesInvoiceSerializer,
     GenerateInvoiceSerializer
@@ -46,7 +56,8 @@ from .serializers import (
 class PurchaseInvoiceViewSet(ModelViewSet):
 
     filter_backends = [SearchFilter, DjangoFilterBackend]
-    filterset_fields = ['supplier__name', 'status', 'payment_status', 'sub_total', 'total', 'goods_received']
+    filterset_fields = ['supplier__name', 'status',
+                        'payment_status', 'sub_total', 'total', 'goods_received']
     search_fields = [
         'id', 'invoice_number', 'supplier__name', 'status', 'payment_status',
         'sub_total', 'total', 'amount_paid', 'goods_received', 'delivery', 'notes'
@@ -136,11 +147,11 @@ class PurchaseInvoiceViewSet(ModelViewSet):
                 }, status=status.HTTP_400_BAD_REQUEST)
 
             serializer = PurchaseInvoiceAndItemsCreateSerializer(
-                data=request.data, 
+                data=request.data,
                 context={
-                'business_id': business.id,
-                'user_id': self.request.user.id,
-            })
+                    'business_id': business.id,
+                    'user_id': self.request.user.id,
+                })
             serializer.is_valid(raise_exception=True)
             purchase_invoice = serializer.save()
 
@@ -179,7 +190,6 @@ class PurchaseInvoiceViewSet(ModelViewSet):
             }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     @action(['POST'], detail=True, url_path='update-with-items', url_name='update-with-items')
-    @transaction.atomic()
     def update_invoice_and_items(self, request, pk=None):
         try:
             business = get_active_business(self.request)
@@ -188,71 +198,22 @@ class PurchaseInvoiceViewSet(ModelViewSet):
                     'detail': 'Not Found.'
                 }, status=status.HTTP_404_NOT_FOUND)
 
-            instance: PurchaseInvoice = self.get_object()
-            if not instance:
-                return Response({
-                    'detail': 'Not Found.'
-                }, status=status.HTTP_404_NOT_FOUND)
-
-            existing_items = instance.invoice_items.all()
-            existing_items_map = {
-                item.id: item for item in existing_items
-            }
-
-            updated_items, new_items = [], []
-            items = request.data.pop('items', None)
-            if not items:
-                existing_items.delete()
-                return Response({
-                    'detail': 'OK'
-                }, status=status.HTTP_200_OK)
-            
-            tbc_items = [item for item in items if item.get('id') is None]
-            tbu_items = [item for item in items if item.get('id')]
-            tbu_ids = [item.get('id') for item in tbu_items]
-            tbd_ids = [item.id for item in existing_items if item.id not in tbu_ids]
-
-            with transaction.atomic():
-
-                serializer = PurchaseInvoiceUpdateSerializer(
-                    instance=instance, 
-                    data=request.data, 
-                    context={
+            instance = self.get_object()
+            serializer = PurchaseInvoiceAndItemsUpdateSerializer(
+                instance=instance,
+                data=request.data,
+                context={
                     'business_id': business.id,
                     'user_id': self.request.user.id
-                })
-                serializer.is_valid(raise_exception=True)
-
-                PurchaseInvoiceItem.objects.filter(id__in=tbd_ids).delete()
-
-                for item in tbu_items:
-                    invoice_item = existing_items_map.get(item['id'])
-                    invoice_item.product_id = item['product_id']
-                    invoice_item.quantity = item['quantity']
-                    invoice_item.unit_cost = item['unit_cost']
-                    updated_items.append(invoice_item)
-
-                for item in tbc_items:
-                    new_items.append(PurchaseInvoiceItem(
-                        business=business,
-                        purchase_invoice=instance,
-                        product_id=item['product_id'],
-                        quantity=item['quantity'],
-                        unit_cost=item['unit_cost']
-                    ))
-
-                if updated_items:
-                    PurchaseInvoiceItem.objects.bulk_update(
-                        updated_items,
-                        ['product_id', 'quantity', 'unit_cost']
-                    )
-
-                if new_items:
-                    PurchaseInvoiceItem.objects.bulk_create(new_items)
-
-            updated_purchase_invoice = serializer.update(
-                instance, serializer.validated_data
+                }
             )
+            serializer.is_valid(raise_exception=True)
+            updated_purchase_invoice = serializer.save()
+
+            if not updated_purchase_invoice:
+                return Response({
+                    'detail': 'Bad Request.'
+                }, status=status.HTTP_400_BAD_REQUEST)
 
             res_serializer = PurchaseInvoiceSerializer(updated_purchase_invoice)
             return Response(res_serializer.data, status=status.HTTP_200_OK)
@@ -263,7 +224,7 @@ class PurchaseInvoiceViewSet(ModelViewSet):
                 'detail': 'Internal Server Error.'
             }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
-    
+
 class PurchaseInvoiceItemViewSet(ModelViewSet):
 
     filter_backends = [SearchFilter, DjangoFilterBackend]
@@ -272,7 +233,7 @@ class PurchaseInvoiceItemViewSet(ModelViewSet):
         'product__name', 'product__base__name', 'track_code', 'unit_cost', 'quantity_received',
     ]
     search_fields = [
-        'id', 'purchase_invoice__id', 'purchase_invoice__invoice_number', 'product__name', 
+        'id', 'purchase_invoice__id', 'purchase_invoice__invoice_number', 'product__name',
         'product__base__name', 'track_code', 'notes', 'unit_cost', 'quantity_received'
     ]
 
@@ -305,9 +266,27 @@ class PurchaseInvoiceItemViewSet(ModelViewSet):
         }
 
 
+class PurchaseReceiptsViewSet(ModelViewSet):
+
+    def get_queryset(self):
+        return PurchaseReceipt.objects.filter(purchase_invoice_id = self.kwargs['purchase_invoice_pk'])
+    
+    def get_serializer_class(self):
+        
+        if self.request.method == 'POST':
+            return PurchaseReceiptCreateSerializer
+
+        return PaymentReceiptSerializer
+    
+    def get_serializer_context(self):
+        return {
+            "purchase_invoice_id": self.kwargs['purchase_invoice_pk']
+        }
+
+
 class PurchasesKPIViewSet(GenericViewSet):
 
-    ### MONTHLY METRICS
+    # MONTHLY METRICS
     @action(['GET'], detail=False, url_name='monthly-total-purchases', url_path='monthly-total-purchases')
     def monthly_total_purchases(self, request):
 
@@ -320,11 +299,12 @@ class PurchasesKPIViewSet(GenericViewSet):
                 }, status=status.HTTP_400_BAD_REQUEST)
 
             today = datetime.today()
-            total_purchases = PurchaseInvoice.objects.total_purchases(business.id, today.day)
+            total_purchases = PurchaseInvoice.objects.total_purchases(
+                business.id, today.day)
             return Response({
                 "total_purchases": total_purchases
             }, status=status.HTTP_200_OK)
-        
+
         return Response({
             "detail": "Method not allowed"
         }, status=status.HTTP_405_METHOD_NOT_ALLOWED)
@@ -340,16 +320,17 @@ class PurchasesKPIViewSet(GenericViewSet):
                 }, status=status.HTTP_400_BAD_REQUEST)
 
             today = datetime.today()
-            total_invoices = PurchaseInvoice.objects.total_invoices(business.id, today.day)
+            total_invoices = PurchaseInvoice.objects.total_invoices(
+                business.id, today.day)
             return Response({
                 "total_invoices": total_invoices
             }, status=status.HTTP_200_OK)
-        
+
         return Response({
             "detail": "Method not allowed"
         }, status=status.HTTP_405_METHOD_NOT_ALLOWED)
 
-    ### All TIME METRICS
+    # All TIME METRICS
     @action(['GET'], detail=False, url_name='total-purchases', url_path='total-purchases')
     def total_purchases(self, request):
         if request.method == 'GET':
@@ -359,11 +340,12 @@ class PurchasesKPIViewSet(GenericViewSet):
                     'detail': 'No active business exists. Please contact admin.'
                 }, status=status.HTTP_400_BAD_REQUEST)
 
-            total_purchases = PurchaseInvoice.objects.total_purchases(business.id)
+            total_purchases = PurchaseInvoice.objects.total_purchases(
+                business.id)
             return Response({
                 "total_purchases": total_purchases
             }, status=status.HTTP_200_OK)
-        
+
         return Response({
             "detail": "Method not allowed"
         }, status=status.HTTP_405_METHOD_NOT_ALLOWED)
@@ -378,15 +360,16 @@ class PurchasesKPIViewSet(GenericViewSet):
                     'detail': 'No active business exists. Please contact admin.'
                 }, status=status.HTTP_400_BAD_REQUEST)
 
-            total_invoices = PurchaseInvoice.objects.total_pending_invoices(business.id)
+            total_invoices = PurchaseInvoice.objects.total_pending_invoices(
+                business.id)
             return Response({
                 "total_invoices": total_invoices
             }, status=status.HTTP_200_OK)
-        
+
         return Response({
             "detail": "Method not allowed"
         }, status=status.HTTP_405_METHOD_NOT_ALLOWED)
-    
+
     @action(['GET'], detail=False, url_name='total-pending-payment', url_path='total-pending-payment')
     def total_pending_paymnet(self, request):
         if request.method == 'GET':
@@ -397,11 +380,12 @@ class PurchasesKPIViewSet(GenericViewSet):
                     'detail': 'No active business exists. Please contact admin.'
                 }, status=status.HTTP_400_BAD_REQUEST)
 
-            total_payment = PurchaseInvoice.objects.total_pending_payment(business.id)
+            total_payment = PurchaseInvoice.objects.total_pending_payment(
+                business.id)
             return Response({
                 "total_payment": total_payment
             }, status=status.HTTP_200_OK)
-        
+
         return Response({
             "detail": "Method not allowed"
         }, status=status.HTTP_405_METHOD_NOT_ALLOWED)
@@ -410,7 +394,8 @@ class PurchasesKPIViewSet(GenericViewSet):
 class SalesInvoiceViewSet(ModelViewSet):
 
     filter_backends = [SearchFilter, DjangoFilterBackend]
-    filterset_fields = ['customer__name', 'status', 'payment_status', 'sub_total', 'total', 'is_deducted', 'is_partially_deducted']
+    filterset_fields = ['customer__name', 'status', 'payment_status',
+                        'sub_total', 'total', 'is_deducted', 'is_partially_deducted']
     search_fields = [
         'id', 'invoice_number', 'customer__name', 'status', 'payment_status', 'sub_total', 'total', 'discount', 'tax', 'notes', 'created_by__email'
     ]
@@ -544,150 +529,6 @@ class SalesInvoiceViewSet(ModelViewSet):
             return Response(serializer.data, status=status.HTTP_200_OK)
 
 
-class SalesKPIViewSet(GenericViewSet):
-
-    queryset = []
-    serializer_class = None
-
-    ### DAILY METRICS
-    @action(['GET'], detail=False, url_name='daily-total-sales', url_path='daily-total-sales')
-    def daily_total_sales(self, request):
-        if request.method == 'GET':
-
-            business = get_active_business(request)
-            if not business:
-                return Response({
-                    'detail': 'No active business exists. Please contact admin.'
-                }, status=status.HTTP_400_BAD_REQUEST)
-
-            total_sales = SalesInvoice.objects.total_sales(business.id, 1)
-            return Response({
-                "total_daily_sales": total_sales
-            }, status=status.HTTP_200_OK)
-        
-        return Response({
-            "detail": "Method not allowed"
-        }, status=status.HTTP_405_METHOD_NOT_ALLOWED)
-
-    @action(['GET'], detail=False, url_name='daily-total-sales-invoices', url_path='daily-total-sales-invoices')
-    def daily_total_invoices(self, request):
-        if request.method == 'GET':
-
-            business = get_active_business(request)
-            if not business:
-                return Response({
-                    'detail': 'No active business exists. Please contact admin.'
-                }, status=status.HTTP_400_BAD_REQUEST)
-
-            total_invoices = SalesInvoice.objects.total_invoices(business.id, 1)
-            return Response({
-                "total_invoices": total_invoices
-            }, status=status.HTTP_200_OK)
-        
-        return Response({
-            "detail": "Method not allowed"
-        }, status=status.HTTP_405_METHOD_NOT_ALLOWED)
-    
-    @action(['GET'], detail=False, url_name='recent-sales', url_path='recent-sales')
-    def recent_sales(self, request):
-        business = get_active_business(request)
-        if not business:
-            return Response({
-                'detail': 'No active business exists. Please contact admin.'
-            }, status=status.HTTP_400_BAD_REQUEST)
-
-        recent_sales = SalesInvoice.objects.recent_sales(business.id)
-        return Response({
-            "recent_sales": recent_sales
-        }, status=status.HTTP_200_OK)
-
-
-    @action(methods=['GET'], detail=False, url_name='daily-total-items', url_path='daily-total-items')
-    def daily_total_items(self, request):
-        if request.method == "GET":
-            business = get_active_business(request)
-            if not business:
-                return Response({
-                    'detail': 'No active business exists. Please contact admin.'
-                }, status=status.HTTP_400_BAD_REQUEST)
-
-            total_items = SalesInvoiceItem.objects.total_items_sold(business.id, 1)
-            return Response({
-                "total_items": total_items
-            }, status=status.HTTP_200_OK)
-        
-        return Response({
-            "detail": "Method not allowed"
-        }, status=status.HTTP_405_METHOD_NOT_ALLOWED)
-
-    ### MONTHLY METRICS
-    @action(['GET'], detail=False, url_name='monthly-total-sales', url_path='monthly-total-sales')
-    def monthly_total_sales(self, request):
-
-        if request.method == 'GET':
-
-            business = get_active_business(request)
-            if not business:
-                return Response({
-                    'detail': 'No active business exists. Please contact admin.'
-                }, status=status.HTTP_400_BAD_REQUEST)
-
-            today = datetime.today()
-            total_days_month = monthrange(today.year, today.month)[1]
-            days = total_days_month - today.day
-            total_sales = SalesInvoice.objects.total_sales(business.id, days)
-            return Response({
-                "total_monthly_sales": total_sales
-            }, status=status.HTTP_200_OK)
-        
-        return Response({
-            "detail": "Method not allowed"
-        }, status=status.HTTP_405_METHOD_NOT_ALLOWED)
-
-    @action(['GET'], detail=False, url_name='monthly-sales-trend', url_path='monthly-sales-trend')
-    def monthly_sales_trend(self, request):
-
-        if request.method == 'GET':
-
-            business = get_active_business(request)
-            if not business:
-                return Response({
-                    'detail': 'No active business exists. Please contact admin.'
-                }, status=status.HTTP_400_BAD_REQUEST)
-
-            total_sales = SalesInvoice.objects.monthly_sales_trend(business.id)
-            return Response({
-                "monthly_sales_trend": total_sales
-            }, status=status.HTTP_200_OK)
-        
-        return Response({
-            "detail": "Method not allowed"
-        }, status=status.HTTP_405_METHOD_NOT_ALLOWED)
-
-    ### YEARLY METRICS
-
-
-    ### ALL TIME METRICS
-    @action(['GET'], detail=False, url_name='average-order-value', url_path='average-order-value')
-    def avg_order_value(self, request):
-        if request.method == 'GET':
-            business = get_active_business(request)
-            
-            if not business:
-                return Response({
-                    'detail': 'No active business exists. Please contact admin.'
-                }, status=status.HTTP_400_BAD_REQUEST)
-
-            avg_order_value = SalesInvoice.objects.average_order_value(business.id)
-            return Response({
-                "avg_order_value": avg_order_value
-            }, status=status.HTTP_200_OK)
-        
-        return Response({
-            "detail": "Method not allowed"
-        }, status=status.HTTP_405_METHOD_NOT_ALLOWED)
-
-
 class SalesInvoiceItemViewSet(ModelViewSet):
 
     filter_backends = [SearchFilter, DjangoFilterBackend]
@@ -696,7 +537,7 @@ class SalesInvoiceItemViewSet(ModelViewSet):
         'product__name', 'product__base__name', 'track_code', 'unit_price', 'quantity_received'
     ]
     search_fields = [
-       'id', 'sales_invoice__id', 'sales_invoice__invoice_number', 'product__name', 'product__base__name', 'track_code', 'quantity_received', 'unit_price', 'discount'
+        'id', 'sales_invoice__id', 'sales_invoice__invoice_number', 'product__name', 'product__base__name', 'track_code', 'quantity_received', 'unit_price', 'discount'
     ]
 
     def get_queryset(self):
@@ -720,7 +561,6 @@ class SalesInvoiceItemViewSet(ModelViewSet):
 
         if method in ('PUT', 'PATCH'):
             return SalesInvoiceItemUpdateSerializer
-        
 
         return SalesInvoiceItemSerializer
 
@@ -769,6 +609,169 @@ class SalesInvoiceItemViewSet(ModelViewSet):
                 }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
+class SalesReceiptsViewSet(ModelViewSet):
+
+    def get_queryset(self):
+        return SalesReceipt.objects.filter(sales_invoice_id = self.kwargs['sales_invoice_pk'])
+    
+    def get_serializer_class(self):
+        if self.request.method == 'POST':
+            return SalesReceiptCreateSerializer
+        
+        return PaymentReceiptSerializer
+    
+    def get_serializer_context(self):
+        return {
+            "sales_invoice_id": self.kwargs['sales_invoice_pk']
+        }
+
+
+class SalesKPIViewSet(GenericViewSet):
+
+    queryset = []
+    serializer_class = None
+
+    # DAILY METRICS
+    @action(['GET'], detail=False, url_name='daily-total-sales', url_path='daily-total-sales')
+    def daily_total_sales(self, request):
+        if request.method == 'GET':
+
+            business = get_active_business(request)
+            if not business:
+                return Response({
+                    'detail': 'No active business exists. Please contact admin.'
+                }, status=status.HTTP_400_BAD_REQUEST)
+
+            total_sales = SalesInvoice.objects.total_sales(business.id, 1)
+            return Response({
+                "total_daily_sales": total_sales
+            }, status=status.HTTP_200_OK)
+
+        return Response({
+            "detail": "Method not allowed"
+        }, status=status.HTTP_405_METHOD_NOT_ALLOWED)
+
+    @action(['GET'], detail=False, url_name='daily-total-sales-invoices', url_path='daily-total-sales-invoices')
+    def daily_total_invoices(self, request):
+        if request.method == 'GET':
+
+            business = get_active_business(request)
+            if not business:
+                return Response({
+                    'detail': 'No active business exists. Please contact admin.'
+                }, status=status.HTTP_400_BAD_REQUEST)
+
+            total_invoices = SalesInvoice.objects.total_invoices(
+                business.id, 1)
+            return Response({
+                "total_invoices": total_invoices
+            }, status=status.HTTP_200_OK)
+
+        return Response({
+            "detail": "Method not allowed"
+        }, status=status.HTTP_405_METHOD_NOT_ALLOWED)
+
+    @action(['GET'], detail=False, url_name='recent-sales', url_path='recent-sales')
+    def recent_sales(self, request):
+        business = get_active_business(request)
+        if not business:
+            return Response({
+                'detail': 'No active business exists. Please contact admin.'
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        recent_sales = SalesInvoice.objects.recent_sales(business.id)
+        return Response({
+            "recent_sales": recent_sales
+        }, status=status.HTTP_200_OK)
+
+    @action(methods=['GET'], detail=False, url_name='daily-total-items', url_path='daily-total-items')
+    def daily_total_items(self, request):
+        if request.method == "GET":
+            business = get_active_business(request)
+            if not business:
+                return Response({
+                    'detail': 'No active business exists. Please contact admin.'
+                }, status=status.HTTP_400_BAD_REQUEST)
+
+            total_items = SalesInvoiceItem.objects.total_items_sold(
+                business.id, 1)
+            return Response({
+                "total_items": total_items
+            }, status=status.HTTP_200_OK)
+
+        return Response({
+            "detail": "Method not allowed"
+        }, status=status.HTTP_405_METHOD_NOT_ALLOWED)
+
+    # MONTHLY METRICS
+    @action(['GET'], detail=False, url_name='monthly-total-sales', url_path='monthly-total-sales')
+    def monthly_total_sales(self, request):
+
+        if request.method == 'GET':
+
+            business = get_active_business(request)
+            if not business:
+                return Response({
+                    'detail': 'No active business exists. Please contact admin.'
+                }, status=status.HTTP_400_BAD_REQUEST)
+
+            today = datetime.today()
+            total_days_month = monthrange(today.year, today.month)[1]
+            days = total_days_month - today.day
+            total_sales = SalesInvoice.objects.total_sales(business.id, days)
+            return Response({
+                "total_monthly_sales": total_sales
+            }, status=status.HTTP_200_OK)
+
+        return Response({
+            "detail": "Method not allowed"
+        }, status=status.HTTP_405_METHOD_NOT_ALLOWED)
+
+    @action(['GET'], detail=False, url_name='monthly-sales-trend', url_path='monthly-sales-trend')
+    def monthly_sales_trend(self, request):
+
+        if request.method == 'GET':
+
+            business = get_active_business(request)
+            if not business:
+                return Response({
+                    'detail': 'No active business exists. Please contact admin.'
+                }, status=status.HTTP_400_BAD_REQUEST)
+
+            total_sales = SalesInvoice.objects.monthly_sales_trend(business.id)
+            return Response({
+                "monthly_sales_trend": total_sales
+            }, status=status.HTTP_200_OK)
+
+        return Response({
+            "detail": "Method not allowed"
+        }, status=status.HTTP_405_METHOD_NOT_ALLOWED)
+
+    # YEARLY METRICS
+
+    # ALL TIME METRICS
+
+    @action(['GET'], detail=False, url_name='average-order-value', url_path='average-order-value')
+    def avg_order_value(self, request):
+        if request.method == 'GET':
+            business = get_active_business(request)
+
+            if not business:
+                return Response({
+                    'detail': 'No active business exists. Please contact admin.'
+                }, status=status.HTTP_400_BAD_REQUEST)
+
+            avg_order_value = SalesInvoice.objects.average_order_value(
+                business.id)
+            return Response({
+                "avg_order_value": avg_order_value
+            }, status=status.HTTP_200_OK)
+
+        return Response({
+            "detail": "Method not allowed"
+        }, status=status.HTTP_405_METHOD_NOT_ALLOWED)
+
+
 class ReturnedItemsViewSet(ModelViewSet):
 
     filter_backends = [SearchFilter, DjangoFilterBackend]
@@ -776,7 +779,7 @@ class ReturnedItemsViewSet(ModelViewSet):
         'invoice_item__sales_invoice__id', 'invoice_item__product__name', 'invoice_item__product__base__name', 'quantity'
     ]
     search_fields = [
-       'id', 'invoice_item__sales_invoice__id', 'invoice_item__product__name', 'invoice_item__product__base__name'
+        'id', 'invoice_item__sales_invoice__id', 'invoice_item__product__name', 'invoice_item__product__base__name'
     ]
 
     def get_queryset(self):
@@ -785,12 +788,12 @@ class ReturnedItemsViewSet(ModelViewSet):
             return []
 
         return ReturnedItem.objects.filter(business_id=business.id).order_by('-created_at')
-    
+
     def get_serializer_class(self):
         if self.request.method in ('POST', 'PUT', 'PATCH'):
             return ReturnedItemCreateUpdateSerializer
         return ReturnedItemSerializer
-    
+
     def get_serializer_context(self):
         business = get_active_business(self.request)
         if not business:
@@ -798,7 +801,7 @@ class ReturnedItemsViewSet(ModelViewSet):
         return {
             'business_id': business.id
         }
-    
+
     @action(['POST'], detail=False, url_path='bulk-delete', url_name='bulk-delete')
     def bulk_delete(self, request):
         returned_item_ids = request.data.get('returned_item_ids', [])
@@ -833,11 +836,11 @@ class ReturnedItemsViewSet(ModelViewSet):
 
             invoice_item: SalesInvoiceItem = instance.invoice_item
             invoice_item.returned_quantity -= instance.quantity
-            
+
             with transaction.atomic():
                 instance.save()
                 invoice_item.save(update_fields=['returned_quantity'])
-            
+
             return Response({
                 "detail": "OK"
             }, status=status.HTTP_200_OK)
@@ -847,27 +850,28 @@ class ReturnedItemsViewSet(ModelViewSet):
                 "detail": "Internal Server Error"
             }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
-    ### Implement properly, discussed with GPT in MarketPro 04. Search Keyword: You adjust quantities.
+    # Implement properly, discussed with GPT in MarketPro 04. Search Keyword: You adjust quantities.
     @action(['POST'], detail=True, url_path='inventory-return', url_name='inventory-return')
     def inventory_return(self, request, pk=None):
         try:
             instance: ReturnedItem = self.get_object()
-            
+
             if instance.is_returned:
                 return Response({
                     "detail": "Item already returned"
                 }, status=status.HTTP_400_BAD_REQUEST)
-            
+
             instance.return_type = 'to_inventory'
 
-            inventory_item = InventoryItem.objects.get(product = instance.invoice_item.product)
+            inventory_item = InventoryItem.objects.get(
+                product=instance.invoice_item.product)
             inventory_item.quantity += instance.quantity
             inventory_item.quantity_on_hand += instance.quantity
-            
+
             with transaction.atomic():
                 instance.save()
                 inventory_item.save()
-                
+
             return Response({
                 "detail": "OK"
             }, status=status.HTTP_200_OK)
@@ -886,18 +890,195 @@ class ReturnedItemsKPIViewSet(GenericViewSet):
     def total_returned_items(self, request):
         if request.method == 'GET':
             business = get_active_business(request)
-            
+
             if not business:
                 return Response({
                     'detail': 'No active business exists. Please contact admin.'
                 }, status=status.HTTP_400_BAD_REQUEST)
 
-            total_returned_items = ReturnedItem.objects.total_returned_items(business.id)
+            total_returned_items = ReturnedItem.objects.total_returned_items(
+                business.id)
             return Response({
                 "total_returned_items": total_returned_items
             }, status=status.HTTP_200_OK)
-        
+
         return Response({
             "detail": "Method not allowed"
         }, status=status.HTTP_405_METHOD_NOT_ALLOWED)
-    
+
+
+class PurchaseQuotationViewSet(ModelViewSet):
+
+    filter_backends = [SearchFilter]
+    search_fields = [
+        'id', 'quotation_no', 'status', 'notes', 'created_at'
+    ]
+
+    def get_queryset(self):
+
+        business = get_active_business(self.request)
+        return PurchaseQuotation.objects.filter(business_id=business.id)
+
+    def get_serializer_class(self):
+
+        if self.action == 'create_quotation_and_items':
+            return PurchaseQuotationAndItemsCreateSerializer
+
+        if self.request.method == 'POST':
+            return PurchaseQuotationCreateSerializer
+
+        return PurchaseQuotationSerializer
+
+    def get_serializer_context(self):
+
+        business = get_active_business(self.request)
+        if not business:
+            return {}
+
+        return {
+            'business_id': business.id,
+            'user_id': self.request.user.id
+        }
+
+    @action(['POST'], detail=False, url_path='bulk-delete', url_name='bulk-delete')
+    def bulk_delete(self, request):
+        purchase_quotation_ids = request.data.get('purchase_quotation_ids', [])
+        if not purchase_quotation_ids:
+            return Response({
+                'detail': 'Bad Request.'
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            PurchaseQuotation.objects.filter(
+                id__in=purchase_quotation_ids).delete()
+            return Response({
+                'detail': 'Success.'
+            }, status=status.HTTP_200_OK)
+
+        except Exception as error:
+            print(error)
+            return Response({
+                'detail': 'Internal Server Error.'
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    @action(['POST'], detail=False, url_path='create-with-items', url_name='create-with-items')
+    def create_quotation_and_items(self, request):
+        if request.method == 'POST':
+            try:
+                business = get_active_business(request)
+                if not business:
+                    return Response({
+                        'detail': 'No active business exists. Please contact admin.'
+                    }, status=status.HTTP_400_BAD_REQUEST)
+
+                serializer = PurchaseQuotationAndItemsCreateSerializer(data=request.data, context={
+                    'business_id': business.id,
+                    'user_id': self.request.user.id,
+                })
+                serializer.is_valid(raise_exception=True)
+                quotation = serializer.save()
+
+                if not quotation:
+                    return Response({
+                        'detail': 'Bad Request.'
+                    }, status=status.HTTP_400_BAD_REQUEST)
+
+                res_serializer = PurchaseQuotationSerializer(quotation)
+                return Response(res_serializer.data, status=status.HTTP_201_CREATED)
+
+            except Exception as error:
+                print(error)
+                return Response({
+                    'detail': 'Internal Server Error.'
+                }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    @action(['POST'], detail=True, url_path='update-with-items', url_name='update-with-items')
+    def update_quotation_with_items(self, request, pk=None):
+        try:
+            business = get_active_business(request)
+            if not business:
+                return Response({
+                    'detail': 'No active business exists. Please contact admin.'
+                }, status=status.HTTP_400_BAD_REQUEST)
+
+            instance = self.get_object()
+            if not instance:
+                return Response({
+                    'detail': 'Not Found.'
+                }, status=status.HTTP_404_NOT_FOUND)
+
+            serializer = PurchaseQuotationAndItemsUpdateSerializer(
+                instance, data=request.data, 
+                context={
+                'business_id': business.id,
+            })
+            serializer.is_valid(raise_exception=True)
+            sales_invoice = serializer.save()
+
+            if not sales_invoice:
+                return Response({
+                    'detail': 'Bad Request.'
+                }, status=status.HTTP_400_BAD_REQUEST)
+
+            res_serializer = SalesInvoiceSerializer(sales_invoice)
+            return Response(res_serializer.data, status=status.HTTP_200_OK)
+
+        except Exception as error:
+            print(error)
+            return Response({
+                'detail': 'Internal Server Error.'
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+class PurchaseQuotationItemViewSet(ModelViewSet):
+    filter_backends = [SearchFilter, DjangoFilterBackend]
+    '''
+    filterset_fields = [
+        'sales_invoice__id', 'sales_invoice__invoice_number', 'is_deducted', 'is_partially_deducted',
+        'product__name', 'product__base__name', 'track_code', 'unit_price', 'quantity_received'
+    ]
+    search_fields = [
+       'id', 'sales_invoice__id', 'sales_invoice__invoice_number', 'product__name', 'product__base__name', 'track_code', 'quantity_received', 'unit_price', 'discount'
+    ]
+    '''
+
+    def get_queryset(self):
+        return PurchaseQuotationItem.objects.filter(purchase_quotation_id=self.kwargs['purchase_quotation_pk'])
+
+    def get_serializer_class(self):
+        method = self.request.method
+
+        if self.action == 'list':
+            return SimplePurchaseQuotationItemSerializer
+
+        if method in ('POST', 'PUT', 'PATCH'):
+            return PurchaseQuotationItemCreateUpdateSerializer
+
+        return PurchaseQuotationItemSerializer
+
+    def get_serializer_context(self):
+
+        business = get_active_business(self.request)
+        if not business:
+            return {}
+        return {
+            'business_id': business.id,
+            'purchase_quotation_id': self.kwargs['purchase_quotation_pk'],
+        }
+
+    @action(methods=['GET'], detail=True, url_path='toggle-fulfillment', url_name='toggle-fulfillment')
+    def toggle_fulfillment(self, request, purchase_quotation_pk=None, pk=None):
+
+        try:
+            object = self.get_object()
+            object.is_fulfilled = not object.is_fulfilled
+            object.save()
+
+            return Response({
+                "detail": "OK"
+            }, status=status.HTTP_200_OK)
+        except Exception as error:
+            print(error)
+            return Response({
+                "detail": "Internal Server Error"
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)

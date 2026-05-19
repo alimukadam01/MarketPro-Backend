@@ -4,17 +4,21 @@ from django.conf import settings
 from django.db import transaction
 from django.db.models import Q, Model
 from rest_framework.viewsets import ModelViewSet
-from .models import Business
+from .models import Business, Employee
 
 def get_active_business(request):
 
-    if request.user and request.user.is_authenticated:
+    user = request.user
+    business = None
+    
+    if user and user.is_authenticated:
         try:
-            return Business.objects.get(owner_id = request.user.id, is_active=True)
-        except Exception as error:
+            business = Business.objects.get(owner_id = user.id, is_active=True)
+        except Business.DoesNotExist as error:
             print(error)
-            return None
-    return None
+            business = Employee.objects.get(user = user).business
+            return business
+    return business
 
 def generateTransactionId(instance: Model):
     

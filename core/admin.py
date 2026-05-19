@@ -9,7 +9,7 @@ from core.models import User
 class UserAdmin(BaseUserAdmin):
     fieldsets = (
         (None, {"fields": ("email", "password",)}),
-        (_("Personal info"), {"fields": ("first_name", "last_name", "phone",)}),
+        (_("Personal info"), {"fields": ("first_name", "last_name", "phone", "role")}),
         (
             _("Permissions"),
             {

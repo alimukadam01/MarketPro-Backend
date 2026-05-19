@@ -43,14 +43,20 @@ class UserManager(BaseUserManager):
 
 
 class User(AbstractUser):
-    username = None
-    email = models.EmailField(_("email address"), blank=True, unique=True)
-    phone = models.CharField(max_length=25)
-    is_employee = models.BooleanField(default=True)
-    role = models.CharField(max_length=256)
 
-    USERNAME_FIELD = 'email'
+    ADMIN    = 'admin'
+    EMPLOYEE = 'employee'
+    ROLE_CHOICES = [
+        (ADMIN,    'Admin'),
+        (EMPLOYEE, 'Employee'),
+    ]
+
+    username    = None
+    email       = models.EmailField(_("email address"), blank=True, unique=True)
+    phone       = models.CharField(max_length=25, blank=True, default='')
+    role        = models.CharField(max_length=50, choices=ROLE_CHOICES, default=ADMIN)
+
+    USERNAME_FIELD  = 'email'
     REQUIRED_FIELDS = []
-    objects = UserManager()
+    objects         = UserManager()
 
-    

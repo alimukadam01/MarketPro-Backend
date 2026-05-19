@@ -6,6 +6,7 @@ from django.conf import settings
 
 # Create your models here.
 
+
 class BaseQuerySet(models.QuerySet):
 
     def for_business(self, business_id):
@@ -13,8 +14,8 @@ class BaseQuerySet(models.QuerySet):
 
     def in_period(self, days):
         start = datetime.today() - timedelta(days=days)
-        return self.filter(created_at__gte = start)
-    
+        return self.filter(created_at__gte=start)
+
     def monthly_trend(self, business_id, field):
         today = date.today()
         year = today.year
@@ -65,17 +66,17 @@ class City(models.Model):
 
     name = models.CharField(max_length=256)
     postal_code = models.CharField(max_length=256)
-    created_at = models.DateTimeField(auto_now_add = True)
+    created_at = models.DateTimeField(auto_now_add=True)
 
     def __str__(self):
         return f"{self.name}"
-    
+
 
 class Category(models.Model):
 
-    name = models.CharField(max_length=256) 
+    name = models.CharField(max_length=256)
     desc = models.CharField(max_length=1000, null=True, blank=True)
-    created_at = models.DateTimeField(auto_now_add = True)
+    created_at = models.DateTimeField(auto_now_add=True)
 
     def __str__(self):
         return f"{self.name}"
@@ -94,13 +95,14 @@ class Business(models.Model):
 
     name = models.CharField(max_length=256)
     owner = models.ForeignKey(
-        settings.AUTH_USER_MODEL, 
-        on_delete=models.CASCADE, 
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
         related_name="businesses"
     )
     phone = models.CharField(max_length=256)
     address = models.TextField(null=True, blank=True)
-    logo = models.ImageField(upload_to="business_logos/", null=True, blank=True)
+    logo = models.ImageField(
+        upload_to="business_logos/", null=True, blank=True)
     sku_counter = models.PositiveIntegerField(default=0)
     is_active = models.BooleanField(default=False)
 
@@ -108,12 +110,74 @@ class Business(models.Model):
         return f"{ self.name }"
 
 
+class Employee(models.Model):
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='emp_records')
+    business = models.ForeignKey(
+        Business, models.CASCADE, related_name='emp_records')
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    created_by = models.ForeignKey(settings.AUTH_USER_MODEL, models.CASCADE)
+
+    class Meta:
+        unique_together = [("business", "user")]
+
+
 class BusinessConfig(models.Model):
-    user = models.OneToOneField(settings.AUTH_USER_MODEL, models.CASCADE, related_name='business_config')
-    is_sales_enabled = models.BooleanField(default=True)
-    is_purchases_enabled = models.BooleanField(default=True)
-    is_projects_enabled = models.BooleanField(default=False)
-    is_inventory_enabled = models.BooleanField(default=True)
+    business = models.OneToOneField(
+        Business, models.CASCADE, related_name='config')
+    sales = models.BooleanField(default=True)
+    purchases = models.BooleanField(default=True)
+    projects = models.BooleanField(default=False)
+    inventory = models.BooleanField(default=True)
+    returned_items = models.BooleanField(default=True)
+    quotations = models.BooleanField(default=True)
+
+    def __str__(self):
+        return f"Config for {self.business.name}"
+
+
+class EmployeeAccess(models.Model):
+    """
+    Stores per-module CRUD permissions for an employee within a specific business.
+    Admins always have full access; this model only applies to role='employee' users.
+
+    permissions JSON structure:
+    {
+        "sales":         {"view": bool, "create": bool, "edit": bool, "delete": bool},
+        "purchases":     {"view": bool, "create": bool, "edit": bool, "delete": bool},
+        "inventory":     {"view": bool, "create": bool, "edit": bool, "delete": bool},
+        "products":      {"view": bool, "create": bool, "edit": bool, "delete": bool},
+        "customers":     {"view": bool, "create": bool, "edit": bool, "delete": bool},
+        "suppliers":     {"view": bool, "create": bool, "edit": bool, "delete": bool},
+        "locations":     {"view": bool, "create": bool, "edit": bool, "delete": bool},
+        "expenses":      {"view": bool, "create": bool, "edit": bool, "delete": bool},
+        "projects":      {"view": bool, "create": bool, "edit": bool, "delete": bool},
+        "quotations":    {"view": bool, "create": bool, "edit": bool, "delete": bool},
+        "returned_items":{"view": bool, "create": bool, "edit": bool, "delete": bool},
+    }
+    """
+
+    all_modules = [
+        "sales",
+        "purchases",
+        "inventory",
+        "products",
+        "customers",
+        "suppliers",
+        "locations",
+        "expenses",
+        "projects",
+        "quotations",
+        "returned_items"
+    ]
+
+    employee = models.OneToOneField(
+        Employee, on_delete=models.CASCADE, related_name="access")
+    permissions = models.JSONField(default=dict)
+
+    def __str__(self):
+        return f"{self.employee.user.email} @ {self.employee.business.name}"
 
 
 class CustomerQuerySet(BaseQuerySet):
@@ -136,13 +200,14 @@ class CustomerManager(models.Manager):
 class Customer(models.Model):
 
     name = models.CharField(max_length=256)
-    business = models.ForeignKey(Business, models.CASCADE, related_name='customers')
+    business = models.ForeignKey(
+        Business, models.CASCADE, related_name='customers')
     phone = models.CharField(max_length=256, null=True, blank=True)
     email = models.EmailField(null=True, blank=True)
     address = models.TextField(null=True, blank=True)
     city = models.ForeignKey(City, models.DO_NOTHING)
-    created_at = models.DateTimeField(auto_now_add = True)
-    updated_at = models.DateTimeField(auto_now = True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
     notes = models.TextField(null=True, blank=True)
     total_sales = models.FloatField(null=True, blank=True)
 
@@ -160,14 +225,16 @@ class LocationManager(models.Manager):
 
     def get_queryset(self):
         return LocationQuerySet(self.model)
-    
+
     def total_locations(self, business_id):
         return self.get_queryset().for_business(business_id).count()
 
 
 class Location(models.Model):
 
-    business = models.ForeignKey(Business, models.CASCADE, related_name='locations')
+    business = models.ForeignKey(
+        Business, models.CASCADE, related_name='locations'
+    )
     name = models.CharField(max_length=256)
     address = models.TextField()
     created_at = models.DateTimeField(auto_now_add=True)
@@ -187,12 +254,12 @@ class ProductManager(models.Manager):
 
     def get_queryset(self):
         return ProductQuerySet(self.model)
-    
+
     def total_products(self, business_id, num_days=None):
 
         if num_days:
             return self.get_queryset().for_business(business_id).in_period(num_days).count()
-        
+
         return self.get_queryset().for_business(business_id).count()
 
 
@@ -204,7 +271,8 @@ class ProductVariantType(models.Model):
 
 
 class Product(models.Model):
-    business = models.ForeignKey(Business, models.CASCADE, related_name='products')
+    business = models.ForeignKey(
+        Business, models.CASCADE, related_name='products')
     name = models.CharField(max_length=256)
     code = models.CharField(max_length=256, null=True, blank=True)
     desc = models.TextField(null=True, blank=True)
@@ -220,9 +288,10 @@ class Product(models.Model):
 
 
 class ProductVariant(models.Model):
-    
+
     name = models.CharField(max_length=256, null=True, blank=True)
-    base = models.ForeignKey(Product, on_delete=models.CASCADE, related_name='variants')
+    base = models.ForeignKey(
+        Product, on_delete=models.CASCADE, related_name='variants')
     sku = models.CharField(max_length=256)
     attributes = models.JSONField(default=dict, blank=True, null=True)
     is_active = models.BooleanField(default=True)
@@ -236,7 +305,8 @@ class ProductVariant(models.Model):
 class BaseItem(models.Model):
 
     business = models.ForeignKey(Business, models.CASCADE)
-    product = models.ForeignKey(ProductVariant, models.CASCADE, null=True, blank=True)
+    product = models.ForeignKey(
+        ProductVariant, models.CASCADE, null=True, blank=True)
     quantity = models.IntegerField(default=0)
     track_code = models.CharField(max_length=256, null=True, blank=True)
     notes = models.TextField(null=True, blank=True)
@@ -255,17 +325,18 @@ class SupplierManager(models.Manager):
 
     def get_queryset(self):
         return SupplierQuerySet(self.model)
-    
+
     def total_suppliers(self, business_id, num_days=None):
 
         if num_days:
             return self.get_queryset().for_business(business_id).in_period(num_days).count()
-        
+
         return self.get_queryset().for_business(business_id).count()
 
 
 class Supplier(models.Model):
-    business = models.ForeignKey(Business, models.CASCADE, related_name='suppliers')
+    business = models.ForeignKey(
+        Business, models.CASCADE, related_name='suppliers')
     name = models.CharField(max_length=256)
     business_name = models.CharField(max_length=256, null=True, blank=True)
     phone = models.CharField(max_length=256, null=True, blank=True)
@@ -286,14 +357,14 @@ class ExpenseManager(models.Manager):
 
     def get_queryset(self):
         return ExpenseQuerySet(self.model)
-    
+
     def total_expenses(self, business_id, num_days=None):
 
         if num_days:
             return self.get_queryset().for_business(business_id).in_period(num_days).count()
-        
+
         return self.get_queryset().for_business(business_id).count()
-    
+
     def total_expense_amount(self, business_id, num_days=None):
         queryset = self.get_queryset().for_business(business_id)
 
@@ -307,7 +378,8 @@ class ExpenseManager(models.Manager):
 
 
 class Expense(models.Model):
-    business = models.ForeignKey(Business, on_delete=models.CASCADE, related_name='expenses')
+    business = models.ForeignKey(
+        Business, on_delete=models.CASCADE, related_name='expenses')
     name = models.CharField(max_length=256)
     desc = models.TextField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)

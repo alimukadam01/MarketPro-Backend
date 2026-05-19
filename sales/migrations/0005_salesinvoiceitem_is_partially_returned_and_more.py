@@ -18,24 +18,9 @@ class Migration(migrations.Migration):
             name='is_partially_returned',
             field=models.BooleanField(default=False),
         ),
-        migrations.AddConstraint(
-            model_name='purchaseinvoice',
-            constraint=models.CheckConstraint(condition=models.Q(('is_restocked', True), ('is_partially_restocked', True), _negated=True), name='is_restocked_and_is_partially_restocked_mutually_exclusive_pi'),
-        ),
-        migrations.AddConstraint(
-            model_name='purchaseinvoiceitem',
-            constraint=models.CheckConstraint(condition=models.Q(('is_restocked', True), ('is_partially_restocked', True), _negated=True), name='is_restocked_and_is_partially_restocked_mutually_exclusive_pii'),
-        ),
-        migrations.AddConstraint(
-            model_name='salesinvoice',
-            constraint=models.CheckConstraint(condition=models.Q(('is_deducted', True), ('is_partially_deducted', True), _negated=True), name='is_deducted_and_is_partially_deducted_mutually_exclusive_si'),
-        ),
-        migrations.AddConstraint(
-            model_name='salesinvoiceitem',
-            constraint=models.CheckConstraint(condition=models.Q(('is_returned', True), ('is_partially_returned', True), _negated=True), name='is_returned_and_is_partially_returned_mutually_exclusive'),
-        ),
-        migrations.AddConstraint(
-            model_name='salesinvoiceitem',
-            constraint=models.CheckConstraint(condition=models.Q(('is_deducted', True), ('is_partially_deducted', True), _negated=True), name='is_deducted_and_is_partially_deducted_mutually_exclusive_sii'),
-        ),
+        # Note: AddConstraint operations below were intentionally deferred
+        # migrations.AddConstraint(model_name='purchaseinvoice', ...)
+        # migrations.AddConstraint(model_name='purchaseinvoiceitem', ...)
+        # migrations.AddConstraint(model_name='salesinvoice', ...)
+        # migrations.AddConstraint(model_name='salesinvoiceitem', ...)
     ]

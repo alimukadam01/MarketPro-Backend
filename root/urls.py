@@ -1,12 +1,13 @@
 from django.urls import path
 from rest_framework_nested.routers import DefaultRouter, NestedDefaultRouter
 from .views import (
-    BusinessViewSet, CategoryViewSet, CityViewSet, 
-    CustomerKPIViewSet, CustomerViewSet, ExpenseKPIViewSet, 
-    ExpenseViewSet, LocationKPIViewSet, 
+    BusinessViewSet, BusinessConfigViewSet, CategoryViewSet, CityViewSet,
+    CustomerKPIViewSet, CustomerViewSet, ExpenseKPIViewSet,
+    ExpenseViewSet, LocationKPIViewSet,
     LocationViewSet, MultiModelSearchView, ProductKPIViewSet, ProductRelatedVariantViewSet,
-    SupplierKPIViewSet, SupplierViewSet, UnitViewSet, 
-    ProductViewSet, EmailTestingView, ProductVariantViewSet, ProductVariantTypeViewSet
+    SupplierKPIViewSet, SupplierViewSet, UnitViewSet,
+    ProductViewSet, EmailTestingView, ProductVariantViewSet, ProductVariantTypeViewSet,
+    EmployeeViewSet, EmployeePermissionsViewSet,
 )
 
 router = DefaultRouter()
@@ -25,6 +26,13 @@ router.register('product-variants', ProductVariantViewSet, basename='product-var
 products_router = NestedDefaultRouter(router, 'products', lookup='product')
 products_router.register('variants', ProductRelatedVariantViewSet, basename='variants')
 
+business_router = NestedDefaultRouter(router, 'business', lookup='business')
+business_router.register('employees', EmployeeViewSet, basename='business-employees')
+business_router.register('config', BusinessConfigViewSet, basename='business-config')
+
+employees_router = NestedDefaultRouter(business_router, 'employees', lookup='employee')
+employees_router.register('permissions', EmployeePermissionsViewSet, basename='employee-permissions')
+
 router.register('customer-kpis', CustomerKPIViewSet, basename='customer-kpis')
 router.register('product-kpis', ProductKPIViewSet, basename='products-kpis')
 router.register('location-kpis', LocationKPIViewSet, basename='locations-kpis')
@@ -34,4 +42,4 @@ router.register('expenses-kpis', ExpenseKPIViewSet, basename='expenses-kpis')
 urlpatterns = [
     path('search/', MultiModelSearchView.as_view()),
     path('test-email/', EmailTestingView.as_view()),
-] + router.urls + products_router.urls
+] + router.urls + products_router.urls + business_router.urls + employees_router.urls

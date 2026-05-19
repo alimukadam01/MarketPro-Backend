@@ -11,14 +11,17 @@ from django_filters.rest_framework import DjangoFilterBackend
 from core.utils import send_marketpro_email
 from .utils import get_active_business
 from .serializers import (
-    BusinessCreateSerializer, CategorySerializer, CitySerializer, CustomerSerializer, ExpenseSerializer, LocationSerializer, 
+    BusinessCreateSerializer, CategorySerializer, CitySerializer, CustomerSerializer, EmployeeAndUserCreateSerializer, ExpenseSerializer, LocationSerializer,
     BusinessSerializer, ProductAndVariantCreateSerializer, ProductAndVariantUpdateSerializer, ProductVariantTypeSerializer, SimpleCustomerSerializer, SupplierSerializer, UnitSerializer,
-    ProductCreateUpdateSerializer, ProductSerializer, ProductVariantCreateSerializer, ProductVariantSerializer
+    ProductCreateUpdateSerializer, ProductSerializer, ProductVariantCreateSerializer, ProductVariantSerializer,
+    EmployeeSerializer, EmployeeCreateSerializer, EmployeeUpdateSerializer,
+    EmployeeAccessSerializer, EmployeeAccessCreateSerializer, EmployeeAccessUpdateSerializer,
+    BusinessConfigSerializer, BusinessConfigCreateSerializer, BusinessConfigUpdateSerializer,
 )
 from .models import (
-    Business, Category, City, 
-    Customer, Expense, Location, 
-    Product, ProductVariant, ProductVariantType, Supplier, Unit
+    Business, BusinessConfig, Category, City,
+    Customer, Employee, EmployeeAccess, Expense, Location,
+    Product, ProductVariant, ProductVariantType, Supplier, Unit,
 )
 from .filters import GlobalSearch
 
@@ -49,7 +52,17 @@ class BusinessViewSet(ModelViewSet):
         user = self.request.user
 
         if user and user.is_authenticated:
-            return Business.objects.filter(owner_id=user.id)
+
+            owned = Business.objects.filter(owner_id = user.id)
+            if not owned:
+                try:
+                    employee = Employee.objects.get(user = user)
+                    return [employee.business]
+                
+                except Employee.DoesNotExist as error:
+                    print(error)
+                    return []
+            return owned
         return []
 
     def get_serializer_class(self):
@@ -679,5 +692,105 @@ class EmailTestingView(APIView):
             )
         except:
             return Response({"detail": "Internal Server Error"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-            
+
         return Response({"detail": "OK"}, status=status.HTTP_200_OK)
+
+
+class BusinessConfigViewSet(ModelViewSet):
+
+    def get_queryset(self):
+        return BusinessConfig.objects.filter(business_id=self.kwargs['business_pk'])
+
+    def get_serializer_class(self):
+        method = self.request.method
+        if method == 'POST':
+            return BusinessConfigCreateSerializer
+        if method in ('PUT', 'PATCH'):
+            return BusinessConfigUpdateSerializer
+        return BusinessConfigSerializer
+
+    def get_serializer_context(self):
+        return {
+            'business_id': self.kwargs['business_pk'],
+        }
+
+
+class EmployeeViewSet(ModelViewSet):
+
+    filter_backends = [SearchFilter]
+    search_fields = ['user__email', 'user__first_name', 'user__last_name']
+
+    def get_queryset(self):
+        return Employee.objects.filter(
+            business_id=self.kwargs['business_pk']
+        ).order_by('-created_at')
+
+    def get_serializer_class(self):
+        method = self.request.method
+
+        if self.action == 'create_user_and_employee':
+            return EmployeeAndUserCreateSerializer
+        
+        if method in ('PUT', 'PATCH'):
+            return EmployeeUpdateSerializer
+        return EmployeeSerializer
+
+    def get_serializer_context(self):
+        business = get_active_business(self.request)
+        if not business:
+            return {}
+        return {
+            'business_id': business.id,
+            'created_by_id': self.request.user.id,
+        }
+    
+    @action(['POST'], False, url_path='create-with-user', url_name='create-with-user')
+    def create_user_and_employee(self, request, business_pk):
+        try:
+
+            business = get_active_business(self.request)
+            if not business:
+                return Response({
+                    'detail': 'Bad Request'
+                }, status=status.HTTP_400_BAD_REQUEST)
+
+            serializer = self.get_serializer(
+                data=request.data, 
+                context={
+                    'business_id': business.id,
+                    'created_by_id': self.request.user.id
+                }
+            )
+            serializer.is_valid(raise_exception=True)
+            employee = serializer.save()
+            
+            if not employee:
+                return Response({
+                    'detail': 'Bad Request'
+                }, status=status.HTTP_400_BAD_REQUEST)
+
+            response_serializer = EmployeeSerializer(employee)
+            return Response(response_serializer.data, status=status.HTTP_201_CREATED)
+        except Exception as error:
+            print(error)
+            return Response({
+                'detail': 'Internal Server Error'
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+class EmployeePermissionsViewSet(ModelViewSet):
+
+    def get_queryset(self):
+        return EmployeeAccess.objects.filter(employee_id=self.kwargs['employee_pk'])
+
+    def get_serializer_class(self):
+        method = self.request.method
+        if method == 'POST':
+            return EmployeeAccessCreateSerializer
+        if method in ('PUT', 'PATCH'):
+            return EmployeeAccessUpdateSerializer
+        return EmployeeAccessSerializer
+
+    def get_serializer_context(self):
+        return {
+            'employee_id': self.kwargs['employee_pk'],
+        }

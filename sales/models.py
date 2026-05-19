@@ -33,6 +33,15 @@ class BaseRestock(models.Model):
         ordering = ['-created_at']
 
 
+class PaymentReceipt(models.Model):
+
+    amount = models.FloatField(default=0.0)
+    desc = models.CharField(max_length=512, null=True, blank=True)
+
+    class Meta:
+        abstract = True
+
+
 class SalesInvoiceQuerySet(BaseQuerySet):
 
     pass
@@ -139,6 +148,12 @@ class SalesInvoice(models.Model):
 
     objects = SalesInvoiceManager()
 
+    @property
+    def amount_paid(self):
+        return self.payment_receipts.aggregate(
+                total=Sum("amount")
+            )["total"] or 0
+
     def update_deduction_flags(self):
         items = self.invoice_items.all()
         deducted = 0
@@ -223,18 +238,6 @@ class SalesInvoice(models.Model):
     def map_to_products(self) -> Dict[int, 'SalesInvoiceItem']:
         return {item.product_id: item for item in self.invoice_items.all()}
 
-    class Meta:
-        # constraints = [
-        #     '''
-        #     models.CheckConstraint(
-        #         check=~(models.Q(is_deducted=True) &
-        #                 models.Q(is_partially_deducted=True)),
-        #         name='is_deducted_and_is_partially_deducted_mutually_exclusive_si'
-        #     )
-        #     '''
-        # ]
-        pass
-
 
 class SalesInvoiceItemQuerySet(BaseQuerySet):
     pass
@@ -308,6 +311,11 @@ class SalesInvoiceItem(BaseItem):
     
     class Meta:
         unique_together = [('sales_invoice', 'product')]
+
+
+class SalesReceipt(PaymentReceipt):
+
+    sales_invoice = models.ForeignKey(SalesInvoice, on_delete=models.CASCADE, related_name='payment_receipts')
 
 
 class PurchaseInvoiceQuerySet(BaseQuerySet):
@@ -443,10 +451,6 @@ class PurchaseInvoice(models.Model):
             self.is_restocked = True
             self.status = 'R'
 
-    class Meta:
-
-        pass
-
 
 class PurchaseInvoiceItem(BaseItem):
     purchase_invoice = models.ForeignKey(
@@ -521,6 +525,12 @@ class PurchaseInvoiceItem(BaseItem):
         # ]
 
 
+class PurchaseReceipt(PaymentReceipt):
+    
+    purchase_invoice = models.ForeignKey(PurchaseInvoice, on_delete=models.CASCADE, related_name='payment_receipts')
+    desc = models.CharField(max_length=512, null=True, blank=True)
+
+
 class PurchaseInvoiceItemRestock(BaseRestock):
     purchase_invoice = models.ForeignKey(
         PurchaseInvoice, models.CASCADE, related_name='restocks')
@@ -564,55 +574,36 @@ class PurchaseQuotation(models.Model):
     business = models.ForeignKey(
         Business, on_delete=models.CASCADE, related_name='purchase_quotations')
     quotation_no = models.CharField(max_length=256, null=True, blank=True)
-    expected_response_at = models.DateTimeField(null=True, blank=True)
     created_by = models.ForeignKey(
         settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True)
     status = models.CharField(max_length=256, choices=PQ_STATUSES, default="D")
-    date_created = models.DateTimeField(auto_now_add=True)
-    date_updated = models.DateTimeField(auto_now=True)
-    suppliers = models.ManyToManyField(
-        Supplier, through='PurchaseQuotationSupplier')
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
     notes = models.TextField(null=True, blank=True)
 
 
 class PurchaseQuotationItem(BaseItem):
     purchase_quotation = models.ForeignKey(
-        PurchaseQuotation, on_delete=models.CASCADE, related_name='items')
+        PurchaseQuotation, on_delete=models.CASCADE, related_name='items'
+    )
+    supplier = models.ForeignKey(Supplier, models.CASCADE, related_name='quotation_items')
     unit_price = models.FloatField(null=True, blank=True)
+    is_fulfilled = models.BooleanField(default=False)
 
 
-class PurchaseQuotationSupplier(models.Model):
-    purchase_quotation = models.ForeignKey(
-        PurchaseQuotation, on_delete=models.CASCADE)
-    supplier = models.ForeignKey(Supplier, on_delete=models.CASCADE)
-    is_confirmed = models.BooleanField(default=False)
-
-    def save(self, *args, **kwargs):
-
-        if self.is_confirmed:
-            PurchaseQuotationSupplier.objects.filter(
-                purchase_quotation=self.purchase_quotation,
-                is_confirmed=True
-            ).exclude(pk=self.pk).update(is_confirmed=False)
-
-        super().save(*args, **kwargs)
-
-    def __str__(self):
-        return f"{self.supplier.name}-{self.purchase_quotation.quotation_no if self.purchase_quotation.quotation_no else self.purchase_quotation.id}"
-
-    # SalesQuotation*
-    # Payment*
-    # Inter Account Transfer
-    # Bank Reconciliations
-    # Witholding Tax
-    # Debit Notes
-    # Inventory Write Offs
-    # Production Orders
-    # Employees
-    # Employee Payslips
-    # Master Account Functionality
-    # Folders
-    # Financial Reports
+# SalesQuotation*
+# Payment*
+# Inter Account Transfer
+# Bank Reconciliations
+# Witholding Tax
+# Debit Notes
+# Inventory Write Offs
+# Production Orders
+# Employees
+# Employee Payslips
+# Master Account Functionality
+# Folders
+# Financial Reports
 
 
 class ReturnedItemsQuerySet(BaseQuerySet):
@@ -670,3 +661,4 @@ class ReturnedItem(models.Model):
 
     def __str__(self):
         return f"Return for {self.invoice_item.product.base.name} ({self.invoice_item.product.name}) from Invoice {self.invoice_item.sales_invoice.invoice_number} on {self.created_at.date()}"
+
