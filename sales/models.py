@@ -1,4 +1,5 @@
 from calendar import monthrange
+from datetime import datetime
 from typing import Dict
 from django.db import models
 from django.db.models import Sum, F
@@ -37,6 +38,8 @@ class PaymentReceipt(models.Model):
 
     amount = models.FloatField(default=0.0)
     desc = models.CharField(max_length=512, null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
         abstract = True
@@ -385,7 +388,6 @@ class PurchaseInvoice(models.Model):
         max_length=256, choices=PAYMENT_STATUS_CHOICES, default=PAYMENT_STATUS_CHOICES[2])
     sub_total = models.FloatField(null=True, blank=True)
     total = models.FloatField(null=True, blank=True)
-    amount_paid = models.FloatField(null=True, blank=True)
     goods_received = models.IntegerField(null=True, blank=True)
     delivery = models.DateField(null=True, blank=True)
     created_by = models.ForeignKey(
@@ -395,6 +397,12 @@ class PurchaseInvoice(models.Model):
     is_partially_restocked = models.BooleanField(default=False)
 
     objects = PurchaseInvoiceManager()
+
+    @property
+    def amount_paid(self):
+        return self.payment_receipts.aggregate(
+                total=Sum("amount")
+            )["total"] or 0
 
     def __str__(self):
         return f"{self.id}-{self.invoice_number}-{self.total}-{self.status}"

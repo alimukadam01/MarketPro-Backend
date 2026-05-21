@@ -24,8 +24,9 @@ class PaymentReceiptSerializer(serializers.Serializer):
 
     id = serializers.IntegerField(read_only=True)
     amount = serializers.FloatField()
-    desc = serializers.CharField(
-        required=False, allow_null=True, allow_blank=True)
+    desc = serializers.CharField(required=False, allow_null=True, allow_blank=True)
+    created_at = serializers.DateTimeField(read_only=True)
+    updated_at = serializers.DateTimeField(read_only=True)
 
 
 class PurchaseInvoiceItemSerializer(BaseItemSerializer):
@@ -358,7 +359,7 @@ class PurchaseInvoiceAndItemsUpdateSerializer(serializers.ModelSerializer):
 class PurchaseReceiptCreateSerializer(PaymentReceiptSerializer):
 
     def is_valid(self, *, raise_exception=False):
-        purchase_invoice = SalesInvoice.objects.get(
+        purchase_invoice = PurchaseInvoice.objects.get(
             id=self.context["purchase_invoice_id"]
         )
 
@@ -790,7 +791,7 @@ class SalesReceiptCreateSerializer(PaymentReceiptSerializer):
             id=self.context["sales_invoice_id"]
         )
 
-        if float(self.initial_data["amount"]) + sales_invoice.total_paid > sales_invoice.total:
+        if float(self.initial_data["amount"]) + sales_invoice.amount_paid > sales_invoice.total:
             raise serializers.ValidationError({
                 "amount": "accumulated amount cannot exceed invoice total"
             })

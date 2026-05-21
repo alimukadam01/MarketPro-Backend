@@ -38,7 +38,7 @@ class UserSerializer(serializers.Serializer):
             permissions = {
                 attr: {
                     "view": value, "create": value, 
-                    "update": value, "delete": value
+                    "edit": value, "delete": value
                 } for attr, value in config.items() if attr not in ("business", "id", "_state")
             }
 
