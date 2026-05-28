@@ -34,7 +34,6 @@ class UserSerializer(serializers.Serializer):
                 business = businesses[0]
 
             config = model_to_dict(business.config)
-            print(config)
             permissions = {
                 attr: {
                     "view": value, "create": value, 
@@ -46,7 +45,7 @@ class UserSerializer(serializers.Serializer):
                 if not permissions.get(module, None):
                     permissions[module] = {
                     "view": True, "create": True, 
-                    "update": True, "delete": True
+                    "edit": True, "delete": True
                 }
         
             return permissions
