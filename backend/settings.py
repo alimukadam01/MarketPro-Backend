@@ -54,7 +54,8 @@ INSTALLED_APPS = [
     'root',
     'inventory',
     'sales',
-    'projects'
+    'projects',
+    'backlog'
 ]
 
 MIDDLEWARE = [
@@ -192,6 +193,6 @@ EMAIL_HOST = "mail.spacemail.com"
 EMAIL_PORT = 465
 EMAIL_USE_SSL = True
 EMAIL_HOST_USER = "admin@market-pro.pk"
-EMAIL_HOST_PASSWORD = "time2WorkBitches!"
+EMAIL_HOST_PASSWORD = "Polaroids34_"
 
-DEFAULT_FROM_EMAIL = "Market Pro <noreply@market-pro.pk>"
+DEFAULT_FROM_EMAIL = "Market Pro <admin@market-pro.pk>"

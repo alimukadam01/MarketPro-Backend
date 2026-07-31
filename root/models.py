@@ -169,7 +169,8 @@ class EmployeeAccess(models.Model):
         "expenses",
         "projects",
         "quotations",
-        "returned_items"
+        "returned_items",
+        "backlog_entries",
     ]
 
     employee = models.OneToOneField(

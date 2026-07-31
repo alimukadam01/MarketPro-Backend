@@ -30,4 +30,5 @@ urlpatterns = [
     path(r"", include('sales.urls')),
     path(r"", include('inventory.urls')),
     path(r"", include('projects.urls')),
+    path(r"", include('backlog.urls')),
 ] + static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT) + static(settings.STATIC_URL, document_root=settings.STATIC_ROOT)

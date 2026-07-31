@@ -1,13 +1,16 @@
+from datetime import datetime
+
 from django.contrib.auth import get_user_model
 from rest_framework.views import APIView
 from rest_framework.viewsets import ViewSet
 from rest_framework.response import Response
-from rest_framework.permissions import IsAuthenticated
+from rest_framework.permissions import IsAuthenticated, AllowAny
 from rest_framework.decorators import action
 from rest_framework import status
 
 from root.models import Business, EmployeeAccess
 from .access_config import UserAccessConfig
+from .utils import send_marketpro_email
 
 User = get_user_model()
 
@@ -69,3 +72,35 @@ class AccessConfigView(APIView):
 
         config = UserAccessConfig(request.user, business)
         return Response(config.to_dict())
+
+
+# ---------------------------------------------------------------------------
+# POST /contact/   (public — no auth required)
+# ---------------------------------------------------------------------------
+
+ADMIN_EMAIL = 'admin@market-pro.pk'
+
+
+class LandingPageContactView(APIView):
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        data = request.data
+        if not data:
+            return Response({'detail': 'Bad Request.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            send_marketpro_email(
+                subject='New Landing Page Submission',
+                to_email=ADMIN_EMAIL,
+                template_name='emails/landing_contact.html',
+                context={
+                    'data': data,
+                    'submitted_at': datetime.now().strftime('%d %b %Y, %I:%M %p'),
+                    'year': datetime.now().year,
+                },
+            )
+            return Response({'detail': 'Message sent successfully.'}, status=status.HTTP_200_OK)
+        except Exception as error:
+            print(error)
+            return Response({'detail': 'Internal Server Error.'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
