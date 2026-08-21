@@ -27,7 +27,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 SECRET_KEY = 'django-insecure-n)ih+0wkoxbkcx4#s+ni9@hu9_ojy(rt+f%624^0ulcmi%gf28'
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = False
+DEBUG = True
 
 ALLOWED_HOSTS = [
     'localhost', 
@@ -55,7 +55,8 @@ INSTALLED_APPS = [
     'inventory',
     'sales',
     'projects',
-    'backlog'
+    'backlog',
+    'accounts'
 ]
 
 MIDDLEWARE = [
@@ -135,7 +136,7 @@ AUTH_PASSWORD_VALIDATORS = [
 
 LANGUAGE_CODE = 'en-us'
 
-TIME_ZONE = 'UTC'
+TIME_ZONE = 'Asia/Karachi'
 
 USE_I18N = True
 
@@ -164,11 +165,19 @@ DJOSER = {
     'PASSWORD_RESET_CONFIRM_RETYPE': True,
     'LOGOUT_ON_PASSWORD_CHANGE': True,
     'PASSWORD_RESET_SHOW_EMAIL_NOT_FOUND': True,
+    # The uid and token ride as query params, so the reset screen is a plain
+    # route the router does not need a wildcard segment for.
+    'PASSWORD_RESET_CONFIRM_URL': 'reset-password?uid={uid}&token={token}',
     'SERIALIZERS': {
         "user": "core.serializers.UserSerializer",
         "current_user": "core.serializers.UserSerializer",
     },
 }
+
+# Where the reset link points. This is the frontend, not the API - the email
+# has to land the user on the React screen that collects the new password.
+DOMAIN = 'localhost:8080' if DEBUG else 'market-pro.pk'
+SITE_NAME = 'Market Pro'
 
 # Static files (CSS, JavaScript, Images)
 # https://docs.djangoproject.com/en/4.2/howto/static-files/
@@ -193,6 +202,5 @@ EMAIL_HOST = "mail.spacemail.com"
 EMAIL_PORT = 465
 EMAIL_USE_SSL = True
 EMAIL_HOST_USER = "admin@market-pro.pk"
+DEFAULT_FROM_EMAIL = "admin@market-pro.pk"
 EMAIL_HOST_PASSWORD = "Polaroids34_"
-
-DEFAULT_FROM_EMAIL = "Market Pro <admin@market-pro.pk>"

@@ -1,5 +1,5 @@
 from django.db import transaction
-from django.db.models import Sum
+from django.db.models import Q, Sum
 from rest_framework import serializers
 
 from projects.models import ProjectPurchaseInvoice, ProjectSalesInvoice
@@ -20,13 +20,95 @@ from .utils import (
 )
 
 
+# A payment holds its share of the invoice while it is cleared or still
+# pending. A bounced one never arrives, so it frees its share up again.
+# Receipts with no transaction behind them predate the accounting module.
+LIVE_RECEIPT = (
+    Q(transaction_record__isnull=True) |
+    Q(transaction_record__status__in=['C', 'PEN'])
+)
+
+
 class PaymentReceiptSerializer(serializers.Serializer):
 
     id = serializers.IntegerField(read_only=True)
     amount = serializers.FloatField()
     desc = serializers.CharField(required=False, allow_null=True, allow_blank=True)
+    account = serializers.SerializerMethodField()
+    payment_method = serializers.SerializerMethodField()
+    status = serializers.SerializerMethodField()
     created_at = serializers.DateTimeField(read_only=True)
     updated_at = serializers.DateTimeField(read_only=True)
+
+    def get_account(self, receipt):
+        """
+        The receipt carries the context; the account lives on the transaction
+        the accounts module mirrors it into.
+        """
+        transaction = getattr(receipt, 'transaction_record', None)
+        if not transaction or not transaction.account_id:
+            return None
+
+        return {
+            'id': transaction.account_id,
+            'name': transaction.account.name,
+            'type': transaction.account.type,
+        }
+
+    def get_payment_method(self, receipt):
+        transaction = getattr(receipt, 'transaction_record', None)
+        return transaction.payment_method if transaction else None
+
+    def get_status(self, receipt):
+        # Cleared, pending or bounced. Only cleared money pays the invoice.
+        transaction = getattr(receipt, 'transaction_record', None)
+        return transaction.status if transaction else None
+
+
+class PaymentReceiptCreateSerializer(PaymentReceiptSerializer):
+    """
+    Adds the money details a receipt does not itself store. A signal mirrors
+    every receipt into a Transaction; these fields refine that record.
+    """
+
+    account = serializers.IntegerField(required=False, allow_null=True)
+    payment_method = serializers.CharField(required=False, allow_null=True)
+    date = serializers.DateField(required=False, allow_null=True)
+    cheque_number = serializers.CharField(
+        required=False, allow_null=True, allow_blank=True)
+    cheque_due_date = serializers.DateField(required=False, allow_null=True)
+
+    MONEY_FIELDS = [
+        'account', 'payment_method', 'date', 'cheque_number', 'cheque_due_date'
+    ]
+
+    def pop_money_details(self):
+        details = {}
+        for field in self.MONEY_FIELDS:
+            value = self.validated_data.pop(field, None)
+            if value:
+                details['account_id' if field == 'account' else field] = value
+        return details
+
+    def apply_money_details(self, receipt, money_details):
+        if not money_details:
+            return receipt
+
+        try:
+            transaction = receipt.transaction_record
+        except Exception as error:
+            print(error)
+            return receipt
+
+        # A cheque stays pending until it clears, so it moves no money yet.
+        if money_details.get('payment_method') == 'cheque':
+            money_details['status'] = 'PEN'
+
+        for attr, value in money_details.items():
+            setattr(transaction, attr, value)
+        transaction.save(update_fields=list(money_details.keys()))
+
+        return receipt
 
 
 class PurchaseInvoiceItemSerializer(BaseItemSerializer):
@@ -201,11 +283,14 @@ class PurchaseInvoiceUpdateSerializer(serializers.ModelSerializer):
 class PurchaseInvoiceAndItemsCreateSerializer(serializers.ModelSerializer):
     items = serializers.ListField()
     project = serializers.IntegerField(required=False, allow_null=True)
+    amount_paid = serializers.FloatField(
+        required=False, allow_null=True, write_only=True)
 
     def save(self, **kwargs):
         items = self.validated_data.pop('items')
-        project_id = self.validated_data.pop('project')
+        project_id = self.validated_data.pop('project', None)
         project_id = int(project_id) if project_id else project_id
+        amount_paid = self.validated_data.pop('amount_paid', None)
 
         try:
             with transaction.atomic():
@@ -232,6 +317,19 @@ class PurchaseInvoiceAndItemsCreateSerializer(serializers.ModelSerializer):
                     )
 
             purchase_invoice.adjust_totals()
+
+            # Money paid at the time of purchase becomes a payment record;
+            # the accounts signal mirrors it into a transaction and
+            # payment_status derives from it.
+            if amount_paid and float(amount_paid) > 0:
+                PurchaseReceipt.objects.create(
+                    purchase_invoice_id=purchase_invoice.id,
+                    amount=min(
+                        float(amount_paid),
+                        purchase_invoice.total or float(amount_paid)
+                    ),
+                )
+
             return purchase_invoice
 
         except Exception as error:
@@ -261,7 +359,7 @@ class PurchaseInvoiceAndItemsUpdateSerializer(serializers.ModelSerializer):
 
     def save(self, **kwargs):
         items = self.validated_data.pop('items')
-        project_id = self.validated_data.pop('project')
+        project_id = self.validated_data.pop('project', None)
         project_id = int(project_id) if project_id else project_id
 
         try:
@@ -356,17 +454,19 @@ class PurchaseInvoiceAndItemsUpdateSerializer(serializers.ModelSerializer):
         ]
 
 
-class PurchaseReceiptCreateSerializer(PaymentReceiptSerializer):
+class PurchaseReceiptCreateSerializer(PaymentReceiptCreateSerializer):
 
     def is_valid(self, *, raise_exception=False):
         purchase_invoice = PurchaseInvoice.objects.get(
             id=self.context["purchase_invoice_id"]
         )
 
+        # A pending cheque still occupies its share of the invoice; a bounced
+        # one does not, so its amount can be paid again.
         total_paid = (
-            purchase_invoice.payment_receipts.aggregate(
-                total=Sum("amount")
-            )["total"] or 0
+            purchase_invoice.payment_receipts
+            .filter(LIVE_RECEIPT)
+            .aggregate(total=Sum("amount"))["total"] or 0
         )
 
         if float(self.initial_data["amount"]) + total_paid > purchase_invoice.total:
@@ -377,10 +477,12 @@ class PurchaseReceiptCreateSerializer(PaymentReceiptSerializer):
         return super().is_valid(raise_exception=raise_exception)
 
     def save(self, **kwargs):
-        return PurchaseReceipt.objects.create(
+        money_details = self.pop_money_details()
+        receipt = PurchaseReceipt.objects.create(
             purchase_invoice_id=self.context['purchase_invoice_id'],
             **self.validated_data
         )
+        return self.apply_money_details(receipt, money_details)
 
 
 class SalesInvoiceItemSerializer(serializers.ModelSerializer):
@@ -620,10 +722,13 @@ class SalesInvoiceAndItemsCreateSerializer(serializers.ModelSerializer):
 
     items = serializers.ListField()
     project = serializers.IntegerField(required=False, allow_null=True)
+    amount_paid = serializers.FloatField(
+        required=False, allow_null=True, write_only=True)
 
     def save(self, **kwargs):
         items = self.validated_data.pop('items')
         project_id = self.validated_data.pop('project', None)
+        amount_paid = self.validated_data.pop('amount_paid', None)
 
         try:
             with transaction.atomic():
@@ -653,6 +758,19 @@ class SalesInvoiceAndItemsCreateSerializer(serializers.ModelSerializer):
             sales_invoice.adjust_totals()
             # No need to call this, it's called in adjust_totals.
             updateInventoryOnSale(sales_invoice)
+
+            # Money received at the time of sale becomes a payment record;
+            # the accounts signal mirrors it into a transaction and
+            # payment_status derives from it.
+            if amount_paid and float(amount_paid) > 0:
+                SalesReceipt.objects.create(
+                    sales_invoice_id=sales_invoice.id,
+                    amount=min(
+                        float(amount_paid),
+                        sales_invoice.total or float(amount_paid)
+                    ),
+                )
+
             return sales_invoice
 
         except Exception as error:
@@ -672,7 +790,8 @@ class SalesInvoiceAndItemsCreateSerializer(serializers.ModelSerializer):
             'payment_status',
             'status',
             'items',
-            'project'
+            'project',
+            'amount_paid'
         ]
 
 
@@ -784,14 +903,22 @@ class SalesInvoiceAndItemsUpdateSerializer(serializers.ModelSerializer):
         ]
 
 
-class SalesReceiptCreateSerializer(PaymentReceiptSerializer):
+class SalesReceiptCreateSerializer(PaymentReceiptCreateSerializer):
 
     def is_valid(self, *, raise_exception=False):
         sales_invoice = SalesInvoice.objects.get(
             id=self.context["sales_invoice_id"]
         )
 
-        if float(self.initial_data["amount"]) + sales_invoice.amount_paid > sales_invoice.total:
+        # A pending cheque still occupies its share of the invoice; a bounced
+        # one does not, so its amount can be paid again.
+        total_recorded = (
+            sales_invoice.payment_receipts
+            .filter(LIVE_RECEIPT)
+            .aggregate(total=Sum("amount"))["total"] or 0
+        )
+
+        if float(self.initial_data["amount"]) + total_recorded > sales_invoice.total:
             raise serializers.ValidationError({
                 "amount": "accumulated amount cannot exceed invoice total"
             })
@@ -799,10 +926,12 @@ class SalesReceiptCreateSerializer(PaymentReceiptSerializer):
         return super().is_valid(raise_exception=raise_exception)
 
     def save(self, **kwargs):
-        return SalesReceipt.objects.create(
+        money_details = self.pop_money_details()
+        receipt = SalesReceipt.objects.create(
             sales_invoice_id=self.context['sales_invoice_id'],
             **self.validated_data
         )
+        return self.apply_money_details(receipt, money_details)
 
 
 class ReturnedItemSerializer(serializers.ModelSerializer):
@@ -872,12 +1001,14 @@ class GenerateInvoiceSerializer(serializers.ModelSerializer):
     business = BusinessSerializer()
     customer = SimpleCustomerSerializer()
     invoice_items = BasicSalesInvoiceItemSerializer(many=True)
+    amount_paid = serializers.FloatField(read_only=True)
 
     class Meta:
         model = SalesInvoice
         fields = [
-            'id', 'created_at', 'business', 'customer', 'invoice_number',
-            'invoice_items', 'discount', 'tax', 'sub_total', 'total'
+            'id', 'created_at', 'date_issued', 'business', 'customer',
+            'invoice_number', 'invoice_items', 'discount', 'tax', 'sub_total',
+            'total', 'amount_paid'
         ]
 
 

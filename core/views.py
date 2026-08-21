@@ -1,6 +1,7 @@
 from datetime import datetime
 
 from django.contrib.auth import get_user_model
+from django.utils import timezone
 from rest_framework.views import APIView
 from rest_framework.viewsets import ViewSet
 from rest_framework.response import Response
@@ -96,8 +97,8 @@ class LandingPageContactView(APIView):
                 template_name='emails/landing_contact.html',
                 context={
                     'data': data,
-                    'submitted_at': datetime.now().strftime('%d %b %Y, %I:%M %p'),
-                    'year': datetime.now().year,
+                    'submitted_at': timezone.localtime().strftime('%d %b %Y, %I:%M %p'),
+                    'year': timezone.localtime().year,
                 },
             )
             return Response({'detail': 'Message sent successfully.'}, status=status.HTTP_200_OK)

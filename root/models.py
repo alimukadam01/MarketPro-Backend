@@ -3,6 +3,7 @@ from django.db.models.functions import TruncDate
 from calendar import monthrange
 from datetime import date, datetime, timedelta
 from django.conf import settings
+from django.utils import timezone
 
 # Create your models here.
 
@@ -13,11 +14,13 @@ class BaseQuerySet(models.QuerySet):
         return self.filter(business_id=business_id)
 
     def in_period(self, days):
-        start = datetime.today() - timedelta(days=days)
+        # timezone.now() is aware, so this compares like with like. A naive
+        # datetime here would be read as UTC and shift the window.
+        start = timezone.now() - timedelta(days=days)
         return self.filter(created_at__gte=start)
 
     def monthly_trend(self, business_id, field):
-        today = date.today()
+        today = timezone.localdate()
         year = today.year
         month = today.month
 
@@ -132,6 +135,7 @@ class BusinessConfig(models.Model):
     inventory = models.BooleanField(default=True)
     returned_items = models.BooleanField(default=True)
     quotations = models.BooleanField(default=True)
+    accounting = models.BooleanField(default=False)
 
     def __str__(self):
         return f"Config for {self.business.name}"
@@ -171,6 +175,7 @@ class EmployeeAccess(models.Model):
         "quotations",
         "returned_items",
         "backlog_entries",
+        "accounting",
     ]
 
     employee = models.OneToOneField(
@@ -379,9 +384,20 @@ class ExpenseManager(models.Manager):
 
 
 class Expense(models.Model):
+
+    CATEGORY_CHOICES = [
+        ("kiraya", "Rent (Kiraya)"),
+        ("bijli", "Electricity (Bijli)"),
+        ("tankhwa", "Salaries (Tankhwa)"),
+        ("transport", "Transport"),
+        ("mutafarriq", "Miscellaneous (Mutafarriq)"),
+    ]
+
     business = models.ForeignKey(
         Business, on_delete=models.CASCADE, related_name='expenses')
     name = models.CharField(max_length=256)
+    category = models.CharField(
+        max_length=256, choices=CATEGORY_CHOICES, null=True, blank=True)
     desc = models.TextField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     amount = models.FloatField(default=0)

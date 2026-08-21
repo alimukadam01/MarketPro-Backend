@@ -52,7 +52,7 @@ class BusinessConfigSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'business',
             'sales', 'purchases', 'projects',
-            'inventory', 'returned_items', 'quotations',
+            'inventory', 'returned_items', 'quotations', 'accounting',
         ]
 
 
@@ -62,7 +62,7 @@ class SimpleBusinessConfigSerializer(serializers.ModelSerializer):
         model = BusinessConfig
         fields = [
             'sales', 'purchases', 'projects',
-            'inventory', 'returned_items', 'quotations',
+            'inventory', 'returned_items', 'quotations', 'accounting',
         ]
 
 
@@ -72,7 +72,7 @@ class BusinessConfigCreateSerializer(serializers.ModelSerializer):
         model = BusinessConfig
         fields = [
             'sales', 'purchases', 'projects',
-            'inventory', 'returned_items', 'quotations',
+            'inventory', 'returned_items', 'quotations', 'accounting',
         ]
 
     def create(self, validated_data):
@@ -88,7 +88,7 @@ class BusinessConfigUpdateSerializer(serializers.ModelSerializer):
         model = BusinessConfig
         fields = [
             'sales', 'purchases', 'projects',
-            'inventory', 'returned_items', 'quotations',
+            'inventory', 'returned_items', 'quotations', 'accounting',
         ]
 
     def update(self, instance, validated_data):
@@ -462,12 +462,60 @@ class ExpenseSerializer(serializers.ModelSerializer):
 
     business = serializers.PrimaryKeyRelatedField(read_only=True)
 
-    def create(self, validated_data):
-        return Expense.objects.create(business_id=self.context['business_id'], **validated_data)
+    # Money details land on the linked transaction, which the signal creates.
+    account = serializers.IntegerField(
+        required=False, allow_null=True, write_only=True)
+    date = serializers.DateField(
+        required=False, allow_null=True, write_only=True)
 
     class Meta:
         model = Expense
-        fields = ['id', 'business', 'name', 'desc', 'amount', 'created_at']
+        fields = [
+            'id', 'business', 'name', 'category', 'desc',
+            'amount', 'created_at', 'account', 'date',
+        ]
+
+    def create(self, validated_data):
+        money_details = self._pop_money_details(validated_data)
+        expense = Expense.objects.create(
+            business_id=self.context['business_id'], **validated_data)
+        self._apply_money_details(expense, money_details)
+        return expense
+
+    def update(self, instance, validated_data):
+        money_details = self._pop_money_details(validated_data)
+
+        for attr, value in validated_data.items():
+            setattr(instance, attr, value)
+        instance.save()
+
+        self._apply_money_details(instance, money_details)
+        return instance
+
+    def _pop_money_details(self, validated_data):
+        return {
+            'account_id': validated_data.pop('account', None),
+            'date': validated_data.pop('date', None),
+        }
+
+    def _apply_money_details(self, expense, money_details):
+        if not any(money_details.values()):
+            return
+
+        try:
+            transaction = expense.transaction_record
+        except Exception as error:
+            print(error)
+            return
+
+        fields = []
+        for attr, value in money_details.items():
+            if value:
+                setattr(transaction, attr, value)
+                fields.append(attr)
+
+        if fields:
+            transaction.save(update_fields=fields)
 
 
 # ── Employee ──────────────────────────────────────────────────────────────────

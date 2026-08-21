@@ -1,5 +1,6 @@
 from datetime import datetime
 from django.db.models import QuerySet
+from django.utils import timezone
 from rest_framework import status
 from rest_framework.views import APIView
 from rest_framework.viewsets import ReadOnlyModelViewSet, ModelViewSet, GenericViewSet, ViewSet
@@ -8,8 +9,9 @@ from rest_framework.decorators import action
 from rest_framework.filters import SearchFilter
 from django_filters.rest_framework import DjangoFilterBackend
 
+from accounts.utils import customer_balance, party_invoiced, supplier_balance
 from core.utils import send_marketpro_email
-from .utils import get_active_business
+from .utils import get_active_business, whatsapp_number
 from .serializers import (
     BusinessCreateSerializer, CategorySerializer, CitySerializer, CustomerSerializer, EmployeeAndUserCreateSerializer, ExpenseSerializer, LocationSerializer,
     BusinessSerializer, ProductAndVariantCreateSerializer, ProductAndVariantUpdateSerializer, ProductVariantTypeSerializer, SimpleCustomerSerializer, SupplierSerializer, UnitSerializer,
@@ -362,6 +364,39 @@ class SupplierViewSet(ModelViewSet):
                 'detail': 'Internal Server Error.'
             }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
+    ### the money picture for one supplier, for the detail screen cards
+    @action(['GET'], detail=True, url_path='summary', url_name='summary')
+    def summary(self, request, pk=None):
+
+        business = get_active_business(request)
+        if not business:
+            return Response({
+                'detail': 'No active business exists. Please contact admin.'
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        supplier = Supplier.objects.filter(
+            id=pk, business_id=business.id).first()
+        if not supplier:
+            return Response({
+                'detail': 'Not Found'
+            }, status=status.HTTP_404_NOT_FOUND)
+
+        try:
+            return Response({
+                'balance': supplier_balance(supplier, business.id),
+                'total_business': round(
+                    party_invoiced(business.id, supplier=supplier)),
+                # Reminders go out from this page too, and they must work
+                # without accounting access, so the wa.me number rides along.
+                'whatsapp': whatsapp_number(supplier.phone),
+            }, status=status.HTTP_200_OK)
+
+        except Exception as error:
+            print(error)
+            return Response({
+                'detail': 'Internal Server Error.'
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
 
 class SupplierKPIViewSet(GenericViewSet):
 
@@ -510,6 +545,39 @@ class CustomerViewSet(ModelViewSet):
                 'detail': 'Internal Server Error.'
             }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
+    ### the money picture for one customer, for the detail screen cards
+    @action(['GET'], detail=True, url_path='summary', url_name='summary')
+    def summary(self, request, pk=None):
+
+        business = get_active_business(request)
+        if not business:
+            return Response({
+                'detail': 'No active business exists. Please contact admin.'
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        customer = Customer.objects.filter(
+            id=pk, business_id=business.id).first()
+        if not customer:
+            return Response({
+                'detail': 'Not Found'
+            }, status=status.HTTP_404_NOT_FOUND)
+
+        try:
+            return Response({
+                'balance': customer_balance(customer, business.id),
+                'total_business': round(
+                    party_invoiced(business.id, customer=customer)),
+                # Reminders go out from this page too, and they must work
+                # without accounting access, so the wa.me number rides along.
+                'whatsapp': whatsapp_number(customer.phone),
+            }, status=status.HTTP_200_OK)
+
+        except Exception as error:
+            print(error)
+            return Response({
+                'detail': 'Internal Server Error.'
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
 
 class CustomerKPIViewSet(GenericViewSet):
 
@@ -538,9 +606,9 @@ class CustomerKPIViewSet(GenericViewSet):
 class ExpenseViewSet(ModelViewSet):
     serializer_class = ExpenseSerializer
     filter_backends = [SearchFilter, DjangoFilterBackend]
-    filterset_fields = ['name', 'desc', 'amount']
+    filterset_fields = ['name', 'category', 'desc', 'amount']
     search_fields = [
-        'id', 'name', 'desc', 'amount', 'created_at'
+        'id', 'name', 'category', 'desc', 'amount', 'created_at'
     ]
 
     def get_queryset(self):
@@ -613,7 +681,7 @@ class ExpenseKPIViewSet(GenericViewSet):
                     'detail': 'No active business exists. Please contact admin.'
                 }, status=status.HTTP_400_BAD_REQUEST)
 
-            today = datetime.today()
+            today = timezone.localdate()
             monthly_total_expense_amount = Expense.objects.total_expense_amount(business.id, num_days=today.day)
             return Response({
                 "monthly_total_expense_amount": monthly_total_expense_amount

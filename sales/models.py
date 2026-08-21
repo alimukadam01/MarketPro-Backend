@@ -2,10 +2,11 @@ from calendar import monthrange
 from datetime import datetime
 from typing import Dict
 from django.db import models
-from django.db.models import Sum, F
+from django.db.models import Sum, F, Q
 from django.core.exceptions import ValidationError
 from django.conf import settings
-from root.utils import generateTransactionId
+from django.utils import timezone
+from root.utils import generateTransactionId, local_date
 from root.models import Business, BusinessConfig, Customer, BaseItem, Supplier, Location, BaseQuerySet
 
 
@@ -22,7 +23,9 @@ class SalesConfig(models.Model):
 class BaseRestock(models.Model):
 
     quantity = models.PositiveIntegerField(default=0)
-    received_at = models.DateField(auto_now_add=True, null=True, blank=True)
+    # auto_now_add would use the server's OS date rather than TIME_ZONE.
+    received_at = models.DateField(
+        default=timezone.localdate, null=True, blank=True)
     # Optional link to external txn
     notes = models.TextField(null=True, blank=True)
 
@@ -121,12 +124,11 @@ class SalesInvoice(models.Model):
     business = models.ForeignKey(Business, models.CASCADE)
     customer = models.ForeignKey(
         Customer, models.CASCADE, related_name='sale_invoices')
-    date_issued = models.DateTimeField(auto_now_add=True)
+    # Editable, so a sale entered a day late can carry the day it happened.
+    date_issued = models.DateTimeField(default=timezone.now)
     date_due = models.DateField(null=True, blank=True)
     status = models.CharField(
         max_length=256, choices=SALES_INVOICE_STATUS_CHOICES, default=SALES_INVOICE_STATUS_CHOICES[2])
-    payment_status = models.CharField(
-        max_length=256, choices=PAYMENT_STATUS_CHOICES, default=PAYMENT_STATUS_CHOICES[2])
     sub_total = models.FloatField(null=True, blank=True)
     tax = models.JSONField(
         null=True,
@@ -153,9 +155,32 @@ class SalesInvoice(models.Model):
 
     @property
     def amount_paid(self):
-        return self.payment_receipts.aggregate(
-                total=Sum("amount")
-            )["total"] or 0
+        # Python-side sum so prefetched receipts are reused on list views.
+        # Only money that has actually cleared pays the invoice down — a
+        # pending or bounced cheque is recorded against it but settles
+        # nothing until it clears.
+        total = 0
+        for receipt in self.payment_receipts.all():
+            transaction = getattr(receipt, 'transaction_record', None)
+            if transaction and transaction.status != 'C':
+                continue
+            total += receipt.amount or 0
+        return total
+
+    @property
+    def payment_status(self):
+        """
+        Always derived from the payments recorded against the invoice.
+        Never stored, never set by hand.
+        """
+        paid = self.amount_paid
+        invoice_total = self.total or 0
+
+        if invoice_total > 0 and paid >= invoice_total:
+            return 'P'
+        if paid > 0:
+            return 'PP'
+        return 'PEN'
 
     def update_deduction_flags(self):
         items = self.invoice_items.all()
@@ -342,12 +367,20 @@ class PurchaseInvoiceManager(models.Manager):
         return self.get_queryset().for_business(business_id).in_period(num_days).count() 
 
     def total_pending_invoices(self, business_id):
-        return self.get_queryset().for_business(business_id).filter(payment_status="PEN").count() 
-
-    def total_pending_payment(self, business_id):
-        queryset = self.get_queryset().for_business(business_id).filter(payment_status="PEN")
-
-        return queryset.aggregate(total=Sum("total"))["total"] or 0
+        # An invoice is pending until the receipts against it cover its total.
+        return (
+            self.get_queryset()
+            .for_business(business_id)
+            .annotate(paid=Sum(
+                'payment_receipts__amount',
+                filter=(
+                    Q(payment_receipts__transaction_record__isnull=True) |
+                    Q(payment_receipts__transaction_record__status='C')
+                ),
+            ))
+            .filter(Q(paid__isnull=True) | Q(paid__lt=F('total')))
+            .count()
+        )
 
 
 class PurchaseInvoice(models.Model):
@@ -384,8 +417,6 @@ class PurchaseInvoice(models.Model):
     )
     status = models.CharField(
         max_length=256, choices=PURCHASE_INVOICE_STATUS_CHOICES, default=PURCHASE_INVOICE_STATUS_CHOICES[1])
-    payment_status = models.CharField(
-        max_length=256, choices=PAYMENT_STATUS_CHOICES, default=PAYMENT_STATUS_CHOICES[2])
     sub_total = models.FloatField(null=True, blank=True)
     total = models.FloatField(null=True, blank=True)
     goods_received = models.IntegerField(null=True, blank=True)
@@ -400,9 +431,32 @@ class PurchaseInvoice(models.Model):
 
     @property
     def amount_paid(self):
-        return self.payment_receipts.aggregate(
-                total=Sum("amount")
-            )["total"] or 0
+        # Python-side sum so prefetched receipts are reused on list views.
+        # Only money that has actually cleared pays the invoice down — a
+        # pending or bounced cheque is recorded against it but settles
+        # nothing until it clears.
+        total = 0
+        for receipt in self.payment_receipts.all():
+            transaction = getattr(receipt, 'transaction_record', None)
+            if transaction and transaction.status != 'C':
+                continue
+            total += receipt.amount or 0
+        return total
+
+    @property
+    def payment_status(self):
+        """
+        Always derived from the payments recorded against the invoice.
+        Never stored, never set by hand.
+        """
+        paid = self.amount_paid
+        invoice_total = self.total or 0
+
+        if invoice_total > 0 and paid >= invoice_total:
+            return 'P'
+        if paid > 0:
+            return 'PP'
+        return 'PEN'
 
     def __str__(self):
         return f"{self.id}-{self.invoice_number}-{self.total}-{self.status}"
@@ -668,5 +722,5 @@ class ReturnedItem(models.Model):
         return True
 
     def __str__(self):
-        return f"Return for {self.invoice_item.product.base.name} ({self.invoice_item.product.name}) from Invoice {self.invoice_item.sales_invoice.invoice_number} on {self.created_at.date()}"
+        return f"Return for {self.invoice_item.product.base.name} ({self.invoice_item.product.name}) from Invoice {self.invoice_item.sales_invoice.invoice_number} on {local_date(self.created_at)}"
 

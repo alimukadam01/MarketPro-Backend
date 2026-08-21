@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+
+<html>
+
+<head>
+    <meta charset="UTF-8" />
+    <title>Market Pro - Daily Summary</title>
+</head>
+
+<body style="margin:0; padding:0; background-color:#f0f0f0; font-family:Arial, Helvetica, sans-serif;">
+
+    <!-- Outer Wrapper -->
+
+    <table width="100%" cellpadding="0" cellspacing="0" style="background-color:#ffffff;">
+        <!-- Header -->
+        <tr>
+            <td style="background-color:#8b5cf6; padding:16px 20px;">
+                <table width="100%" cellpadding="0" cellspacing="0">
+                    <tr>
+                        <td style="color:#ffffff; font-size:18px; font-weight:bold;">
+                            MARKET&nbsp;Pro
+                        </td>
+                        <td style="color:#e9d5ff; font-size:12px; text-align:right;">
+                            Daily Summary &middot; {{ summary.date }}
+                        </td>
+                    </tr>
+                </table>
+            </td>
+        </tr>
+
+        <!-- Body -->
+        <tr>
+            <td style="padding:24px; color:#000000; font-size:14px; line-height:1.6;">
+
+                <p style="margin:0 0 16px 0;">
+                    Hello <strong>{{ business.name }}</strong>,
+                </p>
+
+                <p style="margin:0 0 16px 0;">
+                    Here is your daily summary for <strong>{{ summary.date }}</strong>.
+                </p>
+
+                <!-- Cash per account -->
+                <table width="100%" cellpadding="0" cellspacing="0"
+                    style="border:1px solid #ddd; background-color:#ffffff; margin-bottom:16px;">
+                    <tr>
+                        <td colspan="3" style="padding:10px 12px; background-color:#f5f3ff; font-size:13px; font-weight:bold; color:#6d28d9;">
+                            Cash
+                        </td>
+                    </tr>
+                    <tr>
+                        <td style="padding:8px 12px; font-size:12px; color:#555; border-bottom:1px solid #eee;">Account</td>
+                        <td style="padding:8px 12px; font-size:12px; color:#555; border-bottom:1px solid #eee; text-align:right;">Opening</td>
+                        <td style="padding:8px 12px; font-size:12px; color:#555; border-bottom:1px solid #eee; text-align:right;">Closing</td>
+                    </tr>
+                    {% for account in summary.accounts %}
+                    <tr>
+                        <td style="padding:8px 12px; font-size:13px;">{{ account.account_name }}</td>
+                        <td style="padding:8px 12px; font-size:13px; text-align:right;">PKR {{ account.opening_balance }}</td>
+                        <td style="padding:8px 12px; font-size:13px; text-align:right; font-weight:bold;">PKR {{ account.closing_balance }}</td>
+                    </tr>
+                    {% endfor %}
+                </table>
+
+                <!-- Money in -->
+                <table width="100%" cellpadding="0" cellspacing="0"
+                    style="border:1px solid #ddd; background-color:#ffffff; margin-bottom:16px;">
+                    <tr>
+                        <td colspan="2" style="padding:10px 12px; background-color:#f0fdf4; font-size:13px; font-weight:bold; color:#15803d;">
+                            Money In
+                        </td>
+                    </tr>
+                    <tr>
+                        <td style="padding:8px 12px; font-size:13px; color:#555;">Cash sales</td>
+                        <td style="padding:8px 12px; font-size:13px; text-align:right;">PKR {{ summary.money_in.cash_sales }}</td>
+                    </tr>
+                    <tr>
+                        <td style="padding:8px 12px; font-size:13px; color:#555;">Credit recovered</td>
+                        <td style="padding:8px 12px; font-size:13px; text-align:right;">PKR {{ summary.money_in.udhaar_recovered }}</td>
+                    </tr>
+                    <tr>
+                        <td style="padding:8px 12px; font-size:13px; color:#555;">Other income</td>
+                        <td style="padding:8px 12px; font-size:13px; text-align:right;">PKR {{ summary.money_in.other_income }}</td>
+                    </tr>
+                    <tr>
+                        <td style="padding:8px 12px; font-size:13px; font-weight:bold; border-top:1px solid #ddd;">Total in</td>
+                        <td style="padding:8px 12px; font-size:13px; font-weight:bold; text-align:right; border-top:1px solid #ddd;">PKR {{ summary.money_in.total }}</td>
+                    </tr>
+                </table>
+
+                <!-- Money out -->
+                <table width="100%" cellpadding="0" cellspacing="0"
+                    style="border:1px solid #ddd; background-color:#ffffff; margin-bottom:16px;">
+                    <tr>
+                        <td colspan="2" style="padding:10px 12px; background-color:#fef2f2; font-size:13px; font-weight:bold; color:#b91c1c;">
+                            Money Out
+                        </td>
+                    </tr>
+                    <tr>
+                        <td style="padding:8px 12px; font-size:13px; color:#555;">Expenses</td>
+                        <td style="padding:8px 12px; font-size:13px; text-align:right;">PKR {{ summary.money_out.expenses }}</td>
+                    </tr>
+                    <tr>
+                        <td style="padding:8px 12px; font-size:13px; color:#555;">Supplier payments</td>
+                        <td style="padding:8px 12px; font-size:13px; text-align:right;">PKR {{ summary.money_out.supplier_payments }}</td>
+                    </tr>
+                    <tr>
+                        <td style="padding:8px 12px; font-size:13px; color:#555;">Salaries</td>
+                        <td style="padding:8px 12px; font-size:13px; text-align:right;">PKR {{ summary.money_out.salaries }}</td>
+                    </tr>
+                    <tr>
+                        <td style="padding:8px 12px; font-size:13px; color:#555;">Owner drawings</td>
+                        <td style="padding:8px 12px; font-size:13px; text-align:right;">PKR {{ summary.money_out.drawings }}</td>
+                    </tr>
+                    <tr>
+                        <td style="padding:8px 12px; font-size:13px; font-weight:bold; border-top:1px solid #ddd;">Total out</td>
+                        <td style="padding:8px 12px; font-size:13px; font-weight:bold; text-align:right; border-top:1px solid #ddd;">PKR {{ summary.money_out.total }}</td>
+                    </tr>
+                </table>
+
+                <!-- Ledger position -->
+                <table width="100%" cellpadding="0" cellspacing="0"
+                    style="border:1px solid #ddd; background-color:#ffffff; margin-bottom:16px;">
+                    <tr>
+                        <td colspan="2" style="padding:10px 12px; background-color:#f5f3ff; font-size:13px; font-weight:bold; color:#6d28d9;">
+                            Ledger
+                        </td>
+                    </tr>
+                    <tr>
+                        <td style="padding:8px 12px; font-size:13px; color:#555;">New credit extended today</td>
+                        <td style="padding:8px 12px; font-size:13px; text-align:right;">PKR {{ summary.credit_extended }}</td>
+                    </tr>
+                    <tr>
+                        <td style="padding:8px 12px; font-size:13px; color:#555;">Total receivable</td>
+                        <td style="padding:8px 12px; font-size:13px; text-align:right;">PKR {{ summary.total_receivable }}</td>
+                    </tr>
+                    <tr>
+                        <td style="padding:8px 12px; font-size:13px; color:#555;">Total payable</td>
+                        <td style="padding:8px 12px; font-size:13px; text-align:right;">PKR {{ summary.total_payable }}</td>
+                    </tr>
+                </table>
+
+                <!-- Pending cheques -->
+                {% if summary.pending_cheques %}
+                <table width="100%" cellpadding="0" cellspacing="0"
+                    style="border:1px solid #ddd; background-color:#ffffff; margin-bottom:16px;">
+                    <tr>
+                        <td colspan="3" style="padding:10px 12px; background-color:#fffbeb; font-size:13px; font-weight:bold; color:#b45309;">
+                            Cheques Due
+                        </td>
+                    </tr>
+                    {% for cheque in summary.pending_cheques %}
+                    <tr>
+                        <td style="padding:8px 12px; font-size:13px;">{{ cheque.cheque_number }}</td>
+                        <td style="padding:8px 12px; font-size:13px; color:#555;">{{ cheque.due_date }}</td>
+                        <td style="padding:8px 12px; font-size:13px; text-align:right;">PKR {{ cheque.amount }}</td>
+                    </tr>
+                    {% endfor %}
+                </table>
+                {% endif %}
+
+                <p style="margin:16px 0 0 0; font-size:12px; color:#777;">
+                    These figures reflect what has been entered into Market Pro. Anything
+                    not recorded will not appear here.
+                </p>
+
+                <p style="margin:16px 0 0 0;">
+                    If you have any questions, feel free to reach out to our support team on the following channels
+                </p>
+                <p>
+                    <strong>Email: </strong> support@market-pro.pk </br>
+                    <strong>Phone: </strong> 0331-3689402 </br>
+                </p>
+
+            </td>
+        </tr>
+
+        <!-- Footer -->
+        <tr>
+            <td style="border-top:1px solid #ddd; padding:12px 20px; background-color:#ffffff;">
+                <p style="margin:0; font-size:11px; color:#555; text-align:center;">
+                    &copy; {{ year }} Market Pro. All rights reserved.
+                </p>
+            </td>
+        </tr>
+
+    </table>
+
+</body>
+
+</html>

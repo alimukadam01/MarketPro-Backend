@@ -128,14 +128,14 @@ class MultiModelSearchEngine:
 GlobalSearch = MultiModelSearchEngine()
 GlobalSearch.set_models({
     SalesInvoice: [
-        'id', 'invoice_number', 'customer__name', 'status', 'payment_status', 'sub_total', 'total', 'discount', 'tax', 'notes', 'created_by__email'
+        'id', 'invoice_number', 'customer__name', 'status', 'sub_total', 'total', 'discount', 'tax', 'notes', 'created_by__email'
     ],
     SalesInvoiceItem: [
         'id', 'sales_invoice__id', 'sales_invoice__invoice_number', 'product__name', 'product__base__name', 'track_code', 'quantity_received', 'unit_price', 'discount'
     ],
     PurchaseInvoice: [
-        'id', 'invoice_number', 'supplier__name', 'status', 'payment_status',
-        'sub_total', 'total', 'amount_paid', 'goods_received', 'delivery', 'notes'
+        'id', 'invoice_number', 'supplier__name', 'status',
+        'sub_total', 'total', 'goods_received', 'delivery', 'notes'
     ],
     PurchaseInvoiceItem: [
         'id', 'purchase_invoice__id', 'purchase_invoice__invoice_number', 'product__name',

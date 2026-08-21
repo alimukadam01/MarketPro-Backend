@@ -1,7 +1,9 @@
 from calendar import monthrange
 from datetime import datetime
+from urllib.parse import quote
 
 from django.db import transaction
+from django.utils import timezone
 
 from rest_framework import status
 from rest_framework.viewsets import GenericViewSet, ModelViewSet, ViewSet
@@ -10,8 +12,10 @@ from rest_framework.response import Response
 from rest_framework.filters import SearchFilter
 from django_filters.rest_framework import DjangoFilterBackend
 
-from root.utils import get_active_business
+from root.utils import get_active_business, local_date, whatsapp_number
 from inventory.models import InventoryItem
+from accounts.models import Transaction
+from accounts.utils import month_bounds, payables
 from .models import PurchaseInvoice, PurchaseInvoiceItem, PurchaseQuotation, PurchaseQuotationItem, PurchaseReceipt, ReturnedItem, SalesInvoice, SalesInvoiceItem, SalesReceipt
 from .serializers import (
     PaymentReceiptSerializer,
@@ -57,10 +61,10 @@ class PurchaseInvoiceViewSet(ModelViewSet):
 
     filter_backends = [SearchFilter, DjangoFilterBackend]
     filterset_fields = ['supplier__name', 'status',
-                        'payment_status', 'sub_total', 'total', 'goods_received']
+                        'sub_total', 'total', 'goods_received']
     search_fields = [
-        'id', 'invoice_number', 'supplier__name', 'status', 'payment_status',
-        'sub_total', 'total', 'amount_paid', 'goods_received', 'delivery', 'notes'
+        'id', 'invoice_number', 'supplier__name', 'status',
+        'sub_total', 'total', 'goods_received', 'delivery', 'notes'
     ]
 
     def get_queryset(self):
@@ -68,7 +72,11 @@ class PurchaseInvoiceViewSet(ModelViewSet):
         if not business:
             return []
 
-        return PurchaseInvoice.objects.filter(business_id=business.id).order_by('-created_at')
+        return PurchaseInvoice.objects.filter(
+            business_id=business.id
+        ).prefetch_related(
+            'payment_receipts__transaction_record', 'invoice_items'
+        ).order_by('-created_at')
 
     def get_serializer_class(self):
         method = self.request.method
@@ -298,9 +306,10 @@ class PurchasesKPIViewSet(GenericViewSet):
                     'detail': 'No active business exists. Please contact admin.'
                 }, status=status.HTTP_400_BAD_REQUEST)
 
-            today = datetime.today()
-            total_purchases = PurchaseInvoice.objects.total_purchases(
-                business.id, today.day)
+            month_start, month_end = month_bounds()
+            total_purchases = Transaction.objects.money_for_types(
+                business.id, Transaction.PURCHASE_MONEY_TYPES,
+                month_start, month_end)
             return Response({
                 "total_purchases": total_purchases
             }, status=status.HTTP_200_OK)
@@ -319,7 +328,7 @@ class PurchasesKPIViewSet(GenericViewSet):
                     'detail': 'No active business exists. Please contact admin.'
                 }, status=status.HTTP_400_BAD_REQUEST)
 
-            today = datetime.today()
+            today = timezone.localdate()
             total_invoices = PurchaseInvoice.objects.total_invoices(
                 business.id, today.day)
             return Response({
@@ -340,8 +349,8 @@ class PurchasesKPIViewSet(GenericViewSet):
                     'detail': 'No active business exists. Please contact admin.'
                 }, status=status.HTTP_400_BAD_REQUEST)
 
-            total_purchases = PurchaseInvoice.objects.total_purchases(
-                business.id)
+            total_purchases = Transaction.objects.money_for_types(
+                business.id, Transaction.PURCHASE_MONEY_TYPES)
             return Response({
                 "total_purchases": total_purchases
             }, status=status.HTTP_200_OK)
@@ -380,8 +389,7 @@ class PurchasesKPIViewSet(GenericViewSet):
                     'detail': 'No active business exists. Please contact admin.'
                 }, status=status.HTTP_400_BAD_REQUEST)
 
-            total_payment = PurchaseInvoice.objects.total_pending_payment(
-                business.id)
+            total_payment = payables(business.id)['total']
             return Response({
                 "total_payment": total_payment
             }, status=status.HTTP_200_OK)
@@ -394,10 +402,10 @@ class PurchasesKPIViewSet(GenericViewSet):
 class SalesInvoiceViewSet(ModelViewSet):
 
     filter_backends = [SearchFilter, DjangoFilterBackend]
-    filterset_fields = ['customer__name', 'status', 'payment_status',
+    filterset_fields = ['customer__name', 'status',
                         'sub_total', 'total', 'is_deducted', 'is_partially_deducted']
     search_fields = [
-        'id', 'invoice_number', 'customer__name', 'status', 'payment_status', 'sub_total', 'total', 'discount', 'tax', 'notes', 'created_by__email'
+        'id', 'invoice_number', 'customer__name', 'status', 'sub_total', 'total', 'discount', 'tax', 'notes', 'created_by__email'
     ]
 
     def get_queryset(self):
@@ -405,7 +413,11 @@ class SalesInvoiceViewSet(ModelViewSet):
         if not business:
             return []
 
-        return SalesInvoice.objects.filter(business_id=business.id).order_by("-created_at")
+        return SalesInvoice.objects.filter(
+            business_id=business.id
+        ).prefetch_related(
+            'payment_receipts__transaction_record', 'invoice_items'
+        ).order_by("-created_at")
 
     def get_serializer_class(self):
         method = self.request.method
@@ -528,6 +540,65 @@ class SalesInvoiceViewSet(ModelViewSet):
 
             return Response(serializer.data, status=status.HTTP_200_OK)
 
+    ### the message the shopkeeper sends the customer along with the invoice
+    @action(['GET'], detail=True, url_path='whatsapp-message', url_name='whatsapp-message')
+    def whatsapp_message(self, request, pk=None):
+
+        invoice = self.get_object()
+        customer = invoice.customer
+
+        if not customer or not customer.phone:
+            return Response({
+                'detail': 'This customer has no phone number saved.'
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        number = whatsapp_number(customer.phone)
+        if not number:
+            return Response({
+                'detail': 'This customer has no phone number saved.'
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            total = round(invoice.total or 0)
+            paid = round(invoice.amount_paid or 0)
+            due = total - paid
+            issued = local_date(invoice.date_issued or invoice.created_at)
+
+            lines = [
+                f"Assalam-o-Alaikum {customer.name},",
+                "",
+                f"Invoice {invoice.invoice_number or invoice.id} "
+                f"from {invoice.business.name}",
+                f"Date: {issued.strftime('%d/%m/%Y')}",
+                "",
+                f"Items: {invoice.invoice_items.count()}",
+                f"Total: PKR {total:,}",
+            ]
+
+            # A customer who has cleared the bill should not be shown a
+            # balance line at all - it reads like a demand.
+            if paid:
+                lines.append(f"Paid: PKR {paid:,}")
+            if due > 0:
+                lines.append(f"Balance due: PKR {due:,}")
+            else:
+                lines.append("Paid in full - thank you.")
+
+            lines += ["", "Thank you for your business."]
+            message = "\n".join(lines)
+
+            return Response({
+                'phone': number,
+                'message': message,
+                'whatsapp_url': f"https://wa.me/{number}?text={quote(message)}",
+            }, status=status.HTTP_200_OK)
+
+        except Exception as error:
+            print(error)
+            return Response({
+                'detail': 'Internal Server Error.'
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
 
 class SalesInvoiceItemViewSet(ModelViewSet):
 
@@ -642,7 +713,9 @@ class SalesKPIViewSet(GenericViewSet):
                     'detail': 'No active business exists. Please contact admin.'
                 }, status=status.HTTP_400_BAD_REQUEST)
 
-            total_sales = SalesInvoice.objects.total_sales(business.id, 1)
+            today = timezone.localdate()
+            total_sales = Transaction.objects.money_for_types(
+                business.id, Transaction.SALES_MONEY_TYPES, today, today)
             return Response({
                 "total_daily_sales": total_sales
             }, status=status.HTTP_200_OK)
@@ -715,10 +788,10 @@ class SalesKPIViewSet(GenericViewSet):
                     'detail': 'No active business exists. Please contact admin.'
                 }, status=status.HTTP_400_BAD_REQUEST)
 
-            today = datetime.today()
-            total_days_month = monthrange(today.year, today.month)[1]
-            days = total_days_month - today.day
-            total_sales = SalesInvoice.objects.total_sales(business.id, days)
+            month_start, month_end = month_bounds()
+            total_sales = Transaction.objects.money_for_types(
+                business.id, Transaction.SALES_MONEY_TYPES,
+                month_start, month_end)
             return Response({
                 "total_monthly_sales": total_sales
             }, status=status.HTTP_200_OK)
@@ -738,7 +811,8 @@ class SalesKPIViewSet(GenericViewSet):
                     'detail': 'No active business exists. Please contact admin.'
                 }, status=status.HTTP_400_BAD_REQUEST)
 
-            total_sales = SalesInvoice.objects.monthly_sales_trend(business.id)
+            total_sales = Transaction.objects.monthly_type_trend(
+                business.id, Transaction.SALES_MONEY_TYPES)
             return Response({
                 "monthly_sales_trend": total_sales
             }, status=status.HTTP_200_OK)
