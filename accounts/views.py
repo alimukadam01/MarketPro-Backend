@@ -202,7 +202,7 @@ class TransactionViewSet(ModelViewSet):
 
     filter_backends = [SearchFilter, DjangoFilterBackend]
     filterset_fields = ['type', 'status', 'payment_method', 'account', 'date']
-    search_fields = ['id', 'reference', 'notes', 'type']
+    search_fields = ['id', 'reference', 'notes', 'type', 'amount']
 
     def get_queryset(self):
         business = get_active_business(self.request)
