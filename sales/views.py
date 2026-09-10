@@ -1,6 +1,5 @@
 from calendar import monthrange
 from datetime import datetime
-from urllib.parse import quote
 
 from django.db import transaction
 from django.utils import timezone
@@ -12,11 +11,13 @@ from rest_framework.response import Response
 from rest_framework.filters import SearchFilter
 from django_filters.rest_framework import DjangoFilterBackend
 
-from root.utils import get_active_business, local_date, whatsapp_number
+from root.serializers import CaptureCustomerSerializer
+from root.utils import get_active_business
 from inventory.models import InventoryItem
 from accounts.models import Transaction
 from accounts.utils import month_bounds, payables
 from .models import PurchaseInvoice, PurchaseInvoiceItem, PurchaseQuotation, PurchaseQuotationItem, PurchaseReceipt, ReturnedItem, SalesInvoice, SalesInvoiceItem, SalesReceipt
+from .utils import build_whatsapp_payload
 from .serializers import (
     PaymentReceiptSerializer,
     PurchaseInvoiceAndItemsCreateSerializer,
@@ -544,53 +545,53 @@ class SalesInvoiceViewSet(ModelViewSet):
     @action(['GET'], detail=True, url_path='whatsapp-message', url_name='whatsapp-message')
     def whatsapp_message(self, request, pk=None):
 
+        payload = build_whatsapp_payload(self.get_object())
+
+        if not payload:
+            return Response({
+                'detail': 'This customer has no phone number saved.'
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        return Response(payload, status=status.HTTP_200_OK)
+
+    ### a counter sale gets a name when it is printed
+    @action(['POST'], detail=True, url_path='capture-customer', url_name='capture-customer')
+    def capture_customer(self, request, pk=None):
+        """
+        Turn a walk-in invoice into a named one.
+
+        The invoice was raised against the business's placeholder customer
+        because the buyer was not known at the till. They are captured here,
+        when the invoice is printed, and both writes land together — the client
+        can never be left holding a customer that no invoice points at.
+        """
+        business = get_active_business(request)
+        if not business:
+            return Response({
+                'detail': 'No active business exists. Please contact admin.'
+            }, status=status.HTTP_400_BAD_REQUEST)
+
         invoice = self.get_object()
-        customer = invoice.customer
 
-        if not customer or not customer.phone:
-            return Response({
-                'detail': 'This customer has no phone number saved.'
-            }, status=status.HTTP_400_BAD_REQUEST)
-
-        number = whatsapp_number(customer.phone)
-        if not number:
-            return Response({
-                'detail': 'This customer has no phone number saved.'
-            }, status=status.HTTP_400_BAD_REQUEST)
+        serializer = CaptureCustomerSerializer(
+            data=request.data, context={'business_id': business.id})
+        serializer.is_valid(raise_exception=True)
 
         try:
-            total = round(invoice.total or 0)
-            paid = round(invoice.amount_paid or 0)
-            due = total - paid
-            issued = local_date(invoice.date_issued or invoice.created_at)
+            with transaction.atomic():
+                customer = serializer.save()
+                # .update() rather than invoice.save(): moving the buyer must
+                # not fire updateInventoryOnSale, which would take a stock
+                # deduction pass as a side effect of a name change.
+                SalesInvoice.objects.filter(pk=invoice.pk).update(customer=customer)
 
-            lines = [
-                f"Assalam-o-Alaikum {customer.name},",
-                "",
-                f"Invoice {invoice.invoice_number or invoice.id} "
-                f"from {invoice.business.name}",
-                f"Date: {issued.strftime('%d/%m/%Y')}",
-                "",
-                f"Items: {invoice.invoice_items.count()}",
-                f"Total: PKR {total:,}",
-            ]
-
-            # A customer who has cleared the bill should not be shown a
-            # balance line at all - it reads like a demand.
-            if paid:
-                lines.append(f"Paid: PKR {paid:,}")
-            if due > 0:
-                lines.append(f"Balance due: PKR {due:,}")
-            else:
-                lines.append("Paid in full - thank you.")
-
-            lines += ["", "Thank you for your business."]
-            message = "\n".join(lines)
+            invoice.refresh_from_db()
 
             return Response({
-                'phone': number,
-                'message': message,
-                'whatsapp_url': f"https://wa.me/{number}?text={quote(message)}",
+                'invoice': GenerateInvoiceSerializer(invoice).data,
+                # Built after the commit, and never raises — a message that
+                # will not format is no reason to undo a correct reassignment.
+                'whatsapp': build_whatsapp_payload(invoice),
             }, status=status.HTTP_200_OK)
 
         except Exception as error:

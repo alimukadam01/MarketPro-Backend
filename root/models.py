@@ -186,6 +186,14 @@ class EmployeeAccess(models.Model):
         return f"{self.employee.user.email} @ {self.employee.business.name}"
 
 
+### the counter-sale customer every business is given, matched by name when a
+### walk-in invoice is downloaded so the buyer can be captured then.
+### The client matches the same string — inventrify-client-react/services/utils.js,
+### WALK_IN_CUSTOMER_NAME. Changing it here without changing it there turns walk-in
+### detection off.
+WALK_IN_CUSTOMER_NAME = "Walk-In Customer"
+
+
 class CustomerQuerySet(BaseQuerySet):
     pass
 
@@ -201,6 +209,31 @@ class CustomerManager(models.Manager):
             return self.get_queryset().for_business(business_id).in_period(num_days).count()
 
         return self.get_queryset().for_business(business_id).count()
+
+    def create_walk_in(self, business_id):
+        """
+        The counter sale. Every business gets one so an invoice can be raised
+        before the buyer is known; their details are captured later, when the
+        invoice is downloaded.
+
+        Returns None when there is no city to attach it to — the business is
+        still created, it just has no placeholder, which is the same position
+        as a business that predates this.
+        """
+        # Customer.city is NOT NULL and City is a global table with no default
+        # and no business scoping, so the placeholder is pinned to the lowest
+        # id. It is never displayed: the buyer's real city is captured on the
+        # customer this one is replaced by.
+        city_id = City.objects.order_by('id').values_list('id', flat=True).first()
+        if not city_id:
+            return None
+
+        customer, _ = self.get_queryset().get_or_create(
+            business_id=business_id,
+            name=WALK_IN_CUSTOMER_NAME,
+            defaults={'city_id': city_id},
+        )
+        return customer
 
 
 class Customer(models.Model):

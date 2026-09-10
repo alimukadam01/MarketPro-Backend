@@ -153,6 +153,18 @@ class CustomerSerializer(serializers.ModelSerializer):
         return instance
 
 
+class CaptureCustomerSerializer(CustomerSerializer):
+    """
+    The walk-in capture form on invoice download.
+
+    Everything is inherited from CustomerSerializer except the phone, which is
+    optional on the customer screen but not here: the invoice goes out over
+    WhatsApp to this number the moment it saves.
+    """
+
+    phone = serializers.CharField(required=True, allow_blank=False)
+
+
 class SimpleCustomerSerializer(serializers.ModelSerializer):
 
     city = CitySerializer()

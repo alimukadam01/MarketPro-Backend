@@ -1,4 +1,7 @@
 from django.contrib import admin
+
+from core.admin_masking import MaskedModelAdmin
+
 from .models import (
     SalesInvoice, 
     SalesInvoiceItem, 
@@ -13,15 +16,12 @@ from .models import (
 )
 
 
-# Register your models here.
-
-admin.site.register(SalesInvoice)
-admin.site.register(SalesInvoiceItem)
-admin.site.register(PurchaseInvoice)
-admin.site.register(PurchaseInvoiceItem)
-admin.site.register(PurchaseInvoiceItemRestock)
-admin.site.register(SalesInvoiceItemDeduction)
-admin.site.register(SalesReservation)
-admin.site.register(ReturnedItem)
-admin.site.register(PurchaseQuotation)
-admin.site.register(PurchaseQuotationItem)
+# Registered through MaskedModelAdmin so currency amounts render as asterisks.
+# SalesInvoice and PurchaseInvoice also carry their total in __str__, so their
+# changelists and every FK dropdown targeting them are masked too.
+for model in (
+    SalesInvoice, SalesInvoiceItem, PurchaseInvoice, PurchaseInvoiceItem,
+    PurchaseInvoiceItemRestock, SalesInvoiceItemDeduction, SalesReservation,
+    ReturnedItem, PurchaseQuotation, PurchaseQuotationItem,
+):
+    admin.site.register(model, MaskedModelAdmin)

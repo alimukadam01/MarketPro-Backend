@@ -1,3 +1,5 @@
+from urllib.parse import quote
+
 from django.db import transaction
 from typing import Dict, Set, Tuple
 from django.db.models import QuerySet
@@ -7,7 +9,7 @@ from .models import PurchaseInvoiceItem, PurchaseInvoiceItemRestock, SalesInvoic
 from inventory.models import InventoryItem
 from .models import PurchaseInvoice
 from .models import PurchaseInvoiceItemRestock
-from root.utils import generateTransactionId
+from root.utils import generateTransactionId, local_date, whatsapp_number
 
 
 def getRestockField(is_partial: bool) -> str:
@@ -214,3 +216,57 @@ def updateInventoryOnSale(instance: SalesInvoice):
 
         instance.update_deduction_flags()
         instance.save()
+
+
+def build_whatsapp_payload(invoice):
+    """
+    The wa.me link and its message for one invoice, or None when there is no
+    number to send it to.
+
+    Never raises. It is called after a write has already committed, where an
+    exception would be reported to the user as a failure the database does not
+    agree with.
+    """
+    try:
+        customer = invoice.customer
+        number = whatsapp_number(customer.phone) if customer else ''
+        if not number:
+            return None
+
+        total = round(invoice.total or 0)
+        paid = round(invoice.amount_paid or 0)
+        due = total - paid
+        issued = local_date(invoice.date_issued or invoice.created_at)
+
+        lines = [
+            f"Assalam-o-Alaikum {customer.name},",
+            "",
+            f"Invoice {invoice.invoice_number or invoice.id} "
+            f"from {invoice.business.name}",
+            f"Date: {issued.strftime('%d/%m/%Y')}",
+            "",
+            f"Items: {invoice.invoice_items.count()}",
+            f"Total: PKR {total:,}",
+        ]
+
+        # A customer who has cleared the bill should not be shown a balance
+        # line at all - it reads like a demand.
+        if paid:
+            lines.append(f"Paid: PKR {paid:,}")
+        if due > 0:
+            lines.append(f"Balance due: PKR {due:,}")
+        else:
+            lines.append("Paid in full - thank you.")
+
+        lines += ["", "Thank you for your business."]
+        message = "\n".join(lines)
+
+        return {
+            'phone': number,
+            'message': message,
+            'whatsapp_url': f"https://wa.me/{number}?text={quote(message)}",
+        }
+
+    except Exception as error:
+        print(error)
+        return None

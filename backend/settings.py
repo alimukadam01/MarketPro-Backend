@@ -27,7 +27,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 SECRET_KEY = 'django-insecure-n)ih+0wkoxbkcx4#s+ni9@hu9_ojy(rt+f%624^0ulcmi%gf28'
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = False
+DEBUG = True
 
 ALLOWED_HOSTS = [
     'localhost', 
@@ -171,6 +171,12 @@ DJOSER = {
     'SERIALIZERS': {
         "user": "core.serializers.UserSerializer",
         "current_user": "core.serializers.UserSerializer",
+        # Both keys, because djoser chooses between them per request based on
+        # USER_CREATE_PASSWORD_RETYPE above -- setting only 'user_create' would
+        # silently do nothing while that flag is True.
+        "user_create": "core.serializers.UserCreateSerializer",
+        "user_create_password_retype":
+            "core.serializers.UserCreatePasswordRetypeSerializer",
     },
 }
 

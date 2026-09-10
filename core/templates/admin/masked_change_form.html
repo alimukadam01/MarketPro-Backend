@@ -1,0 +1,15 @@
+{% extends "admin/change_form.html" %}
+{% load i18n admin_urls %}
+
+{# Django's admin/change_form.html:22 renders {{ original }} -- i.e. str(obj) --
+   in the breadcrumb, which prints the amount for the models in MASKED_LABELS.
+   This template exists only to put masked_original there instead; every other
+   block is inherited unchanged. See core/admin_masking.py. #}
+{% block breadcrumbs %}
+<div class="breadcrumbs">
+<a href="{% url 'admin:index' %}">{% translate 'Home' %}</a>
+&rsaquo; <a href="{% url 'admin:app_list' app_label=opts.app_label %}">{{ opts.app_config.verbose_name }}</a>
+&rsaquo; {% if has_view_permission %}<a href="{% url opts|admin_urlname:'changelist' %}">{{ opts.verbose_name_plural|capfirst }}</a>{% else %}{{ opts.verbose_name_plural|capfirst }}{% endif %}
+&rsaquo; {% if add %}{% blocktranslate with name=opts.verbose_name %}Add {{ name }}{% endblocktranslate %}{% else %}{{ masked_original|truncatewords:"18" }}{% endif %}
+</div>
+{% endblock %}

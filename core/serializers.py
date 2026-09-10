@@ -1,3 +1,7 @@
+from djoser.serializers import (
+    UserCreatePasswordRetypeSerializer as BaseUserCreatePasswordRetypeSerializer,
+    UserCreateSerializer as BaseUserCreateSerializer,
+)
 from rest_framework import serializers
 from django.contrib.auth import get_user_model
 from django.forms.models import model_to_dict
@@ -70,3 +74,37 @@ class SimpleUserSerializer(serializers.Serializer):
 
     def get_name(self, user):
         return f'{str(user.first_name)} {str(user.last_name)}'
+
+
+# Profile fields accepted at signup on top of djoser's email/password.
+# Djoser builds Meta.fields from User.REQUIRED_FIELDS, which is empty on this
+# User, so without these the serializer accepts only email, id and password --
+# and ModelSerializer drops unknown keys silently rather than rejecting them,
+# which is why the Register form has been posting first_name and last_name and
+# having them thrown away.
+#
+# All three are blank=True on the model, so they stay optional (and allow_blank)
+# here. Register.jsx enforces its own 2-character minimum client-side.
+SIGNUP_PROFILE_FIELDS = ("first_name", "last_name", "phone")
+
+
+class UserCreateSerializer(BaseUserCreateSerializer):
+    """Signup payload when USER_CREATE_PASSWORD_RETYPE is off."""
+
+    class Meta(BaseUserCreateSerializer.Meta):
+        fields = BaseUserCreateSerializer.Meta.fields + SIGNUP_PROFILE_FIELDS
+
+
+class UserCreatePasswordRetypeSerializer(BaseUserCreatePasswordRetypeSerializer):
+    """Signup payload when USER_CREATE_PASSWORD_RETYPE is on -- which it is.
+
+    Both classes are registered in DJOSER['SERIALIZERS'] because djoser picks
+    between them at request time (views.UserViewSet.get_serializer_class), so
+    overriding only 'user_create' would have no effect under the current config.
+    """
+
+    class Meta(BaseUserCreatePasswordRetypeSerializer.Meta):
+        fields = (
+            BaseUserCreatePasswordRetypeSerializer.Meta.fields
+            + SIGNUP_PROFILE_FIELDS
+        )
