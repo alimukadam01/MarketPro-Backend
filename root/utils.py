@@ -34,7 +34,6 @@ def local_date(value=None):
         return timezone.localdate()
     return timezone.localtime(value).date()
 
-
 def whatsapp_number(phone, country_code='92'):
     """
     A phone number in the form wa.me expects: digits only, country code
@@ -54,7 +53,6 @@ def whatsapp_number(phone, country_code='92'):
         return digits
 
     return country_code + digits.lstrip('0')
-
 
 def generateTransactionId(instance: Model):
     
@@ -136,5 +134,3 @@ def generate_variant_name(attributes = None):
 
 
     return " / ".join(values)
-    
-
