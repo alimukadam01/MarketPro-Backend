@@ -53,6 +53,7 @@ class BusinessConfigSerializer(serializers.ModelSerializer):
             'id', 'business',
             'sales', 'purchases', 'projects',
             'inventory', 'returned_items', 'quotations', 'accounting',
+            'targets',
         ]
 
 
@@ -63,6 +64,7 @@ class SimpleBusinessConfigSerializer(serializers.ModelSerializer):
         fields = [
             'sales', 'purchases', 'projects',
             'inventory', 'returned_items', 'quotations', 'accounting',
+            'targets',
         ]
 
 
@@ -73,6 +75,7 @@ class BusinessConfigCreateSerializer(serializers.ModelSerializer):
         fields = [
             'sales', 'purchases', 'projects',
             'inventory', 'returned_items', 'quotations', 'accounting',
+            'targets',
         ]
 
     def create(self, validated_data):
@@ -89,6 +92,7 @@ class BusinessConfigUpdateSerializer(serializers.ModelSerializer):
         fields = [
             'sales', 'purchases', 'projects',
             'inventory', 'returned_items', 'quotations', 'accounting',
+            'targets',
         ]
 
     def update(self, instance, validated_data):
