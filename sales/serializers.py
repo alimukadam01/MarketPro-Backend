@@ -208,7 +208,7 @@ class PurchaseInvoiceSerializer(serializers.ModelSerializer):
         model = PurchaseInvoice
         fields = [
             'id', 'invoice_number', 'business', 'supplier',
-            'created_at', 'updated_at', 'date_due', 'status', 'payment_status',
+            'date_issued', 'created_at', 'updated_at', 'date_due', 'status', 'payment_status',
             'sub_total', 'tax',  'amount_paid', 'total', 'delivery', 'created_by',
             'notes', 'invoice_items', 'is_restocked', 'is_partially_restocked', 'projects', 'payment_receipts'
         ]
@@ -232,7 +232,7 @@ class SimplePurchaseInvoiceSerializer(serializers.ModelSerializer):
         model = PurchaseInvoice
         fields = [
             'id', 'invoice_number', 'supplier',
-            'created_at', 'date_due', 'status',
+            'date_issued', 'created_at', 'date_due', 'status',
             'payment_status', 'sub_total', 'tax', 'total',
             'delivery', 'total_items', 'projects'
         ]
@@ -246,7 +246,7 @@ class PurchaseInvoiceCreateSerializer(serializers.ModelSerializer):
         model = PurchaseInvoice
         fields = [
             'id', 'invoice_number', 'business', 'supplier',
-            'created_at', 'updated_at', 'date_due', 'status',
+            'date_issued', 'created_at', 'updated_at', 'date_due', 'status',
             'payment_status', 'tax', 'delivery', 'notes'
         ]
 
@@ -267,7 +267,7 @@ class PurchaseInvoiceUpdateSerializer(serializers.ModelSerializer):
     class Meta:
         model = PurchaseInvoice
         fields = [
-            'id', 'invoice_number', 'supplier', 'date_due',
+            'id', 'invoice_number', 'supplier', 'date_issued', 'date_due',
             'status', 'payment_status', 'sub_total', 'tax', 'total', 'delivery', 'notes',
         ]
 
@@ -341,6 +341,7 @@ class PurchaseInvoiceAndItemsCreateSerializer(serializers.ModelSerializer):
         fields = [
             'invoice_number',
             'supplier',
+            'date_issued',
             'notes',
             'amount_paid',
             'date_due',
@@ -442,6 +443,7 @@ class PurchaseInvoiceAndItemsUpdateSerializer(serializers.ModelSerializer):
         fields = [
             'invoice_number',
             'supplier',
+            'date_issued',
             'notes',
             'date_due',
             'delivery',

@@ -94,6 +94,8 @@ MASKED_AMOUNT_FIELDS = {
     "sales.PurchaseQuotationItem": ("unit_price",),
     "inventory.Inventory": ("net_inventory_value", "total_value_reserved"),
     "inventory.InventoryItem": ("unit_cost", "unit_price"),
+    "targets.Target": ("target_value",),
+    "targets.ManualDataPoint": ("value",),
 }
 
 # Models whose __str__ embeds an amount, so the figure would otherwise show up

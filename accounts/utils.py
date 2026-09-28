@@ -344,8 +344,12 @@ def party_ledger(business_id, customer=None, supplier=None,
         )
         for invoice in invoices:
             rows.append({
-                'date': local_date(invoice.created_at).isoformat()
-                if invoice.created_at else None,
+                # date_issued, not created_at: a backdated purchase has to sit
+                # on the day it happened, the same way the sales branch above
+                # dates its invoices, or the khaata and the purchase targets
+                # disagree about which period an invoice belongs to.
+                'date': local_date(invoice.date_issued).isoformat()
+                if invoice.date_issued else None,
                 'description': 'Purchase invoice',
                 'reference': invoice.invoice_number or str(invoice.id),
                 'naam': round(invoice.total or 0),
