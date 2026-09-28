@@ -19,6 +19,35 @@ class BaseQuerySet(models.QuerySet):
         start = timezone.now() - timedelta(days=days)
         return self.filter(created_at__gte=start)
 
+    def in_range(self, date_lookup, date_from, date_to):
+        """
+        An inclusive window between two absolute dates.
+
+        The caller passes the whole lookup, because only the app that owns the
+        model knows the field's type. A DateTimeField needs '<field>__date' so
+        the day is decided in Asia/Karachi rather than UTC; a DateField takes
+        the bare name, and '__date' on one raises FieldError.
+
+        Not the same thing as in_period(days), which is relative to now and
+        always reads created_at.
+        """
+        return self.filter(**{
+            f'{date_lookup}__gte': date_from,
+            f'{date_lookup}__lte': date_to,
+        })
+
+    def filter_optional(self, **kwargs):
+        """
+        Applies only the kwargs whose value is not None, so a caller can pass
+        every filter it supports and let the unset ones fall away.
+
+        None means 'not filtered'. Matching a NULL column has to be asked for
+        explicitly with an __isnull lookup.
+        """
+        return self.filter(**{
+            key: value for key, value in kwargs.items() if value is not None
+        })
+
     def monthly_trend(self, business_id, field):
         today = timezone.localdate()
         year = today.year
@@ -136,6 +165,10 @@ class BusinessConfig(models.Model):
     returned_items = models.BooleanField(default=True)
     quotations = models.BooleanField(default=True)
     accounting = models.BooleanField(default=False)
+    # Paid add-on, off until it is bought. This flag is not optional: an admin's
+    # permissions are derived from this model, and any module in
+    # EmployeeAccess.all_modules without a field here is granted unconditionally.
+    targets = models.BooleanField(default=False)
 
     def __str__(self):
         return f"Config for {self.business.name}"
@@ -159,6 +192,8 @@ class EmployeeAccess(models.Model):
         "projects":      {"view": bool, "create": bool, "edit": bool, "delete": bool},
         "quotations":    {"view": bool, "create": bool, "edit": bool, "delete": bool},
         "returned_items":{"view": bool, "create": bool, "edit": bool, "delete": bool},
+        "accounting":    {"view": bool, "create": bool, "edit": bool, "delete": bool},
+        "targets":       {"view": bool, "create": bool, "edit": bool, "delete": bool},
     }
     """
 
@@ -176,6 +211,7 @@ class EmployeeAccess(models.Model):
         "returned_items",
         "backlog_entries",
         "accounting",
+        "targets",
     ]
 
     employee = models.OneToOneField(
@@ -411,6 +447,26 @@ class ExpenseManager(models.Manager):
             queryset = queryset.in_period(num_days)
 
         return queryset.aggregate(total=models.Sum("amount"))["total"] or 0
+
+    def expense_amount_in_range(self, business_id, date_from, date_to,
+                                category=None):
+        """
+        The absolute-window sibling of total_expense_amount, written for the
+        targets module.
+
+        Dated on created_at because that is the only date Expense has: no
+        editable date, no updated_at, no created_by. So an expense typed a week
+        after the money went out lands in the wrong month, and an expense
+        target can never be narrowed to a person. Both limits are stated on the
+        card rather than hidden.
+        """
+        return (
+            self.get_queryset()
+            .for_business(business_id)
+            .in_range('created_at__date', date_from, date_to)
+            .filter_optional(category=category)
+            .aggregate(value=models.Sum('amount'))['value'] or 0
+        )
 
     def monthly_expenses_trend(self, business_id):
         return self.get_queryset().monthly_trend(business_id, 'amount')

@@ -100,6 +100,50 @@ class SalesInvoiceManager(models.Manager):
 
         return int(total_value/quantity) if quantity > 0 else 0
 
+    ### The two below are the absolute-window siblings of total_sales and
+    ### total_invoices, written for the targets module. They differ from those
+    ### deliberately: an explicit date range instead of a relative one, the
+    ### invoice date instead of created_at, cancelled invoices excluded, and
+    ### optional filters. The originals are left as they are because existing
+    ### dashboards depend on them.
+
+    def revenue(self, business_id, date_from, date_to,
+                customer_id=None, created_by_id=None, status=None):
+        """
+        Invoiced sales value over an absolute window, dated on the invoice.
+
+        Cancelled invoices never count. Drafts do, which matches what
+        party_invoiced, profit_estimate and the Sales page already show.
+        """
+        return (
+            self.get_queryset()
+            .for_business(business_id)
+            .exclude(status__in=self.model.CANCELLED_STATUSES)
+            .in_range('date_issued__date', date_from, date_to)
+            .filter_optional(
+                customer_id=customer_id,
+                created_by_id=created_by_id,
+                status=status,
+            )
+            .aggregate(value=Sum('total'))['value'] or 0
+        )
+
+    def invoice_count(self, business_id, date_from, date_to,
+                      customer_id=None, created_by_id=None, status=None):
+        """How many invoices revenue() would have summed."""
+        return (
+            self.get_queryset()
+            .for_business(business_id)
+            .exclude(status__in=self.model.CANCELLED_STATUSES)
+            .in_range('date_issued__date', date_from, date_to)
+            .filter_optional(
+                customer_id=customer_id,
+                created_by_id=created_by_id,
+                status=status,
+            )
+            .count()
+        )
+
 
 class SalesInvoice(models.Model):
 
@@ -111,6 +155,11 @@ class SalesInvoice(models.Model):
         ("C", "COMPLETED"),
         ("PC", "PARTIALLY_COMPLETED")
     ]
+
+    # Which states mean the sale never happened. Kept here rather than imported
+    # from accounts, which imports this module and cannot be imported back.
+    # Note 'C' means COMPLETED here and CANCELLED on a purchase invoice.
+    CANCELLED_STATUSES = ["X"]
 
     PAYMENT_STATUS_CHOICES = [
         ("P", "PAID"),
@@ -285,6 +334,40 @@ class SalesInvoiceItemManager(models.Manager):
 
         return total_items
 
+    def net_items_sold(self, business_id, date_from, date_to,
+                       customer_id=None, product_id=None,
+                       product_variant_id=None, created_by_id=None):
+        """
+        Quantity sold less quantity returned, over an absolute window.
+
+        The subtraction is done in SQL with F(): net_quantity is a Python
+        property and cannot be used in an aggregate. A fully returned line
+        nets to zero on its own, so do not reach for adjust_totals's
+        .exclude(returned_quantity=F('quantity')) — that drops whole rows,
+        which is wrong when summing a difference.
+
+        Tenancy goes through the invoice rather than the item's own
+        business_id: the invoice is the authority, and it is the path
+        profit_estimate already uses.
+
+        product_id filters the Product while product_variant_id filters the
+        variant, because BaseItem.product points at ProductVariant. It reads
+        backwards; it is not a mistake.
+        """
+        return (
+            self.get_queryset()
+            .filter(sales_invoice__business_id=business_id)
+            .exclude(sales_invoice__status__in=SalesInvoice.CANCELLED_STATUSES)
+            .in_range('sales_invoice__date_issued__date', date_from, date_to)
+            .filter_optional(
+                sales_invoice__customer_id=customer_id,
+                product__base_id=product_id,
+                product_id=product_variant_id,
+                sales_invoice__created_by_id=created_by_id,
+            )
+            .aggregate(value=Sum(F('quantity') - F('returned_quantity')))['value'] or 0
+        )
+
 
 class SalesInvoiceItem(BaseItem):
     sales_invoice = models.ForeignKey(
@@ -366,6 +449,45 @@ class PurchaseInvoiceManager(models.Manager):
     def total_invoices(self, business_id, num_days=None):
         return self.get_queryset().for_business(business_id).in_period(num_days).count() 
 
+    def purchase_value(self, business_id, date_from, date_to,
+                       supplier_id=None, created_by_id=None, status=None):
+        """
+        Invoiced purchase value over an absolute window, dated on the invoice.
+
+        Gross of any negotiated discount: PurchaseInvoice has no discount
+        field, so a discount only shows here if the user lowered unit_cost by
+        hand. The catalogue label says so; nothing in the UI may call this
+        figure net.
+        """
+        return (
+            self.get_queryset()
+            .for_business(business_id)
+            .exclude(status__in=self.model.CANCELLED_STATUSES)
+            .in_range('date_issued__date', date_from, date_to)
+            .filter_optional(
+                supplier_id=supplier_id,
+                created_by_id=created_by_id,
+                status=status,
+            )
+            .aggregate(value=Sum('total'))['value'] or 0
+        )
+
+    def purchase_invoice_count(self, business_id, date_from, date_to,
+                               supplier_id=None, created_by_id=None, status=None):
+        """How many invoices purchase_value() would have summed."""
+        return (
+            self.get_queryset()
+            .for_business(business_id)
+            .exclude(status__in=self.model.CANCELLED_STATUSES)
+            .in_range('date_issued__date', date_from, date_to)
+            .filter_optional(
+                supplier_id=supplier_id,
+                created_by_id=created_by_id,
+                status=status,
+            )
+            .count()
+        )
+
     def total_pending_invoices(self, business_id):
         # An invoice is pending until the receipts against it cover its total.
         return (
@@ -393,6 +515,11 @@ class PurchaseInvoice(models.Model):
         ("O", "OVERDUE"),
     ]
 
+    # 'C' is CANCELLED on a purchase invoice and COMPLETED on a sales one.
+    # Always reach for this constant; a literal here is the likeliest way to
+    # get a purchase figure wrong.
+    CANCELLED_STATUSES = ["C"]
+
     PAYMENT_STATUS_CHOICES = [
         ("P", "PAID"),
         ("PP", "PARTIALLY_PAID"),
@@ -406,6 +533,10 @@ class PurchaseInvoice(models.Model):
         Business, models.CASCADE, related_name='purchase_invoices')
     supplier = models.ForeignKey(
         Supplier, models.DO_NOTHING, related_name='purchase_invoices')
+    # Editable, so a purchase entered a day late can carry the day it happened.
+    # created_at cannot do this job: it is auto_now_add, so a quarterly purchase
+    # target would count a late-entered invoice in the wrong quarter for good.
+    date_issued = models.DateTimeField(default=timezone.now)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
     date_due = models.DateField(null=True, blank=True)
@@ -514,6 +645,45 @@ class PurchaseInvoice(models.Model):
             self.status = 'R'
 
 
+class PurchaseInvoiceItemQuerySet(BaseQuerySet):
+
+    pass
+
+
+class PurchaseInvoiceItemManager(models.Manager):
+
+    def get_queryset(self):
+        return PurchaseInvoiceItemQuerySet(self.model, using=self._db)
+
+    def units_purchased(self, business_id, date_from, date_to,
+                        supplier_id=None, product_id=None,
+                        product_variant_id=None):
+        """
+        Units bought over an absolute window, dated on the invoice.
+
+        Gross, and it can only be gross: PurchaseInvoiceItem has no
+        returned_quantity, and ReturnedItem points only at SalesInvoiceItem,
+        so a purchase return is not recorded anywhere in the system. The
+        catalogue entry states this in words so the card can too.
+
+        As with the sales item, product_id filters the Product and
+        product_variant_id the variant, because BaseItem.product is a
+        ProductVariant.
+        """
+        return (
+            self.get_queryset()
+            .filter(purchase_invoice__business_id=business_id)
+            .exclude(purchase_invoice__status__in=PurchaseInvoice.CANCELLED_STATUSES)
+            .in_range('purchase_invoice__date_issued__date', date_from, date_to)
+            .filter_optional(
+                purchase_invoice__supplier_id=supplier_id,
+                product__base_id=product_id,
+                product_id=product_variant_id,
+            )
+            .aggregate(value=Sum('quantity'))['value'] or 0
+        )
+
+
 class PurchaseInvoiceItem(BaseItem):
     purchase_invoice = models.ForeignKey(
         PurchaseInvoice, models.CASCADE, related_name='invoice_items')
@@ -521,6 +691,8 @@ class PurchaseInvoiceItem(BaseItem):
     quantity_received = models.IntegerField(default=0)
     is_restocked = models.BooleanField(default=False)
     is_partially_restocked = models.BooleanField(default=False)
+
+    objects = PurchaseInvoiceItemManager()
 
     def clean(self):
         super().clean()

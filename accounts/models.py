@@ -3,6 +3,8 @@ from datetime import date as date_cls
 
 from django.conf import settings
 from django.db import models
+from django.db.models import Q
+from django.db.models.functions import Coalesce
 from django.utils import timezone
 
 from root.models import Business, Customer, Supplier
@@ -180,6 +182,23 @@ class TransactionQuerySet(models.QuerySet):
     def in_period(self, date_from, date_to):
         return self.filter(date__gte=date_from, date__lte=date_to)
 
+    ### The two below duplicate root.BaseQuerySet.in_range and filter_optional.
+    ### They are copied rather than inherited because this queryset already has
+    ### an in_period(date_from, date_to), and BaseQuerySet's in_period takes a
+    ### number of days — rebasing would silently change what every existing
+    ### caller of this one means.
+
+    def in_range(self, date_lookup, date_from, date_to):
+        return self.filter(**{
+            f'{date_lookup}__gte': date_from,
+            f'{date_lookup}__lte': date_to,
+        })
+
+    def filter_optional(self, **kwargs):
+        return self.filter(**{
+            key: value for key, value in kwargs.items() if value is not None
+        })
+
 
 class TransactionManager(models.Manager):
 
@@ -245,6 +264,86 @@ class TransactionManager(models.Manager):
             queryset = queryset.filter(date__lte=date_to)
 
         return queryset.aggregate(total=models.Sum('amount'))['total'] or 0
+
+    def _party_money(self, business_id, date_from, date_to, in_types,
+                     refund_type, party_filter=None, payment_method=None):
+        """
+        Cleared money for a set of types, less the refunds that reverse it.
+
+        One query, two conditional sums. Coalesce guards both legs because a
+        Sum over no rows is NULL, and NULL minus 0 is NULL rather than 0 — a
+        period with only a refund in it has to come back negative, not empty.
+
+        status='C' is the point of .cleared(): a pending or bounced cheque is
+        recorded against the party but has settled nothing.
+
+        Transaction.date is a DateField, so in_range takes the bare field name.
+        '__date' on a DateField raises FieldError.
+        """
+        queryset = (
+            self.get_queryset()
+            .for_business(business_id)
+            .cleared()
+            .in_range('date', date_from, date_to)
+            .filter_optional(payment_method=payment_method)
+        )
+
+        if party_filter is not None:
+            queryset = queryset.filter(party_filter)
+
+        return queryset.aggregate(value=(
+            Coalesce(models.Sum('amount', filter=Q(type__in=in_types)), 0)
+            - Coalesce(models.Sum('amount', filter=Q(type=refund_type)), 0)
+        ))['value'] or 0
+
+    def cash_received(self, business_id, date_from, date_to,
+                      customer_id=None, payment_method=None):
+        """
+        Cleared money in from sales, less refunds paid back to customers.
+
+        Not the same number as SalesInvoice.objects.revenue: this is money that
+        moved, dated on the movement, while revenue is invoiced value dated on
+        the invoice. A credit sale raises revenue immediately and this not at
+        all until it is paid.
+        """
+        party_filter = None
+        if customer_id is not None:
+            # A sale_payment reaches the customer through the receipt and its
+            # invoice; a customer_receipt or a refund reaches it through
+            # PartyPayment. Both paths have to be searched.
+            party_filter = (
+                Q(sales_receipt__sales_invoice__customer_id=customer_id)
+                | Q(party_payment__customer_id=customer_id)
+            )
+
+        return self._party_money(
+            business_id, date_from, date_to,
+            in_types=Transaction.SALES_MONEY_TYPES,
+            refund_type='sales_return_refund',
+            party_filter=party_filter,
+            payment_method=payment_method,
+        )
+
+    def cash_paid(self, business_id, date_from, date_to,
+                  supplier_id=None, payment_method=None):
+        """
+        Cleared money out for purchases, less refunds received back from
+        suppliers. The mirror of cash_received.
+        """
+        party_filter = None
+        if supplier_id is not None:
+            party_filter = (
+                Q(purchase_receipt__purchase_invoice__supplier_id=supplier_id)
+                | Q(party_payment__supplier_id=supplier_id)
+            )
+
+        return self._party_money(
+            business_id, date_from, date_to,
+            in_types=Transaction.PURCHASE_MONEY_TYPES,
+            refund_type='purchase_return_refund',
+            party_filter=party_filter,
+            payment_method=payment_method,
+        )
 
     def monthly_type_trend(self, business_id, types):
         """
