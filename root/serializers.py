@@ -238,10 +238,16 @@ class ProductSerializer(serializers.ModelSerializer):
 class SimpleProductSerializer(serializers.ModelSerializer):
 
     unit = UnitSerializer()
+    num_variants = serializers.SerializerMethodField()
 
+    def get_num_variants(self, obj):
+        return len(obj.variants.all())
     class Meta:
         model = Product
-        fields = ['id', 'name', 'code', 'unit', 'desc']
+        fields = [
+            'id', 'business', 'code', 'name', 'desc',
+            'unit', 'created_at', 'updated_at', 'num_variants'
+        ]
 
 
 class ProductCreateUpdateSerializer(serializers.ModelSerializer):
