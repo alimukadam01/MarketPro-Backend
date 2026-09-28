@@ -14,7 +14,7 @@ from core.utils import send_marketpro_email
 from .utils import get_active_business, whatsapp_number
 from .serializers import (
     BusinessCreateSerializer, CategorySerializer, CitySerializer, CustomerSerializer, EmployeeAndUserCreateSerializer, ExpenseSerializer, LocationSerializer,
-    BusinessSerializer, ProductAndVariantCreateSerializer, ProductAndVariantUpdateSerializer, ProductVariantTypeSerializer, SimpleCustomerSerializer, SupplierSerializer, UnitSerializer,
+    BusinessSerializer, ProductAndVariantCreateSerializer, ProductAndVariantUpdateSerializer, ProductVariantTypeSerializer, SimpleCustomerSerializer, SimpleProductSerializer, SupplierSerializer, UnitSerializer,
     ProductCreateUpdateSerializer, ProductSerializer, ProductVariantCreateSerializer, ProductVariantSerializer,
     EmployeeSerializer, EmployeeCreateSerializer, EmployeeUpdateSerializer,
     EmployeeAccessSerializer, EmployeeAccessCreateSerializer, EmployeeAccessUpdateSerializer,
@@ -130,6 +130,9 @@ class ProductViewSet(ModelViewSet):
     def get_serializer_class(self):
         
         method = self.request.method
+
+        if self.action == 'list':
+            return SimpleProductSerializer
 
         if self.action == 'create_product_and_variants' and method == 'POST':
             return ProductAndVariantCreateSerializer
