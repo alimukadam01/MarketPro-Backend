@@ -7,7 +7,7 @@ from django.db.models import Q
 from django.db.models.functions import Coalesce
 from django.utils import timezone
 
-from root.models import Business, Customer, Supplier
+from root.models import Business, Customer, Expense, Supplier
 
 
 class MoneyAccountQuerySet(models.QuerySet):
@@ -225,6 +225,25 @@ class TransactionManager(models.Manager):
             .annotate(total=models.Sum('amount'))
         )
         return {row['type']: row['total'] or 0 for row in rows}
+
+    def salary_expense_total(self, business_id, date_from, date_to):
+        """
+        Cleared money paid out as salaries, which are recorded as an expense in
+        the salary category rather than as their own transaction type.
+
+        The daily summary reports salaries on their own line, so it needs to
+        move this amount out of the expenses line and into the salaries one.
+        Amounts come from the transaction, not the Expense row, so this stays
+        comparable with totals_by_type and is dated the same way.
+        """
+        return (
+            self.get_queryset()
+            .for_business(business_id)
+            .cleared()
+            .in_period(date_from, date_to)
+            .filter(type='expense', expense__category=Expense.SALARY_CATEGORY)
+            .aggregate(total=models.Sum('amount'))['total'] or 0
+        )
 
     def money_in(self, business_id, date_from, date_to):
         return (
@@ -474,7 +493,10 @@ class Transaction(models.Model):
 
     TYPE_CHOICES = [
         ('sale_payment', 'Sale Payment'),
-        ('customer_receipt', 'Customer Receipt'),
+        # Label only. The code stays customer_receipt so existing rows,
+        # filters and PARTY_ON_ACCOUNT keep working; renaming it would
+        # need a data migration for no user-visible gain.
+        ('customer_receipt', 'Customer Payment'),
         ('purchase_return_refund', 'Purchase Return Refund'),
         ('owner_capital', 'Owner Capital'),
         ('loan_received', 'Loan Received'),

@@ -283,6 +283,56 @@ def payables(business_id):
     return {'total': total, 'parties': rows}
 
 
+def uncleared_opening_balances(business_id, party):
+    """
+    Parties whose pre-MarketPro opening balance has not been settled yet, with
+    what is left on it.
+
+    Deliberately NOT the same figure as payables()/receivables(). Those are the
+    whole relationship - invoices included. This is only the balance carried
+    across from the paper khaata at onboarding, because that is the only thing
+    an on-account payment settles: money owed against an invoice is settled by
+    paying that invoice.
+
+        remaining = opening balance - on-account payments already made
+
+    party is 'customer' or 'supplier'.
+    """
+    kinds = PARTY_ON_ACCOUNT[party]
+    rows = []
+    total = 0
+
+    openings = (
+        PartyOpeningBalance.objects
+        .filter(business_id=business_id, amount__gt=0)
+        .exclude(**{f'{party}__isnull': True})
+        .select_related(party)
+    )
+
+    for opening in openings:
+        who = getattr(opening, party)
+        settled, _ = on_account_totals(
+            business_id, {f'{party}_id': who.id}, kinds)
+
+        remaining = round((opening.amount or 0) - settled)
+        if remaining <= 0:
+            continue
+
+        total += remaining
+        rows.append({
+            'id': who.id,
+            'name': who.name,
+            'business_name': getattr(who, 'business_name', None),
+            'phone': who.phone,
+            'opening_balance': opening.amount,
+            'settled': round(settled),
+            'balance': remaining,
+        })
+
+    rows.sort(key=lambda row: row['balance'], reverse=True)
+    return {'total': total, 'parties': rows}
+
+
 # ── Khaata ────────────────────────────────────────────────────────────────────
 
 def party_ledger(business_id, customer=None, supplier=None,
@@ -507,6 +557,8 @@ def daily_summary(business_id, day):
     """
     book = day_book(business_id, day)
     totals = Transaction.objects.totals_by_type(business_id, day, day)
+    salary_expenses = Transaction.objects.salary_expense_total(
+        business_id, day, day)
 
     credit_extended = (
         SalesInvoice.objects
@@ -551,12 +603,17 @@ def daily_summary(business_id, day):
             'total': book['total_money_in'],
         },
         'money_out': {
-            'expenses': totals.get('expense', 0),
+            # Salaries are expenses in the salary category now, not their own
+            # type, so their share moves out of the expenses line and into the
+            # salaries one. Without this the expenses line would quietly
+            # absorb them and salaries would read 0 (BRD 6.9 wants both).
+            # Legacy salary_payment rows keep counting, so history is unchanged.
+            'expenses': totals.get('expense', 0) - salary_expenses,
             'supplier_payments': (
                 totals.get('supplier_payment', 0)
                 + totals.get('purchase_payment', 0)
             ),
-            'salaries': totals.get('salary_payment', 0),
+            'salaries': totals.get('salary_payment', 0) + salary_expenses,
             'drawings': totals.get('owner_drawings', 0),
             'total': book['total_money_out'],
         },

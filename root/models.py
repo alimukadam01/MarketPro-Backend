@@ -482,6 +482,12 @@ class Expense(models.Model):
         ("mutafarriq", "Miscellaneous (Mutafarriq)"),
     ]
 
+    # Salaries are recorded as an expense in this category rather than as their
+    # own transaction type, but the daily summary still reports them on their
+    # own line (BRD 6.9). Named here so the reporting code does not carry a
+    # bare string.
+    SALARY_CATEGORY = "tankhwa"
+
     business = models.ForeignKey(
         Business, on_delete=models.CASCADE, related_name='expenses')
     name = models.CharField(max_length=256)

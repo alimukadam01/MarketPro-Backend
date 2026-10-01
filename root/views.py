@@ -1,5 +1,5 @@
 from datetime import datetime
-from django.db.models import QuerySet
+from django.db.models import Exists, OuterRef, QuerySet
 from django.utils import timezone
 from rest_framework import status
 from rest_framework.views import APIView
@@ -11,6 +11,9 @@ from django_filters.rest_framework import DjangoFilterBackend
 
 from accounts.utils import customer_balance, party_invoiced, supplier_balance
 from core.utils import send_marketpro_email
+# root -> inventory, the same direction sales/ already uses. inventory.models
+# imports root.models, not root.views, so there is no cycle.
+from inventory.models import InventoryItem
 from .utils import get_active_business, whatsapp_number
 from .serializers import (
     BusinessCreateSerializer, CategorySerializer, CitySerializer, CustomerSerializer, EmployeeAndUserCreateSerializer, ExpenseSerializer, LocationSerializer,
@@ -246,16 +249,34 @@ class ProductViewSet(ModelViewSet):
 class ProductVariantViewSet(ModelViewSet):
 
     def get_queryset(self):
-        try:
-            business = get_active_business(self.request)
-            if not business:
-                return []
+        business = get_active_business(self.request)
+        if not business:
+            # none(), never [] or None: both break the moment anything calls
+            # .model or .filter on the result, which is a 500 rather than an
+            # empty list.
+            return ProductVariant.objects.none()
 
-            return ProductVariant.objects.filter(base__business=business).order_by('base__name')
-        
-        except Exception as error:
-            return None
-        
+        queryset = ProductVariant.objects.filter(
+            base__business=business).order_by('base__name')
+
+        # ?has_inventory_item=false lists only variants that are not stocked
+        # yet. The create-inventory-item screen offers exactly those: picking a
+        # variant that already has an item would only create a duplicate, and
+        # nothing stops that today.
+        wanted = self.request.query_params.get('has_inventory_item')
+        if wanted is not None:
+            stocked = InventoryItem.objects.filter(
+                inventory__business_id=business.id,
+                product_id=OuterRef('pk'),
+            )
+            queryset = queryset.annotate(
+                has_inventory_item=Exists(stocked)
+            ).filter(
+                has_inventory_item=wanted.strip().lower() in ('true', '1', 'yes')
+            )
+
+        return queryset
+
     def get_serializer_class(self):
         method = self.request.method
 

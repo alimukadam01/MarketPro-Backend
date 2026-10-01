@@ -357,8 +357,10 @@ class ProductAndVariantUpdateSerializer(serializers.ModelSerializer):
                     )
                     instance.save()
             except Exception as error:
+                # Re-raised, not swallowed: a half-written variant set
+                # must not read as a successful update.
                 print(f"Error updating objects: {error}")
-                return None
+                raise
         else:
             try:
                 with transaction.atomic():
@@ -369,8 +371,10 @@ class ProductAndVariantUpdateSerializer(serializers.ModelSerializer):
                         name=generate_variant_name(),
                     )
             except Exception as error:
+                # Re-raised, not swallowed: a half-written variant set
+                # must not read as a successful update.
                 print(f"Error updating objects: {error}")
-                return None
+                raise
 
         return instance
 
@@ -490,11 +494,29 @@ class ExpenseSerializer(serializers.ModelSerializer):
     date = serializers.DateField(
         required=False, allow_null=True, write_only=True)
 
+    # ...and have to come back out again, or the update screen cannot show
+    # which account the money was paid from. account/date above are write_only,
+    # so the detail response carried neither and the form fell back to blank.
+    paid_from = serializers.SerializerMethodField()
+    paid_on = serializers.SerializerMethodField()
+
+    def _transaction(self, expense):
+        return getattr(expense, 'transaction_record', None)
+
+    def get_paid_from(self, expense):
+        transaction = self._transaction(expense)
+        return transaction.account_id if transaction else None
+
+    def get_paid_on(self, expense):
+        transaction = self._transaction(expense)
+        return transaction.date if transaction else None
+
     class Meta:
         model = Expense
         fields = [
             'id', 'business', 'name', 'category', 'desc',
             'amount', 'created_at', 'account', 'date',
+            'paid_from', 'paid_on',
         ]
 
     def create(self, validated_data):
@@ -524,11 +546,10 @@ class ExpenseSerializer(serializers.ModelSerializer):
         if not any(money_details.values()):
             return
 
-        try:
-            transaction = expense.transaction_record
-        except Exception as error:
-            print(error)
-            return
+        # No try/except. An expense whose mirrored transaction is missing means
+        # money left the books on paper but not in any account; swallowing that
+        # reported success for a half-written record.
+        transaction = expense.transaction_record
 
         fields = []
         for attr, value in money_details.items():
@@ -616,8 +637,10 @@ class EmployeeAndUserCreateSerializer(serializers.ModelSerializer):
 
                 return employee
         except Exception as error:
+            # Re-raised, not swallowed: returning None here turned a
+            # failed write into a misleading 400 at the view.
             print(error)
-            return None
+            raise
         
 
 class EmployeeUpdateSerializer(serializers.ModelSerializer):
