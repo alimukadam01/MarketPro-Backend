@@ -2,7 +2,7 @@ from urllib.parse import quote
 
 from django.db import transaction
 from typing import Dict, Set, Tuple
-from django.db.models import QuerySet
+from django.db.models import Q, QuerySet
 from django.db.models import Sum
 from rest_framework.exceptions import ValidationError
 from .models import PurchaseInvoiceItem, PurchaseInvoiceItemRestock, SalesInvoice, SalesInvoiceItem, SalesInvoiceItemDeduction
@@ -270,3 +270,71 @@ def build_whatsapp_payload(invoice):
     except Exception as error:
         print(error)
         return None
+
+
+# ── Receipt / transaction money details ───────────────────────────────────────
+# Shared by the receipt serializers here, the expense serializer in root/, and
+# the transaction dispatcher in accounts/. Kept in one place so a payment
+# recorded on an invoice screen and the same payment recorded on the
+# transaction screen patch the mirrored transaction identically.
+
+# A payment holds its share of the invoice while it is cleared or still
+# pending. A bounced one never arrives, so it frees its share up again.
+# Receipts with no transaction behind them predate the accounting module.
+LIVE_RECEIPT = (
+    Q(transaction_record__isnull=True) |
+    Q(transaction_record__status__in=['C', 'PEN'])
+)
+
+
+def live_receipt_total(invoice):
+    """
+    What the invoice already has spoken for, counting pending cheques.
+    """
+    return (
+        invoice.payment_receipts
+        .filter(LIVE_RECEIPT)
+        .aggregate(total=Sum('amount'))['total'] or 0
+    )
+
+
+def invoice_room(invoice):
+    """
+    How much more this invoice can still accept. Never negative.
+    """
+    return max(float(invoice.total or 0) - float(live_receipt_total(invoice)), 0.0)
+
+
+def apply_money_details(source, money_details):
+    """
+    Push the money details onto the transaction a signal mirrored from this
+    source record. `source` is anything carrying a `transaction_record`
+    reverse accessor: a SalesReceipt, a PurchaseReceipt or an Expense.
+
+    Returns the patched Transaction, so a caller that needs the mirrored row
+    does not have to go looking for it again.
+
+    Deliberately does NOT swallow. This used to catch every exception and
+    return, which turned "the mirror never ran" into a 201: the invoice was
+    paid down while the money sat on the default account, on the wrong date,
+    with no photo. Letting Transaction.DoesNotExist propagate rolls the source
+    record back with it.
+
+    The caller may pass anything settable on Transaction, not just
+    MONEY_FIELDS - the transaction dispatcher also passes image, reference and
+    created_by_id.
+    """
+    transaction_record = source.transaction_record
+
+    if not money_details:
+        return transaction_record
+
+    # A cheque stays pending until it clears, so it moves no money yet.
+    if money_details.get('payment_method') == 'cheque':
+        money_details['status'] = 'PEN'
+
+    for attr, value in money_details.items():
+        setattr(transaction_record, attr, value)
+    transaction_record.save(update_fields=list(money_details.keys()))
+
+    return transaction_record

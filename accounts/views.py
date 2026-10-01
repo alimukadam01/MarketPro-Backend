@@ -4,12 +4,15 @@ from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework import status
 from rest_framework.decorators import action
 from rest_framework.filters import SearchFilter
+from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.viewsets import GenericViewSet, ModelViewSet
 
-from root.models import Customer, Supplier
+from root.models import Customer, Expense, Supplier
 from root.utils import get_active_business, whatsapp_number
+from sales.models import PurchaseReceipt, SalesReceipt
 from .models import MoneyAccount, PartyOpeningBalance, Transaction
+from .permissions import HasAccountingAccess
 from .serializers import (
     MoneyAccountCreateSerializer, MoneyAccountSerializer,
     MoneyAccountUpdateSerializer, PartyOpeningBalanceSerializer,
@@ -20,7 +23,7 @@ from .serializers import (
 from .utils import (
     daily_summary, day_book, has_accounting_access, month_bounds, parse_date,
     party_ledger, payables, previous_month_bounds, profit_estimate,
-    receivables,
+    receivables, uncleared_opening_balances,
 )
 
 
@@ -30,6 +33,7 @@ NO_ACCESS = {'detail': 'You do not have access to accounting.'}
 
 class MoneyAccountViewSet(ModelViewSet):
 
+    permission_classes = [IsAuthenticated, HasAccountingAccess]
     filter_backends = [SearchFilter, DjangoFilterBackend]
     filterset_fields = ['type', 'is_active']
     search_fields = ['id', 'name', 'type']
@@ -37,9 +41,7 @@ class MoneyAccountViewSet(ModelViewSet):
     def get_queryset(self):
         business = get_active_business(self.request)
         if not business:
-            return []
-        if not has_accounting_access(self.request, business):
-            return []
+            return MoneyAccount.objects.none()
         return MoneyAccount.objects.filter(
             business_id=business.id).order_by('-is_default', 'name')
 
@@ -200,6 +202,10 @@ class MoneyAccountViewSet(ModelViewSet):
 
 class TransactionViewSet(ModelViewSet):
 
+    # HasAccountingAccess answers the module gate with a 403. It is listed
+    # beside IsAuthenticated because permission_classes replaces the default
+    # rather than adding to it.
+    permission_classes = [IsAuthenticated, HasAccountingAccess]
     filter_backends = [SearchFilter, DjangoFilterBackend]
     filterset_fields = ['type', 'status', 'payment_method', 'account', 'date']
     search_fields = ['id', 'reference', 'notes', 'type', 'amount']
@@ -207,9 +213,9 @@ class TransactionViewSet(ModelViewSet):
     def get_queryset(self):
         business = get_active_business(self.request)
         if not business:
-            return []
-        if not has_accounting_access(self.request, business):
-            return []
+            # none(), never []: DjangoFilterBackend reads queryset.model, and a
+            # list has none, which turned every no-access retrieve into a 500.
+            return Transaction.objects.none()
         return Transaction.objects.filter(
             business_id=business.id
         ).select_related('account', 'transfer_account')
@@ -227,21 +233,70 @@ class TransactionViewSet(ModelViewSet):
     def get_serializer_context(self):
         business = get_active_business(self.request)
         if not business:
-            return {}
+            return {'request': self.request}
         return {
+            # request is what ImageField needs to build an absolute URL; the
+            # old context replaced DRF's default and dropped it, so every
+            # image came back as a bare /media/... path.
+            'request': self.request,
             'business_id': business.id,
             'user_id': self.request.user.id,
         }
 
+    def create(self, request, *args, **kwargs):
+        """
+        Overridden for two reasons.
+
+        The business guard moves here, so a missing business is a 400 instead
+        of a KeyError inside the serializer, which used to surface as a 500.
+
+        And the response is rendered with the READ serializer. The create
+        serializer's field list is write-only, so DRF's stock create() answered
+        201 with no id and no is_source_linked - the client could not tell a
+        real write from the phantom 201 this module used to return, nor whether
+        the saved row had become source-linked.
+        """
+        business = get_active_business(request)
+        if not business:
+            return Response(NO_BUSINESS, status=status.HTTP_400_BAD_REQUEST)
+
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        instance = serializer.save()
+
+        return Response(
+            TransactionSerializer(
+                instance, context=self.get_serializer_context()).data,
+            status=status.HTTP_201_CREATED,
+        )
+
     def destroy(self, request, *args, **kwargs):
+        """
+        Deleting a source-backed transaction deletes the record that owns it.
+
+        This used to refuse with "delete the source payment or expense
+        instead", which made sense when source-linked only meant "recorded on
+        the invoice screen". A sale payment, purchase payment or expense can
+        now be recorded here too, so refusing left the user unable to remove a
+        row from the screen that created it.
+
+        Deleting the receipt is also the correct accounting outcome: the
+        invoice's paid amount and payment status derive from its receipts, so
+        removing one frees that share of the invoice again. The transaction
+        goes with it through the FK's CASCADE.
+        """
         try:
             instance = self.get_object()
-            if instance.is_source_linked:
-                return Response(
-                    {'detail': 'Delete the source payment or expense instead.'},
-                    status=status.HTTP_400_BAD_REQUEST
-                )
-            instance.delete()
+            source = (instance.sales_receipt
+                      or instance.purchase_receipt
+                      or instance.expense)
+
+            with db_transaction.atomic():
+                if source is not None:
+                    source.delete()
+                else:
+                    instance.delete()
+
             return Response({'detail': 'Success.'}, status=status.HTTP_200_OK)
         except Exception as error:
             print(error)
@@ -313,14 +368,38 @@ class TransactionViewSet(ModelViewSet):
             )
 
         try:
-            Transaction.objects.filter(
-                id__in=transaction_ids,
-                business_id=business.id,
-                sales_receipt__isnull=True,
-                purchase_receipt__isnull=True,
-                expense__isnull=True,
-            ).delete()
-            return Response({'detail': 'Success.'}, status=status.HTTP_200_OK)
+            # This used to filter source-linked rows OUT and still answer
+            # "Success", so selecting a sale payment or an expense deleted
+            # nothing while the UI reported it had worked. Each one now takes
+            # its owning record with it, exactly as destroy() does.
+            transactions = Transaction.objects.filter(
+                id__in=transaction_ids, business_id=business.id
+            ).only('id', 'sales_receipt_id', 'purchase_receipt_id', 'expense_id')
+
+            plain, receipts, purchases, expenses = [], [], [], []
+            for txn in transactions:
+                if txn.sales_receipt_id:
+                    receipts.append(txn.sales_receipt_id)
+                elif txn.purchase_receipt_id:
+                    purchases.append(txn.purchase_receipt_id)
+                elif txn.expense_id:
+                    expenses.append(txn.expense_id)
+                else:
+                    plain.append(txn.id)
+
+            deleted = len(plain) + len(receipts) + len(purchases) + len(expenses)
+
+            with db_transaction.atomic():
+                # Deleting a source cascades to its transaction.
+                SalesReceipt.objects.filter(id__in=receipts).delete()
+                PurchaseReceipt.objects.filter(id__in=purchases).delete()
+                Expense.objects.filter(id__in=expenses).delete()
+                Transaction.objects.filter(id__in=plain).delete()
+
+            # The count is what lets the caller tell a real delete from a
+            # selection that matched nothing.
+            return Response({'detail': 'Success.', 'deleted': deleted},
+                            status=status.HTTP_200_OK)
         except Exception as error:
             print(error)
             return Response(
@@ -331,6 +410,7 @@ class TransactionViewSet(ModelViewSet):
 
 class PartyOpeningBalanceViewSet(ModelViewSet):
 
+    permission_classes = [IsAuthenticated, HasAccountingAccess]
     serializer_class = PartyOpeningBalanceSerializer
     filter_backends = [SearchFilter, DjangoFilterBackend]
     filterset_fields = ['customer', 'supplier']
@@ -339,9 +419,7 @@ class PartyOpeningBalanceViewSet(ModelViewSet):
     def get_queryset(self):
         business = get_active_business(self.request)
         if not business:
-            return []
-        if not has_accounting_access(self.request, business):
-            return []
+            return PartyOpeningBalance.objects.none()
         return PartyOpeningBalance.objects.filter(
             business_id=business.id).order_by('-created_at')
 
@@ -413,6 +491,39 @@ class AccountingKPIViewSet(GenericViewSet):
         try:
             return Response(
                 {'payables': payables(business.id)},
+                status=status.HTTP_200_OK
+            )
+        except Exception as error:
+            print(error)
+            return Response(
+                {'detail': 'Internal Server Error.'},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
+    @action(['GET'], detail=False, url_path='opening-balances',
+            url_name='opening-balances')
+    def opening_balances(self, request):
+        """
+        Parties still carrying an unsettled opening balance, with what is left
+        on it. ?party=supplier (default) or ?party=customer.
+
+        Separate from payables/receivables on purpose: those are the whole
+        relationship including invoices, while an on-account payment settles
+        only the balance brought across from the paper khaata.
+        """
+        business, guard_error = self._guard(request)
+        if guard_error:
+            return guard_error
+
+        party = request.query_params.get('party', 'supplier')
+        if party not in ('customer', 'supplier'):
+            return Response({'detail': 'Bad Request.'},
+                            status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            return Response(
+                {'opening_balances': uncleared_opening_balances(
+                    business.id, party)},
                 status=status.HTTP_200_OK
             )
         except Exception as error:

@@ -3,8 +3,15 @@ from django.db.models import Q
 from rest_framework import serializers
 
 from core.serializers import SimpleUserSerializer
-from root.models import Customer, Supplier
+from root.models import Customer, Expense, Supplier
 from root.serializers import SimpleCustomerSerializer, SimpleSupplierSerializer
+# accounts -> sales only. accounts/utils.py and accounts/signals.py already
+# import sales, and nothing under sales/ imports accounts, so there is no
+# cycle. Adding a sales -> accounts import would break startup here first.
+from sales.models import (
+    PurchaseInvoice, PurchaseReceipt, SalesInvoice, SalesReceipt
+)
+from sales.utils import apply_money_details, invoice_room
 from .models import (
     MoneyAccount, PartyOpeningBalance, PartyPayment, Transaction
 )
@@ -140,6 +147,41 @@ class TransactionSerializer(serializers.ModelSerializer):
     created_by = SimpleUserSerializer(read_only=True)
     direction = serializers.CharField(read_only=True)
     is_source_linked = serializers.BooleanField(read_only=True)
+    source = serializers.SerializerMethodField()
+
+    def get_source(self, transaction):
+        """
+        What produced this row, for the locked banner on the update screen.
+        The three source FKs are bare ids on the wire, which cannot tell a
+        user which invoice they are looking at.
+        """
+        receipt = transaction.sales_receipt
+        if receipt is not None:
+            invoice = receipt.sales_invoice
+            return {
+                'kind': 'sales_invoice',
+                'id': invoice.id,
+                'label': invoice.invoice_number or str(invoice.id),
+            }
+
+        receipt = transaction.purchase_receipt
+        if receipt is not None:
+            invoice = receipt.purchase_invoice
+            return {
+                'kind': 'purchase_invoice',
+                'id': invoice.id,
+                'label': invoice.invoice_number or str(invoice.id),
+            }
+
+        expense = transaction.expense
+        if expense is not None:
+            return {
+                'kind': 'expense',
+                'id': expense.id,
+                'label': expense.name,
+            }
+
+        return None
 
     class Meta:
         model = Transaction
@@ -148,7 +190,7 @@ class TransactionSerializer(serializers.ModelSerializer):
             'transfer_account', 'payment_method', 'status', 'reference',
             'notes', 'image', 'cheque_number', 'cheque_due_date',
             'created_by', 'party_payment', 'direction', 'is_source_linked',
-            'sales_receipt', 'purchase_receipt', 'expense',
+            'sales_receipt', 'purchase_receipt', 'expense', 'source',
             'created_at', 'updated_at',
         ]
 
@@ -193,6 +235,23 @@ class BaseTransactionWriteSerializer(serializers.ModelSerializer):
                 business_id=business_id)
             self.fields['supplier'].queryset = Supplier.objects.filter(
                 business_id=business_id)
+
+            # Source pickers, present only on the create serializer. Scoped
+            # here so a foreign business's invoice is a 400, not a leak.
+            # Each model's own CANCELLED_STATUSES, never a literal: 'C' means
+            # COMPLETED on a sales invoice and CANCELLED on a purchase one.
+            if 'sales_invoice' in self.fields:
+                self.fields['sales_invoice'].queryset = (
+                    SalesInvoice.objects
+                    .filter(business_id=business_id)
+                    .exclude(status__in=SalesInvoice.CANCELLED_STATUSES)
+                )
+            if 'purchase_invoice' in self.fields:
+                self.fields['purchase_invoice'].queryset = (
+                    PurchaseInvoice.objects
+                    .filter(business_id=business_id)
+                    .exclude(status__in=PurchaseInvoice.CANCELLED_STATUSES)
+                )
 
     def validate(self, attrs):
         txn_type = attrs.get('type') or getattr(self.instance, 'type', None)
@@ -247,6 +306,41 @@ class BaseTransactionWriteSerializer(serializers.ModelSerializer):
 
 
 class TransactionCreateSerializer(BaseTransactionWriteSerializer):
+    """
+    Creates a transaction, and for the three source-backed types creates the
+    record that owns it instead.
+
+    A sale payment IS a receipt against an invoice; an expense IS a row on the
+    expenses ledger. Writing a bare Transaction for either leaves the books
+    disagreeing with themselves - an invoice-less sale payment is counted by
+    daily_summary but invisible to the party ledger, and an Expense-less
+    expense transaction is invisible to profit_estimate and to expense targets.
+    So those branches create the source and let the existing signal mint the
+    transaction, then patch the money details onto it.
+    """
+
+    # Source pickers. Write-only and not model fields; querysets are scoped in
+    # BaseTransactionWriteSerializer.__init__.
+    sales_invoice = serializers.PrimaryKeyRelatedField(
+        queryset=SalesInvoice.objects.none(), required=False,
+        allow_null=True, write_only=True)
+    purchase_invoice = serializers.PrimaryKeyRelatedField(
+        queryset=PurchaseInvoice.objects.none(), required=False,
+        allow_null=True, write_only=True)
+    expense_name = serializers.CharField(
+        max_length=256, required=False, allow_null=True,
+        allow_blank=True, write_only=True)
+    expense_category = serializers.ChoiceField(
+        choices=Expense.CATEGORY_CHOICES, required=False,
+        allow_null=True, allow_blank=True, write_only=True)
+
+    # Which type is backed by which source. The party types are absent on
+    # purpose: they are on-account money with no invoice behind them.
+    SOURCE_TYPES = {
+        'sale_payment': 'sales_invoice',
+        'purchase_payment': 'purchase_invoice',
+        'expense': 'expense_name',
+    }
 
     class Meta:
         model = Transaction
@@ -254,40 +348,189 @@ class TransactionCreateSerializer(BaseTransactionWriteSerializer):
             'type', 'amount', 'date', 'account', 'transfer_account',
             'payment_method', 'status', 'reference', 'notes', 'image',
             'cheque_number', 'cheque_due_date', 'customer', 'supplier',
+            'sales_invoice', 'purchase_invoice',
+            'expense_name', 'expense_category',
         ]
 
-    def save(self, **kwargs):
-        validated_data = dict(self.validated_data)
-        customer = validated_data.pop('customer', None)
-        supplier = validated_data.pop('supplier', None)
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+
+        txn_type = attrs.get('type')
+        amount = float(attrs.get('amount') or 0)
+
+        # A sale or purchase payment settles an invoice, so it must name one.
+        # Without this the screen can manufacture revenue that no customer is
+        # ever credited for: daily_summary counts it, party_ledger does not.
+        # On-account money belongs to customer_receipt / supplier_payment.
+        if txn_type == 'sale_payment' and not attrs.get('sales_invoice'):
+            raise serializers.ValidationError({
+                'sales_invoice':
+                    'A sale payment settles an invoice, so it must name one. '
+                    'For money on account, use Customer Payment.'
+            })
+
+        if txn_type == 'purchase_payment' and not attrs.get('purchase_invoice'):
+            raise serializers.ValidationError({
+                'purchase_invoice':
+                    'A purchase payment settles an invoice, so it must name '
+                    'one. For money on account, use Supplier Payment.'
+            })
+
+        if txn_type == 'expense' and not (attrs.get('expense_name') or '').strip():
+            raise serializers.ValidationError({
+                'expense_name': 'An expense needs a name.'
+            })
+
+        # Same room rule the payments dialog uses, from the same helper, so the
+        # two screens can never disagree about what an invoice can still take.
+        invoice = attrs.get('sales_invoice') or attrs.get('purchase_invoice')
+        if invoice is not None and amount > invoice_room(invoice):
+            raise serializers.ValidationError({
+                'amount': 'accumulated amount cannot exceed invoice total'
+            })
+
+        return attrs
+
+    def create(self, validated_data):
+        """
+        create(), not save().
+
+        This used to override save() and wrap the whole write in
+        `except Exception: print(error); return None`. Two things followed from
+        that, and together they were a silent data-loss bug:
+
+        1. Overriding save() meant self.instance was never assigned, because it
+           is ModelSerializer.save() that does `self.instance = self.create(...)`.
+        2. With self.instance still None and no errors recorded, DRF's
+           Serializer.data falls back to to_representation(self.validated_data)
+           - it renders the SUBMITTED PAYLOAD back. CreateModelMixin then
+           answered 201 Created for a write that never happened.
+
+        So any failure at all - an unwritable MEDIA_ROOT on the image, a
+        constraint, anything - was reported to the user as success. Letting the
+        exception propagate is the fix; DRF turns it into a 500, and a 500 is
+        the truth.
+        """
+        data = dict(validated_data)
+        sales_invoice = data.pop('sales_invoice', None)
+        purchase_invoice = data.pop('purchase_invoice', None)
+        expense_name = (data.pop('expense_name', None) or '').strip()
+        expense_category = data.pop('expense_category', None) or None
+
+        txn_type = data.get('type')
+
+        # Exactly one branch runs, and every branch returns a Transaction.
+        # Writing both a plain transaction and a source record would double
+        # every figure it touches - balance(), money_in, daily_summary.
+        with db_transaction.atomic():
+            if txn_type == 'sale_payment' and sales_invoice is not None:
+                return self._via_receipt(
+                    SalesReceipt, {'sales_invoice': sales_invoice}, data)
+
+            if txn_type == 'purchase_payment' and purchase_invoice is not None:
+                return self._via_receipt(
+                    PurchaseReceipt,
+                    {'purchase_invoice': purchase_invoice}, data)
+
+            if txn_type == 'expense' and expense_name:
+                return self._via_expense(expense_name, expense_category, data)
+
+            return self._plain(data)
+
+    # ── branches ─────────────────────────────────────────────────────────────
+
+    def _money_details(self, data):
+        """
+        What the signal does not know: which account the money actually moved
+        through, how, when, and the photo of the slip.
+
+        status is deliberately absent. The signal defaults it to cleared, and
+        apply_money_details flips it to PEN for a cheque - letting this pass a
+        status too would give one field two owners.
+
+        amount is absent for the same reason: the signal takes it from the
+        source record, so writing it here could let the two drift apart.
+        """
+        details = {
+            'account_id': data['account'].id,
+            'payment_method': data.get('payment_method') or 'cash',
+            'created_by_id': self.context.get('user_id'),
+        }
+        for field in ('date', 'cheque_number', 'cheque_due_date',
+                      'reference', 'image'):
+            value = data.get(field)
+            if value:
+                details[field] = value
+        return details
+
+    def _via_receipt(self, model, link, data):
+        """
+        The money is a payment against an invoice, so record the payment and
+        let the existing signal mirror it. This is the same path the invoice
+        screen uses, which is the point: the invoice's paid amount and status
+        move, and the party ledger sees it.
+        """
+        receipt = model.objects.create(
+            amount=data.get('amount') or 0,
+            # The signal copies desc onto the transaction's notes, so notes
+            # travel as the receipt's desc rather than as a later patch -
+            # otherwise the payments dialog row would render blank.
+            desc=data.get('notes'),
+            **link
+        )
+        # refresh_from_db so transaction_record is resolved after the signal.
+        receipt.refresh_from_db()
+        return apply_money_details(receipt, self._money_details(data))
+
+    def _via_expense(self, name, category, data):
+        """
+        An expense transaction with no Expense row is invisible to
+        profit_estimate and to every expense target, while still being counted
+        by the day book. Minting the Expense keeps the two in step.
+        """
+        expense = Expense.objects.create(
+            business_id=self.context['business_id'],
+            name=name,
+            category=category,
+            desc=data.get('notes'),
+            amount=data.get('amount') or 0,
+        )
+        expense.refresh_from_db()
+        return apply_money_details(expense, self._money_details(data))
+
+    def _plain(self, data):
+        """
+        Everything with no source record behind it: the party types, transfers,
+        adjustments, capital, loans, salaries, drawings, other income/payment.
+        """
+        customer = data.pop('customer', None)
+        supplier = data.pop('supplier', None)
 
         # A cheque is pending until it clears, so it stays financially inert.
-        if validated_data.get('payment_method') == 'cheque' \
-                and not validated_data.get('status'):
-            validated_data['status'] = 'PEN'
+        if data.get('payment_method') == 'cheque' and not data.get('status'):
+            data['status'] = 'PEN'
 
         business_id = self.context['business_id']
 
-        try:
-            with db_transaction.atomic():
-                instance = Transaction.objects.create(
-                    business_id=business_id,
-                    created_by_id=self.context.get('user_id'),
-                    **validated_data
-                )
+        instance = Transaction.objects.create(
+            business_id=business_id,
+            created_by_id=self.context.get('user_id'),
+            **data
+        )
 
-                if (customer or supplier) \
-                        and instance.type in Transaction.PARTY_TYPES:
-                    PartyPayment.objects.create(
-                        business_id=business_id,
-                        customer=customer,
-                        supplier=supplier,
-                        transaction=instance,
-                    )
-            return instance
-        except Exception as error:
-            print(error)
-            return None
+        # Only PARTY_TYPES get a PartyPayment. sale_payment and
+        # purchase_payment must NEVER be added to that list: customer_balance
+        # sums invoice receipts and on-account payments independently, so a row
+        # in both would credit the party twice for the same money.
+        if (customer or supplier) and instance.type in Transaction.PARTY_TYPES:
+            PartyPayment.objects.create(
+                business_id=business_id,
+                customer=customer,
+                supplier=supplier,
+                transaction=instance,
+            )
+
+        return instance
 
 
 class TransactionUpdateSerializer(BaseTransactionWriteSerializer):
@@ -309,7 +552,12 @@ class TransactionUpdateSerializer(BaseTransactionWriteSerializer):
             setattr(instance, attr, value)
         instance.save()
 
-        if (customer or supplier) and instance.type in Transaction.PARTY_TYPES:
+        if instance.type not in Transaction.PARTY_TYPES:
+            # Changing to a type that names no party used to leave the old
+            # PartyPayment behind, because the branch below only ever ran when
+            # a party was supplied - there was no way to clear one.
+            PartyPayment.objects.filter(transaction=instance).delete()
+        elif customer or supplier:
             PartyPayment.objects.update_or_create(
                 transaction=instance,
                 defaults={

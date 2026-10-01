@@ -13,19 +13,12 @@ from root.serializers import (
 from inventory.models import InventoryItem
 from .models import PurchaseInvoice, PurchaseInvoiceItem, PurchaseQuotation, PurchaseQuotationItem, PurchaseReceipt, SalesInvoice, SalesInvoiceItem, ReturnedItem, SalesReceipt
 from .utils import (
+    apply_money_details,
     checkPurchaseInvoiceItemFields,
     checkPurchaseInvoiceCreateFields,
     checkSalesInvoiceItemCreateFields,
+    invoice_room,
     updateInventoryOnSale
-)
-
-
-# A payment holds its share of the invoice while it is cleared or still
-# pending. A bounced one never arrives, so it frees its share up again.
-# Receipts with no transaction behind them predate the accounting module.
-LIVE_RECEIPT = (
-    Q(transaction_record__isnull=True) |
-    Q(transaction_record__status__in=['C', 'PEN'])
 )
 
 
@@ -91,23 +84,9 @@ class PaymentReceiptCreateSerializer(PaymentReceiptSerializer):
         return details
 
     def apply_money_details(self, receipt, money_details):
-        if not money_details:
-            return receipt
-
-        try:
-            transaction = receipt.transaction_record
-        except Exception as error:
-            print(error)
-            return receipt
-
-        # A cheque stays pending until it clears, so it moves no money yet.
-        if money_details.get('payment_method') == 'cheque':
-            money_details['status'] = 'PEN'
-
-        for attr, value in money_details.items():
-            setattr(transaction, attr, value)
-        transaction.save(update_fields=list(money_details.keys()))
-
+        # Delegates to the shared helper so the transaction dispatcher in
+        # accounts/ patches a mirrored transaction exactly the way this does.
+        apply_money_details(receipt, money_details)
         return receipt
 
 
@@ -218,6 +197,7 @@ class SimplePurchaseInvoiceSerializer(serializers.ModelSerializer):
 
     supplier = SimpleSupplierSerializer(read_only=True, required=False)
     total_items = serializers.SerializerMethodField()
+    amount_paid = serializers.SerializerMethodField()
     projects = ProjectPurchaseInvoiceLinker(many=True)
 
     def get_total_items(self, obj):
@@ -228,13 +208,20 @@ class SimplePurchaseInvoiceSerializer(serializers.ModelSerializer):
         if type(obj) == ProjectPurchaseInvoice:
             return obj.purchase_invoice.invoice_items.count()
 
+    def get_amount_paid(self, obj):
+        # transformPurchaseInvoice in the client already reads amount_paid;
+        # this serializer had never sent it.
+        if type(obj) == ProjectPurchaseInvoice:
+            return obj.purchase_invoice.amount_paid
+        return obj.amount_paid
+
     class Meta:
         model = PurchaseInvoice
         fields = [
             'id', 'invoice_number', 'supplier',
             'date_issued', 'created_at', 'date_due', 'status',
             'payment_status', 'sub_total', 'tax', 'total',
-            'delivery', 'total_items', 'projects'
+            'amount_paid', 'delivery', 'total_items', 'projects'
         ]
 
 
@@ -333,8 +320,10 @@ class PurchaseInvoiceAndItemsCreateSerializer(serializers.ModelSerializer):
             return purchase_invoice
 
         except Exception as error:
+            # Re-raised, not swallowed: returning None here turned a
+            # failed write into a misleading 400 at the view.
             print(error)
-            return None
+            raise
 
     class Meta:
         model = PurchaseInvoice
@@ -435,8 +424,10 @@ class PurchaseInvoiceAndItemsUpdateSerializer(serializers.ModelSerializer):
             return self.instance
 
         except Exception as error:
+            # Re-raised, not swallowed: returning None here turned a
+            # failed write into a misleading 400 at the view.
             print(error)
-            return None
+            raise
 
     class Meta:
         model = PurchaseInvoice
@@ -459,24 +450,32 @@ class PurchaseInvoiceAndItemsUpdateSerializer(serializers.ModelSerializer):
 class PurchaseReceiptCreateSerializer(PaymentReceiptCreateSerializer):
 
     def is_valid(self, *, raise_exception=False):
+        # Let the field validation run first. The old version read
+        # self.initial_data["amount"] before this, so a missing amount was a
+        # KeyError and a non-numeric one a ValueError - both 500s where a 400
+        # belonged. It also raised regardless of raise_exception, breaking
+        # DRF's contract.
+        valid = super().is_valid(raise_exception=raise_exception)
+        if not valid:
+            return valid
+
         purchase_invoice = PurchaseInvoice.objects.get(
             id=self.context["purchase_invoice_id"]
         )
-
         # A pending cheque still occupies its share of the invoice; a bounced
         # one does not, so its amount can be paid again.
-        total_paid = (
-            purchase_invoice.payment_receipts
-            .filter(LIVE_RECEIPT)
-            .aggregate(total=Sum("amount"))["total"] or 0
-        )
+        room = invoice_room(purchase_invoice)
 
-        if float(self.initial_data["amount"]) + total_paid > purchase_invoice.total:
-            raise serializers.ValidationError({
+        if float(self.validated_data.get("amount") or 0) > room:
+            error = serializers.ValidationError({
                 "amount": "accumulated amount cannot exceed invoice total"
             })
+            if raise_exception:
+                raise error
+            self._errors.update(error.detail)
+            return False
 
-        return super().is_valid(raise_exception=raise_exception)
+        return True
 
     def save(self, **kwargs):
         money_details = self.pop_money_details()
@@ -589,6 +588,7 @@ class SimpleSalesInvoiceSerializer(serializers.ModelSerializer):
 
     customer = SimpleCustomerSerializer(read_only=True)
     total_items = serializers.SerializerMethodField()
+    amount_paid = serializers.SerializerMethodField()
     projects = ProjectSalesInvoiceLinker(many=True)
 
     def get_total_items(self, obj):
@@ -599,11 +599,21 @@ class SimpleSalesInvoiceSerializer(serializers.ModelSerializer):
         if type(obj) == ProjectSalesInvoice:
             return obj.sales_invoice.invoice_items.count()
 
+    def get_amount_paid(self, obj):
+        # payment_status was already here but the figure behind it was not, so
+        # a list row could say PARTIALLY_PAID without saying how much. The view
+        # prefetches payment_receipts__transaction_record, so the property's
+        # loop costs no extra queries.
+        if type(obj) == ProjectSalesInvoice:
+            return obj.sales_invoice.amount_paid
+        return obj.amount_paid
+
     class Meta:
         model = SalesInvoice
         fields = [
             'id', 'invoice_number', 'customer', 'date_issued', 'date_due',
-            'payment_status', 'status', 'sub_total', 'tax', 'discount', 'total', 'total_items', 'projects'
+            'payment_status', 'status', 'sub_total', 'tax', 'discount', 'total',
+            'amount_paid', 'total_items', 'projects'
         ]
 
 
@@ -776,8 +786,10 @@ class SalesInvoiceAndItemsCreateSerializer(serializers.ModelSerializer):
             return sales_invoice
 
         except Exception as error:
+            # Re-raised, not swallowed: returning None here turned a
+            # failed write into a misleading 400 at the view.
             print(error)
-            return None
+            raise
 
     class Meta:
         model = SalesInvoice
@@ -885,8 +897,10 @@ class SalesInvoiceAndItemsUpdateSerializer(serializers.ModelSerializer):
                 return self.instance
 
         except Exception as error:
+            # Re-raised, not swallowed: returning None here turned a
+            # failed write into a misleading 400 at the view.
             print(error)
-            return None
+            raise
 
     class Meta:
         model = SalesInvoice
@@ -908,24 +922,29 @@ class SalesInvoiceAndItemsUpdateSerializer(serializers.ModelSerializer):
 class SalesReceiptCreateSerializer(PaymentReceiptCreateSerializer):
 
     def is_valid(self, *, raise_exception=False):
+        # See PurchaseReceiptCreateSerializer.is_valid for why field validation
+        # now runs first.
+        valid = super().is_valid(raise_exception=raise_exception)
+        if not valid:
+            return valid
+
         sales_invoice = SalesInvoice.objects.get(
             id=self.context["sales_invoice_id"]
         )
-
         # A pending cheque still occupies its share of the invoice; a bounced
         # one does not, so its amount can be paid again.
-        total_recorded = (
-            sales_invoice.payment_receipts
-            .filter(LIVE_RECEIPT)
-            .aggregate(total=Sum("amount"))["total"] or 0
-        )
+        room = invoice_room(sales_invoice)
 
-        if float(self.initial_data["amount"]) + total_recorded > sales_invoice.total:
-            raise serializers.ValidationError({
+        if float(self.validated_data.get("amount") or 0) > room:
+            error = serializers.ValidationError({
                 "amount": "accumulated amount cannot exceed invoice total"
             })
+            if raise_exception:
+                raise error
+            self._errors.update(error.detail)
+            return False
 
-        return super().is_valid(raise_exception=raise_exception)
+        return True
 
     def save(self, **kwargs):
         money_details = self.pop_money_details()
@@ -1179,8 +1198,10 @@ class PurchaseQuotationAndItemsUpdateSerializer(serializers.ModelSerializer):
                 return self.instance
 
         except Exception as error:
+            # Re-raised, not swallowed: returning None here turned a
+            # failed write into a misleading 400 at the view.
             print(error)
-            return None
+            raise
 
     class Meta:
         model = PurchaseQuotation
