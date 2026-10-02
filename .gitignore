@@ -75,3 +75,4 @@ Thumbs.db
 *.pid.lock
 docker-compose.override.yml
 .env
+.env.example
