@@ -1,4 +1,5 @@
 from django.db import transaction as db_transaction
+from django.db.models import Q
 from django.utils import timezone
 from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework import status
@@ -12,18 +13,23 @@ from root.models import Customer, Expense, Supplier
 from root.utils import get_active_business, whatsapp_number
 from sales.models import PurchaseReceipt, SalesReceipt
 from .models import MoneyAccount, PartyOpeningBalance, Transaction
+from .payments import (
+    record_party_payment, resolve_party,
+    settleable_items as party_settleable_items,
+)
 from .permissions import HasAccountingAccess
 from .serializers import (
     MoneyAccountCreateSerializer, MoneyAccountSerializer,
     MoneyAccountUpdateSerializer, PartyOpeningBalanceSerializer,
-    SimpleMoneyAccountSerializer, SimpleTransactionSerializer,
-    TransactionCreateSerializer, TransactionSerializer,
-    TransactionUpdateSerializer,
+    RecordPartyPaymentSerializer, SimpleMoneyAccountSerializer,
+    SimpleTransactionSerializer, TransactionCreateSerializer,
+    TransactionSerializer, TransactionUpdateSerializer,
 )
 from .utils import (
-    daily_summary, day_book, has_accounting_access, month_bounds, parse_date,
-    party_ledger, payables, previous_month_bounds, profit_estimate,
-    receivables, uncleared_opening_balances,
+    daily_summary, day_book, has_accounting_access, month_bounds,
+    opening_balance_remaining, parse_date, party_ledger, payables,
+    previous_month_bounds, profit_estimate, receivables,
+    uncleared_opening_balances,
 )
 
 
@@ -216,9 +222,15 @@ class TransactionViewSet(ModelViewSet):
             # none(), never []: DjangoFilterBackend reads queryset.model, and a
             # list has none, which turned every no-access retrieve into a 500.
             return Transaction.objects.none()
+        # Explicitly ordered. Without an order_by the database is free to
+        # return rows in any order it likes, which is what made the list jump
+        # around. `date` is the day the money moved and is backdatable, so it
+        # leads; `created_at` is a DateTimeField with microsecond precision, so
+        # it breaks same-day ties by the order things were actually entered.
         return Transaction.objects.filter(
             business_id=business.id
-        ).select_related('account', 'transfer_account')
+        ).select_related('account', 'transfer_account').order_by(
+            '-date', '-created_at', '-id')
 
     def get_serializer_class(self):
         method = self.request.method
@@ -270,32 +282,105 @@ class TransactionViewSet(ModelViewSet):
             status=status.HTTP_201_CREATED,
         )
 
-    def destroy(self, request, *args, **kwargs):
+    @action(['POST'], detail=False, url_path='record-payment',
+            url_name='record-payment')
+    def record_payment(self, request):
+        """
+        One amount, several ticked items, one atomic write.
+
+        Lives here rather than on CustomerViewSet because recording a payment
+        is accounting: this viewset already carries HasAccountingAccess, while
+        the party viewsets are gated on the customers/suppliers module, which
+        is the wrong permission for moving money.
+
+        Responds with the list of transactions actually written. A response
+        body that is not the written rows is exactly how the phantom 201 used
+        to hide.
+        """
+        business = get_active_business(request)
+        if not business:
+            return Response(NO_BUSINESS, status=status.HTTP_400_BAD_REQUEST)
+
+        context = self.get_serializer_context()
+        serializer = RecordPartyPaymentSerializer(
+            data=request.data, context=context)
+        serializer.is_valid(raise_exception=True)
+
+        created = record_party_payment(
+            business_id=business.id,
+            user_id=request.user.id,
+            party=serializer.validated_data['party'],
+            party_id=serializer.validated_data['party_id'],
+            amount=serializer.validated_data['amount'],
+            item_ids=serializer.validated_data['items'],
+            money_details=serializer.money_details(),
+            context=context,
+            order=serializer.validated_data['order'],
+        )
+
+        return Response(
+            TransactionSerializer(created, many=True, context=context).data,
+            status=status.HTTP_201_CREATED,
+        )
+
+    @staticmethod
+    def _with_payment_group(transactions, business_id):
+        """
+        Widen a selection to every sibling in the same payment_group.
+
+        A payment allocated across several items is ONE payment that happens
+        to be stored as several transactions. Deleting or clearing one of them
+        on its own would leave the rest as a half-recorded payment, which is
+        not a state the books should be able to reach.
+        """
+        groups = {txn.payment_group
+                  for txn in transactions if txn.payment_group}
+        ids = [txn.id for txn in transactions]
+
+        if not groups:
+            return transactions
+
+        return (
+            Transaction.objects
+            .filter(Q(id__in=ids) | Q(payment_group__in=groups),
+                    business_id=business_id)
+            .select_related('sales_receipt', 'purchase_receipt', 'expense')
+        )
+
+    @staticmethod
+    def _delete_with_sources(transactions):
         """
         Deleting a source-backed transaction deletes the record that owns it.
 
+        Deleting the receipt is the correct accounting outcome: an invoice's
+        paid amount and payment status derive from its receipts, so removing
+        one frees that share of the invoice again. The transaction goes with it
+        through the FK's CASCADE.
+        """
+        for txn in transactions:
+            source = (txn.sales_receipt
+                      or txn.purchase_receipt
+                      or txn.expense)
+            if source is not None:
+                source.delete()
+            else:
+                txn.delete()
+
+    def destroy(self, request, *args, **kwargs):
+        """
         This used to refuse with "delete the source payment or expense
         instead", which made sense when source-linked only meant "recorded on
         the invoice screen". A sale payment, purchase payment or expense can
         now be recorded here too, so refusing left the user unable to remove a
         row from the screen that created it.
-
-        Deleting the receipt is also the correct accounting outcome: the
-        invoice's paid amount and payment status derive from its receipts, so
-        removing one frees that share of the invoice again. The transaction
-        goes with it through the FK's CASCADE.
         """
         try:
             instance = self.get_object()
-            source = (instance.sales_receipt
-                      or instance.purchase_receipt
-                      or instance.expense)
+            members = self._with_payment_group(
+                [instance], instance.business_id)
 
             with db_transaction.atomic():
-                if source is not None:
-                    source.delete()
-                else:
-                    instance.delete()
+                self._delete_with_sources(members)
 
             return Response({'detail': 'Success.'}, status=status.HTTP_200_OK)
         except Exception as error:
@@ -314,7 +399,9 @@ class TransactionViewSet(ModelViewSet):
             return Response(NO_ACCESS, status=status.HTTP_403_FORBIDDEN)
 
         try:
-            cheques = Transaction.objects.pending_cheques(business.id)
+            # Grouped: one row per physical cheque, so an allocated payment
+            # is cleared once rather than once per item it settled.
+            cheques = Transaction.objects.pending_cheques_grouped(business.id)
             serializer = SimpleTransactionSerializer(cheques, many=True)
             return Response(serializer.data, status=status.HTTP_200_OK)
         except Exception as error:
@@ -333,6 +420,20 @@ class TransactionViewSet(ModelViewSet):
         return self._set_status(request, 'B')
 
     def _set_status(self, request, new_status):
+        """
+        Clearing or bouncing applies to the CHEQUE, not to one transaction.
+
+        A cheque allocated across several items is stored as one transaction
+        per item, all sharing a payment_group. The user clears the physical
+        cheque, so every leg of it moves together - otherwise two of three
+        invoices would show paid from a single cheque, which is not a real
+        state.
+
+        Nothing downstream needs unwinding, because no figure is stored:
+        amount_paid skips receipts whose transaction is not 'C',
+        on_account_totals filters status='C', and LIVE_RECEIPT excludes 'B'.
+        So clearing settles every item at once and a bounce releases them all.
+        """
         business = get_active_business(request)
         if not business:
             return Response(NO_BUSINESS, status=status.HTTP_400_BAD_REQUEST)
@@ -341,10 +442,40 @@ class TransactionViewSet(ModelViewSet):
 
         try:
             instance = self.get_object()
-            instance.status = new_status
-            instance.save(update_fields=['status'])
+
+            # BUG-014: this used to write the status with no checks at all, so
+            # a cash expense could be "bounced" and have its money silently
+            # returned to the account, on a row that pending_cheques does not
+            # even list. Only a cheque clears or bounces, and only a pending
+            # cheque clears.
+            if instance.payment_method != 'cheque':
+                return Response(
+                    {'detail': 'Only a cheque can be cleared or bounced.'},
+                    status=status.HTTP_400_BAD_REQUEST)
+
+            if instance.status == new_status:
+                return Response(
+                    {'detail': f'This cheque is already {new_status}.'},
+                    status=status.HTTP_400_BAD_REQUEST)
+
+            if new_status == 'C' and instance.status != 'PEN':
+                return Response(
+                    {'detail': 'Only a pending cheque can be cleared.'},
+                    status=status.HTTP_400_BAD_REQUEST)
+
+            with db_transaction.atomic():
+                if instance.payment_group:
+                    updated = Transaction.objects.filter(
+                        payment_group=instance.payment_group,
+                        business_id=business.id,
+                    ).update(status=new_status)
+                else:
+                    instance.status = new_status
+                    instance.save(update_fields=['status'])
+                    updated = 1
+
             return Response(
-                {'detail': 'OK', 'status': instance.status},
+                {'detail': 'OK', 'status': new_status, 'updated': updated},
                 status=status.HTTP_200_OK
             )
         except Exception as error:
@@ -372,9 +503,12 @@ class TransactionViewSet(ModelViewSet):
             # "Success", so selecting a sale payment or an expense deleted
             # nothing while the UI reported it had worked. Each one now takes
             # its owning record with it, exactly as destroy() does.
-            transactions = Transaction.objects.filter(
+            selected = Transaction.objects.filter(
                 id__in=transaction_ids, business_id=business.id
-            ).only('id', 'sales_receipt_id', 'purchase_receipt_id', 'expense_id')
+            ).select_related('sales_receipt', 'purchase_receipt', 'expense')
+
+            # Selecting one leg of an allocated payment removes all of it.
+            transactions = self._with_payment_group(selected, business.id)
 
             plain, receipts, purchases, expenses = [], [], [], []
             for txn in transactions:
@@ -526,6 +660,61 @@ class AccountingKPIViewSet(GenericViewSet):
                     business.id, party)},
                 status=status.HTTP_200_OK
             )
+        except Exception as error:
+            print(error)
+            return Response(
+                {'detail': 'Internal Server Error.'},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
+    @action(['GET'], detail=False, url_path='settleable-items',
+            url_name='settleable-items')
+    def settleable_items(self, request):
+        """
+        Everything one party's money could settle, oldest first:
+        their uncleared opening balance, then every invoice with room left.
+        ?customer_id= or ?supplier_id=.
+
+        `room` here is authoritative - it comes from the same invoice_room()
+        the write path validates against, so the dialog can never offer more
+        than the server will accept. The client must not compute it: the
+        frontend's own `invoicePending` subtracts amount_paid, which excludes
+        pending cheques, and would offer money the server then refuses.
+        """
+        business, guard_error = self._guard(request)
+        if guard_error:
+            return guard_error
+
+        party, party_id = resolve_party(
+            business.id,
+            customer_id=request.query_params.get('customer_id'),
+            supplier_id=request.query_params.get('supplier_id'),
+        )
+        if not party:
+            return Response({'detail': 'Not Found'},
+                            status=status.HTTP_404_NOT_FOUND)
+
+        try:
+            opening, settled, remaining = opening_balance_remaining(
+                business.id, party, party_id)
+
+            # as_of_date rides along: the party page needs the STORED date, not
+            # today. Without it the form fell back to today's date, so the card
+            # misreported when the balance was taken and re-saving silently
+            # moved it forward.
+            row = PartyOpeningBalance.objects.filter(
+                business_id=business.id, **{f'{party}_id': party_id}).first()
+
+            return Response({
+                'items': party_settleable_items(business.id, party, party_id),
+                'opening_balance': {
+                    'id': row.id if row else None,
+                    'amount': opening,
+                    'settled': settled,
+                    'remaining': remaining,
+                    'as_of_date': row.as_of_date.isoformat() if row else None,
+                },
+            }, status=status.HTTP_200_OK)
         except Exception as error:
             print(error)
             return Response(

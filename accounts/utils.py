@@ -21,6 +21,13 @@ CLEARED_RECEIPT = (
     Q(transaction_record__isnull=True) | Q(transaction_record__status='C')
 )
 
+# The two questions on-account money gets asked. CLEARED_ONLY is what a party
+# owes; LIVE_ON_ACCOUNT is what a payment picker may still offer, and counts
+# pending cheques because they have already claimed that money. Mirrors
+# CLEARED_RECEIPT vs sales.utils.LIVE_RECEIPT on the invoice side.
+CLEARED_ONLY = ('C',)
+LIVE_ON_ACCOUNT = ('C', 'PEN')
+
 # On-account money and which way it moves a party's balance. A payment settles
 # what they owe; a refund is money going back out, so it puts the debt back on.
 PARTY_ON_ACCOUNT = {
@@ -35,14 +42,24 @@ PARTY_ON_ACCOUNT = {
 }
 
 
-def on_account_totals(business_id, party_filter, kinds):
+def on_account_totals(business_id, party_filter, kinds, statuses=CLEARED_ONLY):
     """
-    Cleared on-account money for one party, split into what settles their
-    balance and what puts it back on.
+    On-account money for one party, split into what settles their balance and
+    what puts it back on.
+
+    `statuses` answers one of two different questions, and they need different
+    answers - exactly as amount_paid and invoice_room differ on the invoice
+    side:
+
+      CLEARED_ONLY   what the party actually owes. A pending cheque has paid
+                     nothing yet, so it must not reduce a balance.
+      LIVE_ON_ACCOUNT what more can still be allocated. A pending cheque has
+                     already claimed that money, so offering it again in a
+                     payment picker invites settling the same debt twice.
     """
     rows = (
         PartyPayment.objects
-        .filter(business_id=business_id, transaction__status='C',
+        .filter(business_id=business_id, transaction__status__in=statuses,
                 transaction__type__in=[kinds['payment'], kinds['refund']],
                 **party_filter)
         .values('transaction__type')
@@ -283,6 +300,43 @@ def payables(business_id):
     return {'total': total, 'parties': rows}
 
 
+def opening_balance_remaining(business_id, party, party_id, opening=None,
+                              include_pending=False):
+    """
+    What is still unsettled on ONE party's opening balance.
+
+    Returns (opening_balance, settled, remaining); remaining is never negative,
+    and a party with no opening balance is (0, 0, 0).
+
+    include_pending=True counts money held by a pending cheque as already
+    spoken for, which is what a payment picker must use - otherwise a cheque
+    for the whole opening balance leaves it still on offer, and clearing the
+    cheque after a second payment settles the same debt twice. Leave it False
+    for anything that reports what the party owes.
+
+    uncleared_opening_balances below calls this, and so does settleable_items,
+    so the party page and the dialog can never disagree. Pass `opening` when
+    the row is already in hand to save a query.
+    """
+    if opening is None:
+        opening = (
+            PartyOpeningBalance.objects
+            .filter(business_id=business_id, **{f'{party}_id': party_id})
+            .first()
+        )
+
+    if opening is None:
+        return 0, 0, 0
+
+    settled, _ = on_account_totals(
+        business_id, {f'{party}_id': party_id}, PARTY_ON_ACCOUNT[party],
+        statuses=LIVE_ON_ACCOUNT if include_pending else CLEARED_ONLY,
+    )
+
+    opening_amount = opening.amount or 0
+    return opening_amount, round(settled), max(round(opening_amount - settled), 0)
+
+
 def uncleared_opening_balances(business_id, party):
     """
     Parties whose pre-MarketPro opening balance has not been settled yet, with
@@ -298,7 +352,6 @@ def uncleared_opening_balances(business_id, party):
 
     party is 'customer' or 'supplier'.
     """
-    kinds = PARTY_ON_ACCOUNT[party]
     rows = []
     total = 0
 
@@ -311,10 +364,15 @@ def uncleared_opening_balances(business_id, party):
 
     for opening in openings:
         who = getattr(opening, party)
-        settled, _ = on_account_totals(
-            business_id, {f'{party}_id': who.id}, kinds)
 
-        remaining = round((opening.amount or 0) - settled)
+        # This is a payment PICKER, so `balance` is what can still be
+        # allocated, not what is still owed. A pending cheque has claimed its
+        # share already; offering it again would settle the same debt twice.
+        opening_amount, settled, owed = opening_balance_remaining(
+            business_id, party, who.id, opening=opening)
+        _, claimed, remaining = opening_balance_remaining(
+            business_id, party, who.id, opening=opening, include_pending=True)
+
         if remaining <= 0:
             continue
 
@@ -324,8 +382,10 @@ def uncleared_opening_balances(business_id, party):
             'name': who.name,
             'business_name': getattr(who, 'business_name', None),
             'phone': who.phone,
-            'opening_balance': opening.amount,
-            'settled': round(settled),
+            'opening_balance': opening_amount,
+            'settled': settled,
+            'owed': owed,
+            'reserved': max(claimed - settled, 0),
             'balance': remaining,
         })
 
@@ -349,6 +409,7 @@ def party_ledger(business_id, customer=None, supplier=None,
     if opening:
         rows.append({
             'date': opening.as_of_date.isoformat(),
+            '_seq': '',
             'description': 'Opening balance',
             'reference': None,
             'naam': opening.amount if opening.amount > 0 else 0,
@@ -365,6 +426,7 @@ def party_ledger(business_id, customer=None, supplier=None,
             rows.append({
                 'date': local_date(invoice.date_issued).isoformat()
                 if invoice.date_issued else None,
+                '_seq': invoice.created_at.isoformat(),
                 'description': 'Sales invoice',
                 'reference': invoice.invoice_number or str(invoice.id),
                 'naam': round(invoice.total or 0),
@@ -379,6 +441,7 @@ def party_ledger(business_id, customer=None, supplier=None,
         for receipt in receipts:
             rows.append({
                 'date': receipt_date(receipt).isoformat(),
+                '_seq': receipt.created_at.isoformat(),
                 'description': 'Payment received',
                 'reference': receipt.sales_invoice.invoice_number
                 or str(receipt.sales_invoice_id),
@@ -400,6 +463,7 @@ def party_ledger(business_id, customer=None, supplier=None,
                 # disagree about which period an invoice belongs to.
                 'date': local_date(invoice.date_issued).isoformat()
                 if invoice.date_issued else None,
+                '_seq': invoice.created_at.isoformat(),
                 'description': 'Purchase invoice',
                 'reference': invoice.invoice_number or str(invoice.id),
                 'naam': round(invoice.total or 0),
@@ -414,6 +478,7 @@ def party_ledger(business_id, customer=None, supplier=None,
         for receipt in receipts:
             rows.append({
                 'date': receipt_date(receipt).isoformat(),
+                '_seq': receipt.created_at.isoformat(),
                 'description': 'Payment made',
                 'reference': receipt.purchase_invoice.invoice_number
                 or str(receipt.purchase_invoice_id),
@@ -439,6 +504,7 @@ def party_ledger(business_id, customer=None, supplier=None,
         is_refund = payment.transaction.type == kinds['refund']
         rows.append({
             'date': payment.transaction.date.isoformat(),
+            '_seq': payment.created_at.isoformat(),
             'description': 'Refund' if is_refund else 'On-account payment',
             'reference': payment.transaction.reference,
             'naam': payment.transaction.amount if is_refund else 0,
@@ -446,7 +512,9 @@ def party_ledger(business_id, customer=None, supplier=None,
         })
 
     rows = [row for row in rows if row['date']]
-    rows.sort(key=lambda row: row['date'])
+    rows.sort(key=lambda row: (row['date'], row['_seq']))
+    for row in rows:
+        del row['_seq']
 
     # Everything before the range is carried in as one figure, so a ranged
     # statement still starts from the party's real position.
@@ -658,11 +726,25 @@ def profit_estimate(business_id, date_from, date_to):
     cogs = sum(item.net_quantity * cost_map.get(item.product_id, 0)
                for item in items)
 
+    # The transaction linked to an expense owns that expense's date, because
+    # Expense itself has no date field and backdating is unrestricted. Dating
+    # these by created_at - the row's insertion timestamp - put a backdated
+    # expense in a different month here than in day_book and daily_summary,
+    # which read Transaction. It also contradicted the salary line below, which
+    # has always dated through Transaction.
+    #
+    # An expense with no transaction behind it predates the accounting module;
+    # it keeps its created_at so it is not silently dropped by the join.
     expenses = (
         Expense.objects
-        .filter(business_id=business_id,
-                created_at__date__gte=date_from,
-                created_at__date__lte=date_to)
+        .filter(business_id=business_id)
+        .filter(
+            Q(transaction_record__date__gte=date_from,
+              transaction_record__date__lte=date_to) |
+            Q(transaction_record__isnull=True,
+              created_at__date__gte=date_from,
+              created_at__date__lte=date_to)
+        )
         .aggregate(total=Sum('amount'))['total'] or 0
     )
 

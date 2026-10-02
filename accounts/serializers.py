@@ -1,3 +1,5 @@
+import json
+
 from django.db import transaction as db_transaction
 from django.db.models import Q
 from rest_framework import serializers
@@ -15,6 +17,9 @@ from sales.utils import apply_money_details, invoice_room
 from .models import (
     MoneyAccount, PartyOpeningBalance, PartyPayment, Transaction
 )
+# payments.py imports TransactionCreateSerializer lazily, inside the function
+# that needs it, so this direction is safe.
+from .payments import INVOICE, OPENING_BALANCE, allocate, settleable_items
 
 
 # ── MoneyAccount ──────────────────────────────────────────────────────────────
@@ -135,7 +140,7 @@ class SimpleTransactionSerializer(serializers.ModelSerializer):
             'id', 'type', 'amount', 'date', 'account', 'account_name',
             'payment_method', 'status', 'reference', 'direction',
             'is_source_linked', 'cheque_number', 'cheque_due_date',
-            'created_at',
+            'payment_group', 'created_at',
         ]
 
 
@@ -189,9 +194,9 @@ class TransactionSerializer(serializers.ModelSerializer):
             'id', 'business', 'type', 'amount', 'date', 'account',
             'transfer_account', 'payment_method', 'status', 'reference',
             'notes', 'image', 'cheque_number', 'cheque_due_date',
-            'created_by', 'party_payment', 'direction', 'is_source_linked',
-            'sales_receipt', 'purchase_receipt', 'expense', 'source',
-            'created_at', 'updated_at',
+            'payment_group', 'created_by', 'party_payment', 'direction',
+            'is_source_linked', 'sales_receipt', 'purchase_receipt',
+            'expense', 'source', 'created_at', 'updated_at',
         ]
 
 
@@ -608,3 +613,177 @@ class PartyOpeningBalanceSerializer(serializers.ModelSerializer):
             setattr(instance, attr, value)
         instance.save()
         return instance
+
+
+class RecordPartyPaymentSerializer(serializers.Serializer):
+    """
+    One amount, several ticked items, one atomic write.
+
+    Validates the whole payload up front so a bad account or date is a clean
+    400 on the request rather than an error raised mid-allocation. The per-item
+    rules stay where they already live: TransactionCreateSerializer re-checks
+    each payload it is handed, including the invoice-room rule.
+    """
+
+    customer = serializers.PrimaryKeyRelatedField(
+        queryset=Customer.objects.none(), required=False, allow_null=True)
+    supplier = serializers.PrimaryKeyRelatedField(
+        queryset=Supplier.objects.none(), required=False, allow_null=True)
+
+    amount = serializers.IntegerField(min_value=1)
+    items = serializers.JSONField()
+    order = serializers.ChoiceField(
+        choices=['oldest', 'newest'], required=False, default='oldest')
+
+    account = serializers.PrimaryKeyRelatedField(
+        queryset=MoneyAccount.objects.none())
+    date = serializers.DateField()
+    payment_method = serializers.ChoiceField(
+        choices=Transaction.PAYMENT_METHOD_CHOICES, required=False,
+        default='cash')
+    reference = serializers.CharField(
+        max_length=256, required=False, allow_null=True, allow_blank=True)
+    notes = serializers.CharField(
+        required=False, allow_null=True, allow_blank=True)
+    image = serializers.ImageField(required=False, allow_null=True)
+    cheque_number = serializers.CharField(
+        max_length=256, required=False, allow_null=True, allow_blank=True)
+    cheque_due_date = serializers.DateField(required=False, allow_null=True)
+
+    MONEY_FIELDS = [
+        'account', 'date', 'payment_method', 'reference', 'notes', 'image',
+        'cheque_number', 'cheque_due_date',
+    ]
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        business_id = self.context.get('business_id')
+        if business_id:
+            self.fields['account'].queryset = MoneyAccount.objects.filter(
+                business_id=business_id, is_active=True)
+            self.fields['customer'].queryset = Customer.objects.filter(
+                business_id=business_id)
+            self.fields['supplier'].queryset = Supplier.objects.filter(
+                business_id=business_id)
+
+    def validate_items(self, value):
+        """
+        A multipart request carries `items` as a JSON string; a JSON request
+        carries it as a real list. Accept both.
+        """
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except (TypeError, ValueError):
+                raise serializers.ValidationError(
+                    'items must be a JSON list of {kind, id}.')
+
+        if not isinstance(value, list) or not value:
+            raise serializers.ValidationError(
+                'Tick at least one item for this payment to settle.')
+
+        cleaned = []
+        for entry in value:
+            if not isinstance(entry, dict):
+                raise serializers.ValidationError(
+                    'Each item must be an object of {kind, id}.')
+
+            kind = entry.get('kind')
+            if kind not in (OPENING_BALANCE, INVOICE):
+                raise serializers.ValidationError(
+                    f'Unknown item kind: {kind}.')
+
+            try:
+                item_id = int(entry.get('id'))
+            except (TypeError, ValueError):
+                raise serializers.ValidationError('Each item needs an id.')
+
+            cleaned.append({'kind': kind, 'id': item_id})
+
+        keys = {(entry['kind'], entry['id']) for entry in cleaned}
+        if len(keys) != len(cleaned):
+            raise serializers.ValidationError(
+                'The same item was selected twice.')
+
+        return cleaned
+
+    def validate(self, attrs):
+        customer = attrs.get('customer')
+        supplier = attrs.get('supplier')
+
+        if not customer and not supplier:
+            raise serializers.ValidationError({
+                'customer': 'Name either a customer or a supplier.'
+            })
+        if customer and supplier:
+            raise serializers.ValidationError({
+                'customer': 'Name either a customer or a supplier, not both.'
+            })
+
+        if attrs.get('payment_method') == 'cheque' and not (
+                attrs.get('cheque_number') or '').strip():
+            raise serializers.ValidationError({
+                'cheque_number': 'A cheque payment needs a cheque number.'
+            })
+
+        party = 'customer' if customer else 'supplier'
+        party_id = (customer or supplier).id
+        business_id = self.context['business_id']
+
+        available = {
+            (item['kind'], item['id']): item
+            for item in settleable_items(business_id, party, party_id)
+        }
+
+        chosen = []
+        for ref in attrs['items']:
+            item = available.get((ref['kind'], ref['id']))
+            if item is None:
+                raise serializers.ValidationError({
+                    'items':
+                        'One of the selected items is no longer settleable. '
+                        'Reopen the dialog to see the current amounts.'
+                })
+            chosen.append(item)
+
+        applied_rows, left = allocate(chosen, attrs['amount'], attrs['order'])
+
+        # The entered amount must land somewhere in full. Same contract as the
+        # dialog's Record button, restated because the API is reachable
+        # without it.
+        if left > 0:
+            raise serializers.ValidationError({
+                'amount':
+                    f'PKR {left} of this payment is not applied to anything. '
+                    'Select another item or lower the amount.'
+            })
+
+        # An item that would receive nothing is not a valid selection: the
+        # dialog stops it being ticked, and dropping it silently here would
+        # return fewer payments than the caller asked for.
+        if len(applied_rows) != len(chosen):
+            raise serializers.ValidationError({
+                'items':
+                    'The amount ran out before every selected item was '
+                    'reached. Deselect the items it cannot cover.'
+            })
+
+        attrs['party'] = party
+        attrs['party_id'] = party_id
+        return attrs
+
+    def money_details(self):
+        """
+        The shared money fields as raw values, ready to hand to
+        TransactionCreateSerializer, which resolves the ids itself.
+        """
+        data = self.validated_data
+        details = {}
+
+        for field in self.MONEY_FIELDS:
+            if field not in data:
+                continue
+            value = data[field]
+            details[field] = value.pk if field == 'account' else value
+
+        return details
