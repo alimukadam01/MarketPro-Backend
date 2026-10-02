@@ -402,12 +402,53 @@ class TransactionManager(models.Manager):
         )
 
     def pending_cheques(self, business_id):
+        """
+        Every pending cheque transaction. Stays a queryset so callers can
+        narrow it further - daily_summary filters it by due date.
+        """
         return (
             self.get_queryset()
             .for_business(business_id)
             .filter(payment_method='cheque', status='PEN')
             .order_by('cheque_due_date')
         )
+
+    def pending_cheques_grouped(self, business_id):
+        """
+        One row per physical CHEQUE, not per transaction.
+
+        A payment allocated across several items writes one transaction per
+        item, all sharing a payment_group and one cheque. The cheque is what
+        the user clears or bounces, so a group collapses to a single row
+        carrying the cheque's full face value - otherwise one cheque appears
+        as three entries needing three clicks.
+
+        Returns a list. The representative's amount is summed in memory for
+        display and is never saved.
+        """
+        rows = (
+            self.pending_cheques(business_id)
+            .select_related('account')
+            .order_by('cheque_due_date', 'id')
+        )
+
+        collapsed = []
+        representatives = {}
+
+        for transaction in rows:
+            group = transaction.payment_group
+            if group is None:
+                collapsed.append(transaction)
+                continue
+
+            first = representatives.get(group)
+            if first is None:
+                representatives[group] = transaction
+                collapsed.append(transaction)
+            else:
+                first.amount = (first.amount or 0) + (transaction.amount or 0)
+
+        return collapsed
 
     def monthly_cash_trend(self, business_id):
         """
@@ -551,6 +592,12 @@ class Transaction(models.Model):
     image = models.ImageField(upload_to='transactions', null=True, blank=True)
     cheque_number = models.CharField(max_length=256, null=True, blank=True)
     cheque_due_date = models.DateField(null=True, blank=True)
+    payment_group = models.UUIDField(
+        null=True, blank=True, db_index=True,
+        help_text='Set when one payment was allocated across several items. '
+                  'Every transaction in a group is one physical payment, so a '
+                  'cheque clears or bounces for the whole group at once.'
+    )
     created_by = models.ForeignKey(
         settings.AUTH_USER_MODEL, on_delete=models.SET_NULL,
         null=True, blank=True, related_name='created_transactions'
