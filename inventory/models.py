@@ -32,28 +32,37 @@ class InventoryManager(models.Manager):
         return InventoryQuerySet(self.model)
     
     def total_inventory_value(self, business_id):
-        """What the stock on hand cost to buy."""
-        return self._stock_value(business_id, 'unit_cost')
-
-    def total_inventory_value_with_profit(self, business_id):
         """
-        What the same stock sells for, so the gap between this and
-        total_inventory_value is the profit sitting in the inventory.
-        """
-        return self._stock_value(business_id, 'unit_price')
+        What the stock on hand cost to buy: quantity times unit_cost.
 
-    def _stock_value(self, business_id, price_field):
-        # Aggregated in SQL rather than summed in Python. unit_cost and
-        # unit_price are both nullable and `quantity * None` raises TypeError,
-        # which is what used to take average_order_value down; one inventory
-        # item already has no unit_price. Coalesce says what a missing price is
-        # worth here - nothing - instead of letting SQL drop the row silently.
+        Aggregated in SQL rather than summed in Python, which is how this read
+        before. unit_cost is nullable and `quantity * None` raises TypeError -
+        the fault that used to take average_order_value down. Coalesce says
+        what a missing cost is worth here, nothing, instead of letting SQL drop
+        the row silently.
+        """
         items = self.get_queryset().get_items(business_id)
         total = items.aggregate(
             total=models.Sum(
-                models.F('quantity') * Coalesce(models.F(price_field), 0.0),
+                models.F('quantity') * Coalesce(models.F('unit_cost'), 0.0),
                 output_field=models.FloatField(),
             )
+        )['total']
+
+        return total or 0
+
+    def total_inventory_value_with_profit(self, business_id):
+        """
+        The sum of unit_price across the items that carry one.
+
+        Deliberately not multiplied by quantity, unlike total_inventory_value:
+        this is the sum of the prices themselves. Items with no unit_price are
+        left out rather than counted as zero - the isnull filter states that,
+        though SQL SUM would skip those rows anyway.
+        """
+        items = self.get_queryset().get_items(business_id)
+        total = items.filter(unit_price__isnull=False).aggregate(
+            total=models.Sum('unit_price', output_field=models.FloatField())
         )['total']
 
         return total or 0
