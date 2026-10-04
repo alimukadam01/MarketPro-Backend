@@ -32,37 +32,29 @@ class InventoryManager(models.Manager):
         return InventoryQuerySet(self.model)
     
     def total_inventory_value(self, business_id):
-        """
-        What the stock on hand cost to buy: quantity times unit_cost.
-
-        Aggregated in SQL rather than summed in Python, which is how this read
-        before. unit_cost is nullable and `quantity * None` raises TypeError -
-        the fault that used to take average_order_value down. Coalesce says
-        what a missing cost is worth here, nothing, instead of letting SQL drop
-        the row silently.
-        """
-        items = self.get_queryset().get_items(business_id)
-        total = items.aggregate(
-            total=models.Sum(
-                models.F('quantity') * Coalesce(models.F('unit_cost'), 0.0),
-                output_field=models.FloatField(),
-            )
-        )['total']
-
-        return total or 0
+        """What the stock on hand cost to buy: quantity times unit_cost."""
+        return self._stock_value(business_id, 'unit_cost')
 
     def total_inventory_value_with_profit(self, business_id):
         """
-        The sum of unit_price across the items that carry one.
-
-        Deliberately not multiplied by quantity, unlike total_inventory_value:
-        this is the sum of the prices themselves. Items with no unit_price are
-        left out rather than counted as zero - the isnull filter states that,
-        though SQL SUM would skip those rows anyway.
+        What the same stock sells for: quantity times unit_price. The gap
+        between this and total_inventory_value is the profit sitting in the
+        inventory.
         """
+        return self._stock_value(business_id, 'unit_price')
+
+    def _stock_value(self, business_id, price_field):
+        # Aggregated in SQL rather than summed in Python, which is how
+        # total_inventory_value read before. unit_cost and unit_price are both
+        # nullable and `quantity * None` raises TypeError - the fault that used
+        # to take average_order_value down. Coalesce says what a missing price
+        # is worth here, nothing, instead of letting SQL drop the row silently.
         items = self.get_queryset().get_items(business_id)
-        total = items.filter(unit_price__isnull=False).aggregate(
-            total=models.Sum('unit_price', output_field=models.FloatField())
+        total = items.aggregate(
+            total=models.Sum(
+                models.F('quantity') * Coalesce(models.F(price_field), 0.0),
+                output_field=models.FloatField(),
+            )
         )['total']
 
         return total or 0
