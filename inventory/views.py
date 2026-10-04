@@ -128,6 +128,32 @@ class InventoryKPIViewSet(GenericViewSet):
             "detail": "Method not allowed"
         }, status=status.HTTP_405_METHOD_NOT_ALLOWED)
     
+    @action(['GET'], detail=False, url_name='total-inventory-value-with-profit', url_path='total-inventory-value-with-profit')
+    def total_inventory_value_with_profit(self, request):
+        business = get_active_business(request)
+        if not business:
+            return Response({
+                'detail': 'No active business exists. Please contact admin.'
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        total = Inventory.objects.total_inventory_value_with_profit(business.id)
+        return Response({
+            "total_inventory_value_with_profit": total
+        }, status=status.HTTP_200_OK)
+
+    @action(['GET'], detail=False, url_name='total-items-not-in-inventory', url_path='total-items-not-in-inventory')
+    def total_items_not_in_inventory(self, request):
+        business = get_active_business(request)
+        if not business:
+            return Response({
+                'detail': 'No active business exists. Please contact admin.'
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        count = Inventory.objects.total_items_not_in_inventory(business.id)
+        return Response({
+            "items_not_in_inventory": count
+        }, status=status.HTTP_200_OK)
+
     @action(['GET'], detail=False, url_name='total-restocks-required', url_path='total-restocks-required')
     def total_restocks_required(self, request):
         if request.method == 'GET':

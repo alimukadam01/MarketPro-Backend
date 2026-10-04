@@ -2,7 +2,7 @@ from calendar import monthrange
 from datetime import datetime
 from typing import Dict
 from django.db import models
-from django.db.models import Sum, F, Q
+from django.db.models import Avg, Sum, F, Q
 from django.core.exceptions import ValidationError
 from django.conf import settings
 from django.utils import timezone
@@ -90,15 +90,17 @@ class SalesInvoiceManager(models.Manager):
         return res[:6]
 
     def average_order_value(self, business_id):
+        # `total` is nullable and stays NULL until adjust_totals runs, which only
+        # happens when an invoice has line items - so a saved invoice with none
+        # crashed the Python-level sum this used to do. SQL AVG is also the right
+        # semantic, not just the safe one: it drops NULL rows from the numerator
+        # AND the denominator, so an itemless shell no longer counts as a zero
+        # value order and drags the average down, while an invoice that really
+        # totals 0.0 still counts. Returns 0 for a business with no invoices,
+        # matching total_sales above.
         queryset = self.get_queryset().for_business(business_id)
 
-        quantity = 0
-        total_value = 0
-        for invoice in queryset:
-            total_value += invoice.total
-            quantity += 1
-
-        return int(total_value/quantity) if quantity > 0 else 0
+        return int(queryset.aggregate(avg=Avg("total"))["avg"] or 0)
 
     ### The two below are the absolute-window siblings of total_sales and
     ### total_invoices, written for the targets module. They differ from those
