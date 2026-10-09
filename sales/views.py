@@ -16,6 +16,7 @@ from root.utils import get_active_business
 from inventory.models import InventoryItem
 from accounts.models import Transaction
 from accounts.utils import month_bounds, payables
+from .filters import PurchaseInvoiceFilter, SalesInvoiceFilter
 from .models import PurchaseInvoice, PurchaseInvoiceItem, PurchaseQuotation, PurchaseQuotationItem, PurchaseReceipt, ReturnedItem, SalesInvoice, SalesInvoiceItem, SalesReceipt
 from .utils import build_whatsapp_payload
 from .serializers import (
@@ -61,8 +62,11 @@ from .serializers import (
 class PurchaseInvoiceViewSet(ModelViewSet):
 
     filter_backends = [SearchFilter, DjangoFilterBackend]
-    filterset_fields = ['supplier__name', 'status',
-                        'sub_total', 'total', 'goods_received']
+    # A FilterSet rather than filterset_fields, so payment_status can be
+    # filtered at all: it is a derived property, so there is no column for
+    # DjangoFilterBackend to match and the parameter used to be ignored.
+    # The column-backed fields are unchanged, declared in its Meta.
+    filterset_class = PurchaseInvoiceFilter
     search_fields = [
         'id', 'invoice_number', 'supplier__name', 'status',
         'sub_total', 'total', 'goods_received', 'delivery', 'notes'
@@ -329,9 +333,23 @@ class PurchasesKPIViewSet(GenericViewSet):
                     'detail': 'No active business exists. Please contact admin.'
                 }, status=status.HTTP_400_BAD_REQUEST)
 
-            today = timezone.localdate()
-            total_invoices = PurchaseInvoice.objects.total_invoices(
-                business.id, today.day)
+            # The calendar month, dated on the invoice.
+            #
+            # This read `total_invoices(business.id, today.day)`, which was
+            # wrong twice over. in_period() counts days back from now against
+            # created_at - when the row was typed, not when the purchase
+            # happened - so every invoice entered in a migration or a catch-up
+            # session counted as this month's whatever its date. And today.day
+            # is the day of the month, used as a number of days: a rolling
+            # window that is one day long on the 1st and reaches into the
+            # previous month on the 31st, so it was never the current month.
+            #
+            # purchase_invoice_count already dates on date_issued and leaves
+            # out cancelled invoices, which is what purchase_value does for
+            # the money figure beside this one.
+            start, end = month_bounds()
+            total_invoices = PurchaseInvoice.objects.purchase_invoice_count(
+                business.id, start, end)
             return Response({
                 "total_invoices": total_invoices
             }, status=status.HTTP_200_OK)
@@ -403,8 +421,11 @@ class PurchasesKPIViewSet(GenericViewSet):
 class SalesInvoiceViewSet(ModelViewSet):
 
     filter_backends = [SearchFilter, DjangoFilterBackend]
-    filterset_fields = ['customer__name', 'status',
-                        'sub_total', 'total', 'is_deducted', 'is_partially_deducted']
+    # A FilterSet rather than filterset_fields, so payment_status can be
+    # filtered at all: it is a derived property, so there is no column for
+    # DjangoFilterBackend to match and the parameter used to be ignored.
+    # The column-backed fields are unchanged, declared in its Meta.
+    filterset_class = SalesInvoiceFilter
     search_fields = [
         'id', 'invoice_number', 'customer__name', 'status', 'sub_total', 'total', 'discount', 'tax', 'notes', 'created_by__email'
     ]
@@ -767,8 +788,22 @@ class SalesKPIViewSet(GenericViewSet):
                     'detail': 'No active business exists. Please contact admin.'
                 }, status=status.HTTP_400_BAD_REQUEST)
 
-            total_items = SalesInvoiceItem.objects.total_items_sold(
-                business.id, 1)
+            # Today's calendar day, dated on the invoice.
+            #
+            # This read total_items_sold(business.id, 1), which was wrong four
+            # ways. in_period(1) is a rolling 24 hours against the ITEM's own
+            # created_at, so "sold today" meant "typed in since this time
+            # yesterday" - every line of a migration counted, and a sale made
+            # this morning did not. It also summed gross quantity, so a
+            # returned unit still counted as sold, and it counted lines on
+            # cancelled invoices.
+            #
+            # net_items_sold answers the question the card asks: it dates on
+            # sales_invoice__date_issued, leaves out cancelled invoices, and
+            # subtracts returned_quantity in SQL.
+            today = timezone.localdate()
+            total_items = SalesInvoiceItem.objects.net_items_sold(
+                business.id, today, today)
             return Response({
                 "total_items": total_items
             }, status=status.HTTP_200_OK)

@@ -9,7 +9,9 @@ from rest_framework.decorators import action
 from rest_framework.filters import SearchFilter
 from django_filters.rest_framework import DjangoFilterBackend
 
-from accounts.utils import customer_balance, party_invoiced, supplier_balance
+from accounts.utils import (
+    customer_balance, month_bounds, party_invoiced, supplier_balance,
+)
 from core.utils import send_marketpro_email
 # root -> inventory, the same direction sales/ already uses. inventory.models
 # imports root.models, not root.views, so there is no cycle.
@@ -705,8 +707,20 @@ class ExpenseKPIViewSet(GenericViewSet):
                     'detail': 'No active business exists. Please contact admin.'
                 }, status=status.HTTP_400_BAD_REQUEST)
 
-            today = timezone.localdate()
-            monthly_total_expense_amount = Expense.objects.total_expense_amount(business.id, num_days=today.day)
+            # The calendar month, not a rolling window.
+            #
+            # This passed today.day as num_days, which is the day of the month
+            # used as a number of days back: one day long on the 1st, and on
+            # the 31st reaching into the previous month. It was never the
+            # current month.
+            #
+            # Still dated on created_at, because that is the only date Expense
+            # has - no editable date, which is why an expense typed a week
+            # late lands in the wrong month. expense_amount_in_range says so
+            # on itself; fixing that needs a field, not a different call.
+            start, end = month_bounds()
+            monthly_total_expense_amount = Expense.objects.expense_amount_in_range(
+                business.id, start, end)
             return Response({
                 "monthly_total_expense_amount": monthly_total_expense_amount
             }, status=status.HTTP_200_OK)
