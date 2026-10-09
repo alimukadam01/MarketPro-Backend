@@ -75,3 +75,7 @@ Thumbs.db
 *.pid.lock
 docker-compose.override.yml
 .env
+
+#migration files
+sales/management/*
+root/management/*
