@@ -201,12 +201,27 @@ class SimplePurchaseInvoiceSerializer(serializers.ModelSerializer):
     projects = ProjectPurchaseInvoiceLinker(many=True)
 
     def get_total_items(self, obj):
+        """
+        How many items are on the invoice - the quantities, not the rows.
 
+        .count() answered a different question: it counted distinct product
+        variants, so a purchase of twelve of one product reported 1.
+
+        Plain quantity, with no net_quantity equivalent to apply: returns live
+        on sales lines only, so a purchase line has nothing deducted from it.
+
+        Summed in Python deliberately: the view prefetches invoice_items, so
+        this touches the database not at all, while .count() ignored that
+        prefetch and issued a COUNT per row of the list.
+        """
         if type(obj) == PurchaseInvoice:
-            return obj.invoice_items.count()
+            items = obj.invoice_items.all()
+        elif type(obj) == ProjectPurchaseInvoice:
+            items = obj.purchase_invoice.invoice_items.all()
+        else:
+            return None
 
-        if type(obj) == ProjectPurchaseInvoice:
-            return obj.purchase_invoice.invoice_items.count()
+        return sum(item.quantity for item in items)
 
     def get_amount_paid(self, obj):
         # transformPurchaseInvoice in the client already reads amount_paid;
@@ -592,12 +607,27 @@ class SimpleSalesInvoiceSerializer(serializers.ModelSerializer):
     projects = ProjectSalesInvoiceLinker(many=True)
 
     def get_total_items(self, obj):
+        """
+        How many items are on the invoice - the quantities, not the rows.
 
+        .count() answered a different question: it counted distinct product
+        variants, so an invoice for six of one product reported 1. net_quantity
+        rather than quantity so a returned unit stops counting, which is how
+        sub_total is worked out too - otherwise a fully returned line would
+        still be listed as sold.
+
+        Summed in Python deliberately: the view prefetches invoice_items, so
+        this touches the database not at all, while .count() ignored that
+        prefetch and issued a COUNT per row of the list.
+        """
         if type(obj) == SalesInvoice:
-            return obj.invoice_items.count()
+            items = obj.invoice_items.all()
+        elif type(obj) == ProjectSalesInvoice:
+            items = obj.sales_invoice.invoice_items.all()
+        else:
+            return None
 
-        if type(obj) == ProjectSalesInvoice:
-            return obj.sales_invoice.invoice_items.count()
+        return sum(item.net_quantity for item in items)
 
     def get_amount_paid(self, obj):
         # payment_status was already here but the figure behind it was not, so
