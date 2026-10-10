@@ -79,3 +79,4 @@ docker-compose.override.yml
 #migration files
 sales/management/*
 root/management/*
+.env.example

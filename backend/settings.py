@@ -27,7 +27,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 SECRET_KEY = 'django-insecure-n)ih+0wkoxbkcx4#s+ni9@hu9_ojy(rt+f%624^0ulcmi%gf28'
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = True
+DEBUG = False
 
 ALLOWED_HOSTS = [
     'localhost', 
@@ -49,6 +49,7 @@ INSTALLED_APPS = [
     'rest_framework',
     'django_filters',
     'corsheaders',
+    'storages',
     'djoser',
     'core',
     'root',
@@ -194,6 +195,101 @@ STATIC_ROOT = os.path.join(BASE_DIR, 'static')
 
 MEDIA_URL = '/media/'
 MEDIA_ROOT = os.path.join(BASE_DIR, 'media')
+
+
+# ── Media storage ─────────────────────────────────────────────────────────────
+# Uploads (transaction slips, cheque photos, backlog photos, business logos)
+# live on S3 in production and on local disk everywhere else.
+#
+# Gated on its own flag rather than on DEBUG, for two reasons: DEBUG also
+# switches the DATABASE, so you could not point a dev machine at S3 without
+# also pointing it at production Postgres; and the switch should be an explicit
+# deployment decision, not a side effect.
+#
+# Why this matters beyond tidiness: uploads currently sit on the instance's own
+# disk under MEDIA_ROOT, which is gitignored. Replace or redeploy the box and
+# every slip recorded against a transaction is gone, and a missing
+# MEDIA_ROOT/transactions/ directory is what made image uploads fail silently
+# on the server in the first place.
+
+USE_S3 = os.getenv('USE_S3', 'false').lower() == 'true'
+
+if USE_S3:
+    AWS_STORAGE_BUCKET_NAME = os.environ['AWS_STORAGE_BUCKET_NAME']
+    AWS_S3_REGION_NAME = os.environ['AWS_S3_REGION_NAME']
+
+    # No access keys here on purpose. boto3 resolves credentials in order and
+    # picks up the EC2 instance profile by itself, so the server needs an IAM
+    # ROLE rather than a key pair sitting in .env. Setting AWS_ACCESS_KEY_ID /
+    # AWS_SECRET_ACCESS_KEY in the environment still works if you must, but a
+    # role cannot be leaked by a stray config dump and rotates on its own.
+
+    AWS_S3_SIGNATURE_VERSION = 's3v4'
+
+    # Pin the REGIONAL endpoint. Without it boto3 falls back to the global
+    # bucket.s3.amazonaws.com host, which costs a redirect on every object and
+    # does not work at all for regions enabled after 2019 - the signature is
+    # scoped to the right region either way, so the failure would look like a
+    # DNS or SignatureDoesNotMatch error rather than a config mistake.
+    AWS_S3_ENDPOINT_URL = os.getenv(
+        'AWS_S3_ENDPOINT_URL',
+        f'https://s3.{AWS_S3_REGION_NAME}.amazonaws.com',
+    )
+
+    # bucket.s3.region.amazonaws.com, not s3.region.amazonaws.com/bucket.
+    # Setting an explicit endpoint above makes boto3 default to the path style,
+    # which AWS deprecated for buckets created after September 2020.
+    AWS_S3_ADDRESSING_STYLE = 'virtual'
+
+    # Bucket owner enforced (ACLs disabled) is the modern default for new
+    # buckets, and PutObject fails outright if the client sends an ACL. None
+    # means "send no ACL" - do NOT set 'public-read' here.
+    AWS_DEFAULT_ACL = None
+
+    # django-storages overwrites a same-named key by default, which would let
+    # one upload silently replace another's slip. Django's usual suffixing
+    # behaviour is what we want.
+    AWS_S3_FILE_OVERWRITE = False
+
+    # These are financial documents - payment slips and cheque images - so the
+    # bucket stays private and every URL is presigned and short-lived. The cost
+    # is that a URL cannot be cached or shared beyond its expiry, which is the
+    # correct trade for this content.
+    AWS_QUERYSTRING_AUTH = True
+    AWS_QUERYSTRING_EXPIRE = int(os.getenv('AWS_QUERYSTRING_EXPIRE', '3600'))
+
+    # Lets the browser cache an object for the life of its signature.
+    AWS_S3_OBJECT_PARAMETERS = {
+        'CacheControl': f'private, max-age={AWS_QUERYSTRING_EXPIRE}',
+    }
+
+    # Optional: a CloudFront distribution in front of the bucket. Leave unset
+    # unless one exists - with AWS_QUERYSTRING_AUTH on, the signature is an S3
+    # one, so a plain CloudFront domain will reject it.
+    if os.getenv('AWS_S3_CUSTOM_DOMAIN'):
+        AWS_S3_CUSTOM_DOMAIN = os.environ['AWS_S3_CUSTOM_DOMAIN']
+
+    MEDIA_LOCATION = os.getenv('AWS_MEDIA_LOCATION', 'media')
+
+# Django 4.2 replaced DEFAULT_FILE_STORAGE/STATICFILES_STORAGE with STORAGES,
+# and 5.1 removed the old names. This project is on 5.2, so the dict is the
+# only form that works.
+STORAGES = {
+    'default': {
+        'BACKEND': 'storages.backends.s3.S3Storage',
+        'OPTIONS': {
+            'location': MEDIA_LOCATION,
+        },
+    } if USE_S3 else {
+        'BACKEND': 'django.core.files.storage.FileSystemStorage',
+    },
+    # Static files stay on the box: nginx already serves /static/ straight off
+    # disk, they are tiny (admin CSS and DRF's browsable API), and putting them
+    # on S3 would add a collectstatic upload to every deploy for no gain.
+    'staticfiles': {
+        'BACKEND': 'django.contrib.staticfiles.storage.StaticFilesStorage',
+    },
+}
 
 # Default primary key field type
 # https://docs.djangoproject.com/en/4.2/ref/settings/#default-auto-field
