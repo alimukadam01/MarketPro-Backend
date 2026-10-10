@@ -207,34 +207,75 @@ def supplier_balance(supplier, business_id):
     return round(invoiced - paid - settled + refunded + opening_amount)
 
 
-def aging_buckets(business_id, customer_id):
+def aging_buckets(business_id, customer):
     """
-    Unpaid sales invoice value split by how long it has been outstanding.
+    What a customer owes, split by how long it has been owed.
+
+    Aged first-in-first-out, the way a khaata is settled in practice. Every
+    rupee owed is a dated debt: each invoice's unpaid part, and a debit
+    opening balance carried over from paper. Money in the customer's favour
+    that is not tied to one invoice - on-account payments, a credit opening
+    balance, overpayment on an invoice - clears the oldest debt first. The
+    buckets therefore always add up to customer_balance().
+
+    Each invoice used to be aged against its own receipts only, so on-account
+    payments and opening balances never reached the buckets, and the three of
+    them overstated the Receivable card they sit under.
     """
     today = timezone.localdate()
     buckets = {'current': 0, 'days_31_60': 0, 'days_over_60': 0}
+    debts = []      # (date owed since, amount)
+    credit = 0      # money in their favour, not yet set against a debt
 
     invoices = (
         SalesInvoice.objects
-        .filter(business_id=business_id, customer_id=customer_id)
+        .filter(business_id=business_id, customer_id=customer.id)
         .exclude(status__in=CANCELLED_SALES_STATUSES)
         .prefetch_related('payment_receipts__transaction_record')
     )
 
     for invoice in invoices:
         outstanding = (invoice.total or 0) - invoice.amount_paid
-        if outstanding <= 0:
+        issued = local_date(invoice.date_issued) if invoice.date_issued else today
+        if outstanding > 0:
+            debts.append((issued, outstanding))
+        else:
+            # Overpaid. The excess still counts in customer_balance, so it
+            # pays down their other invoices here too.
+            credit -= outstanding
+
+    opening = getattr(customer, 'opening_balance', None)
+    if opening and opening.amount > 0:
+        debts.append((opening.as_of_date, opening.amount))
+    elif opening and opening.amount < 0:
+        credit -= opening.amount
+
+    settled, refunded = on_account_totals(
+        business_id, {'customer_id': customer.id},
+        PARTY_ON_ACCOUNT['customer'],
+    )
+    credit += settled - refunded
+    if credit < 0:
+        # More refunded than was ever paid on account: money that went back
+        # out and is owed again. on_account_totals gives no date, so it is
+        # aged from today rather than guessed.
+        debts.append((today, -credit))
+        credit = 0
+
+    for owed_since, amount in sorted(debts, key=lambda debt: debt[0]):
+        applied = min(credit, amount)
+        credit -= applied
+        remaining = amount - applied
+        if remaining <= 0:
             continue
 
-        issued = local_date(invoice.date_issued) if invoice.date_issued else today
-        age = (today - issued).days
-
+        age = (today - owed_since).days
         if age <= 30:
-            buckets['current'] += outstanding
+            buckets['current'] += remaining
         elif age <= 60:
-            buckets['days_31_60'] += outstanding
+            buckets['days_31_60'] += remaining
         else:
-            buckets['days_over_60'] += outstanding
+            buckets['days_over_60'] += remaining
 
     return {key: round(value) for key, value in buckets.items()}
 
@@ -256,7 +297,7 @@ def receivables(business_id):
             continue
 
         total += balance
-        buckets = aging_buckets(business_id, customer.id)
+        buckets = aging_buckets(business_id, customer)
         for key in totals:
             totals[key] += buckets[key]
 
