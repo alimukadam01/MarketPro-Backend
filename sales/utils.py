@@ -300,9 +300,21 @@ def live_receipt_total(invoice):
 
 def invoice_room(invoice):
     """
-    How much more this invoice can still accept. Never negative.
+    How much more this invoice can still accept as a payment that names it.
+    Never negative.
+
+    Less what its own payments have claimed (pending cheques included) AND
+    what the party's khaata has already settled onto it - otherwise an
+    invoice the pool covers would still take a payment, and the party would
+    pay the same debt twice. This cap is what keeps named payments and the
+    pool from contradicting each other (credit-debit-notes plan, section 4).
     """
-    return max(float(invoice.total or 0) - float(live_receipt_total(invoice)), 0.0)
+    return max(
+        float(invoice.total or 0)
+        - float(live_receipt_total(invoice))
+        - float(invoice.pool_applied or 0),
+        0.0,
+    )
 
 
 def apply_money_details(source, money_details):

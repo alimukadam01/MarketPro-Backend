@@ -483,7 +483,7 @@ class PurchaseReceiptCreateSerializer(PaymentReceiptCreateSerializer):
 
         if float(self.validated_data.get("amount") or 0) > room:
             error = serializers.ValidationError({
-                "amount": "accumulated amount cannot exceed invoice total"
+                "amount": f"This invoice can take at most PKR {room:,.0f} more - part of it may already be settled from the khaata."
             })
             if raise_exception:
                 raise error
@@ -967,7 +967,7 @@ class SalesReceiptCreateSerializer(PaymentReceiptCreateSerializer):
 
         if float(self.validated_data.get("amount") or 0) > room:
             error = serializers.ValidationError({
-                "amount": "accumulated amount cannot exceed invoice total"
+                "amount": f"This invoice can take at most PKR {room:,.0f} more - part of it may already be settled from the khaata."
             })
             if raise_exception:
                 raise error

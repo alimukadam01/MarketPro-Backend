@@ -20,6 +20,11 @@ from .models import (
 # payments.py imports TransactionCreateSerializer lazily, inside the function
 # that needs it, so this direction is safe.
 from .payments import INVOICE, OPENING_BALANCE, allocate, settleable_items
+from .settlement import settlement_for_transaction
+
+# Pool credit: the types whose `settles` list means something.
+SETTLING_TYPES = (
+    Transaction.CREDIT_NOTE_TYPES + ['customer_receipt', 'supplier_payment'])
 
 
 # ── MoneyAccount ──────────────────────────────────────────────────────────────
@@ -153,6 +158,19 @@ class TransactionSerializer(serializers.ModelSerializer):
     direction = serializers.CharField(read_only=True)
     is_source_linked = serializers.BooleanField(read_only=True)
     source = serializers.SerializerMethodField()
+    settles = serializers.SerializerMethodField()
+
+    def get_settles(self, transaction):
+        """
+        What this note or on-account payment settled on the party's khaata,
+        oldest first. Computed on read (accounts/settlement.py), so it changes
+        when the khaata does - a backdated invoice, a deleted note.
+        Empty for anything that is not pool credit.
+        """
+        if transaction.type not in SETTLING_TYPES:
+            return []
+        settlement = settlement_for_transaction(transaction)
+        return settlement.settles(transaction.id) if settlement else []
 
     def get_source(self, transaction):
         """
@@ -196,7 +214,7 @@ class TransactionSerializer(serializers.ModelSerializer):
             'notes', 'image', 'cheque_number', 'cheque_due_date',
             'payment_group', 'created_by', 'party_payment', 'direction',
             'is_source_linked', 'sales_receipt', 'purchase_receipt',
-            'expense', 'source', 'created_at', 'updated_at',
+            'expense', 'source', 'settles', 'created_at', 'updated_at',
         ]
 
 
@@ -471,10 +489,14 @@ class TransactionCreateSerializer(BaseTransactionWriteSerializer):
         # Same room rule the payments dialog uses, from the same helper, so the
         # two screens can never disagree about what an invoice can still take.
         invoice = attrs.get('sales_invoice') or attrs.get('purchase_invoice')
-        if invoice is not None and amount > invoice_room(invoice):
-            raise serializers.ValidationError({
-                'amount': 'accumulated amount cannot exceed invoice total'
-            })
+        if invoice is not None:
+            room = invoice_room(invoice)
+            if amount > room:
+                raise serializers.ValidationError({
+                    'amount': f'This invoice can take at most PKR {room:,.0f} '
+                              'more - part of it may already be settled from '
+                              'the khaata.'
+                })
 
         return attrs
 

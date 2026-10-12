@@ -15,10 +15,11 @@ from root.serializers import CaptureCustomerSerializer
 from root.utils import get_active_business
 from inventory.models import InventoryItem
 from accounts.models import Transaction
+from accounts.settlement import attach_settlement
 from accounts.utils import month_bounds, payables
 from .filters import PurchaseInvoiceFilter, SalesInvoiceFilter
 from .models import PurchaseInvoice, PurchaseInvoiceItem, PurchaseQuotation, PurchaseQuotationItem, PurchaseReceipt, ReturnedItem, SalesInvoice, SalesInvoiceItem, SalesReceipt
-from .utils import build_whatsapp_payload
+from .utils import build_whatsapp_payload, invoice_room
 from .serializers import (
     PaymentReceiptSerializer,
     PurchaseInvoiceAndItemsCreateSerializer,
@@ -59,7 +60,56 @@ from .serializers import (
 # Create your views here.
 
 
-class PurchaseInvoiceViewSet(ModelViewSet):
+class SettledInvoiceViewMixin:
+    """
+    What the khaata settles onto an invoice (credit-debit-notes plan, D9/D15).
+
+    list() attaches the settlement for the whole filtered list in one khaata
+    pass per party; without it every row's amount_paid would run its own.
+    settlement/ is what the invoice's payments dialog reads: the khaata lines
+    that settled the invoice, and the totals its "Paid in full" state and its
+    payment cap are worked out from - so the dialog and the server agree.
+    """
+
+    def list(self, request, *args, **kwargs):
+        invoices = list(self.filter_queryset(self.get_queryset()))
+        attach_settlement(invoices)
+        page = self.paginate_queryset(invoices)
+        if page is not None:
+            return self.get_paginated_response(
+                self.get_serializer(page, many=True).data)
+        return Response(self.get_serializer(invoices, many=True).data)
+
+    @action(['GET'], detail=True, url_path='settlement', url_name='settlement')
+    def settlement(self, request, pk=None):
+        business = get_active_business(request)
+        if not business:
+            return Response(
+                {'detail': 'No active business exists. Please contact admin.'},
+                status=status.HTTP_400_BAD_REQUEST)
+        try:
+            invoice = self.get_object()
+            attach_settlement([invoice])
+            total = float(invoice.total or 0)
+            paid = float(invoice.amount_paid or 0)
+            return Response({
+                'total': round(total),
+                'paid_on_invoice': round(invoice.receipts_paid or 0),
+                'settled_from_khaata': round(invoice.pool_applied or 0),
+                'paid': round(paid),
+                'still_owed': round(max(total - paid, 0)),
+                # What one more payment naming this invoice may be. Less than
+                # still_owed while a pending cheque holds part of it.
+                'room': round(invoice_room(invoice)),
+                'settled_by': invoice._settlement.settled_by(invoice.id),
+            }, status=status.HTTP_200_OK)
+        except Exception as error:
+            print(error)
+            return Response({'detail': 'Internal Server Error.'},
+                            status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+class PurchaseInvoiceViewSet(SettledInvoiceViewMixin, ModelViewSet):
 
     filter_backends = [SearchFilter, DjangoFilterBackend]
     # A FilterSet rather than filterset_fields, so payment_status can be
@@ -418,7 +468,7 @@ class PurchasesKPIViewSet(GenericViewSet):
         }, status=status.HTTP_405_METHOD_NOT_ALLOWED)
 
 
-class SalesInvoiceViewSet(ModelViewSet):
+class SalesInvoiceViewSet(SettledInvoiceViewMixin, ModelViewSet):
 
     filter_backends = [SearchFilter, DjangoFilterBackend]
     # A FilterSet rather than filterset_fields, so payment_status can be
