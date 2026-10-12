@@ -490,8 +490,13 @@ class TransactionManager(models.Manager):
 
 class Transaction(models.Model):
     """
-    A transaction exists if and only if money actually moved (BRD §5).
+    A transaction records money that actually moved, or a note that adjusts a
+    party's khaata (BRD §5, as amended for credit and debit notes).
     Credit sales and credit purchases are not transactions — they are invoices.
+
+    A note has no account and no payment method: no money moved, so it never
+    reaches a cash figure. Every cash aggregate selects by IN_TYPES, OUT_TYPES
+    or a named list of money types, and NOTE_TYPES is in none of them.
     """
 
     IN_TYPES = [
@@ -519,18 +524,33 @@ class Transaction(models.Model):
         'cash_adjustment',
     ]
 
+    # Notes move no money. A credit note lowers what the party owes (or what
+    # the business owes them); a debit note raises it. One type per party kind
+    # keeps the one-type-one-reference rule the type picker relies on.
+    CREDIT_NOTE_TYPES = ['customer_credit_note', 'supplier_credit_note']
+    DEBIT_NOTE_TYPES = ['customer_debit_note', 'supplier_debit_note']
+    NOTE_TYPES = CREDIT_NOTE_TYPES + DEBIT_NOTE_TYPES
+    NOTE_PARTY = {
+        'customer_credit_note': 'customer',
+        'customer_debit_note': 'customer',
+        'supplier_credit_note': 'supplier',
+        'supplier_debit_note': 'supplier',
+    }
+
     # Money that counts toward sales / purchase KPIs (every rupee actually
     # received from customers, and every rupee actually paid to suppliers).
     SALES_MONEY_TYPES = ['sale_payment', 'customer_receipt']
     PURCHASE_MONEY_TYPES = ['purchase_payment', 'supplier_payment']
 
-    # Types that name a customer or supplier when recorded on account.
+    # Types that name a customer or supplier when recorded on account. Notes
+    # always name one: a note never names an invoice, so the party is the
+    # only thing it settles against.
     PARTY_TYPES = [
         'customer_receipt',
         'supplier_payment',
         'sales_return_refund',
         'purchase_return_refund',
-    ]
+    ] + NOTE_TYPES
 
     TYPE_CHOICES = [
         ('sale_payment', 'Sale Payment'),
@@ -552,6 +572,10 @@ class Transaction(models.Model):
         ('other_payment', 'Other Payment'),
         ('transfer', 'Account Transfer'),
         ('cash_adjustment', 'Cash Adjustment'),
+        ('customer_credit_note', 'Customer Credit Note'),
+        ('customer_debit_note', 'Customer Debit Note'),
+        ('supplier_credit_note', 'Supplier Credit Note'),
+        ('supplier_debit_note', 'Supplier Debit Note'),
     ]
 
     PAYMENT_METHOD_CHOICES = [
@@ -569,8 +593,11 @@ class Transaction(models.Model):
 
     business = models.ForeignKey(
         Business, on_delete=models.CASCADE, related_name='transactions')
+    # Null only for notes, which move no money. Required for every other type
+    # by BaseTransactionWriteSerializer.validate.
     account = models.ForeignKey(
-        MoneyAccount, on_delete=models.CASCADE, related_name='transactions')
+        MoneyAccount, on_delete=models.CASCADE, related_name='transactions',
+        null=True, blank=True)
     transfer_account = models.ForeignKey(
         MoneyAccount, on_delete=models.CASCADE,
         null=True, blank=True, related_name='incoming_transfers',
@@ -583,8 +610,10 @@ class Transaction(models.Model):
     )
     date = models.DateField(
         help_text='The date the money moved. Backdating is unrestricted.')
+    # Null only for notes, for the same reason as account.
     payment_method = models.CharField(
-        max_length=256, choices=PAYMENT_METHOD_CHOICES, default='cash')
+        max_length=256, choices=PAYMENT_METHOD_CHOICES, default='cash',
+        null=True, blank=True)
     status = models.CharField(
         max_length=256, choices=STATUS_CHOICES, default='C')
     reference = models.CharField(max_length=256, null=True, blank=True)
@@ -635,7 +664,13 @@ class Transaction(models.Model):
             return 'in'
         if self.type in self.OUT_TYPES:
             return 'out'
+        if self.type in self.NOTE_TYPES:
+            return 'none'
         return 'neutral'
+
+    @property
+    def is_note(self):
+        return self.type in self.NOTE_TYPES
 
     @property
     def is_source_linked(self):
