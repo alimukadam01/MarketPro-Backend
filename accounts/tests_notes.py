@@ -100,6 +100,38 @@ class NotesAPITests(TestCase):
         self.assertEqual(response.status_code, 400)
         self.assertIn('account', response.json())
 
+    def test_on_account_money_must_name_its_party(self):
+        response = self.client.post('/transactions/', {
+            'type': 'supplier_payment', 'amount': 1000, 'date': '2026-04-15',
+            'account': self.account.id, 'payment_method': 'cash'},
+            format='json')
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('supplier', response.json())
+
+    def test_an_unlinked_payment_is_repaired_by_naming_the_supplier(self):
+        # How production got supplier payments with no supplier: the create
+        # screen offered only parties with an opening balance, and the server
+        # accepted none. The update screen is where they get fixed.
+        orphan = Transaction.objects.create(
+            business=self.business, account=self.account,
+            type='supplier_payment', amount=1000,
+            date=datetime.date(2026, 4, 15))
+        body = {'type': 'supplier_payment', 'amount': 1000,
+                'date': '2026-04-15', 'account': self.account.id,
+                'payment_method': 'cash', 'status': 'C'}
+
+        response = self.client.put(f'/transactions/{orphan.id}/', body,
+                                   format='json')
+        self.assertEqual(response.status_code, 400)
+
+        response = self.client.put(f'/transactions/{orphan.id}/',
+                                   {**body, 'supplier': self.jotun.id},
+                                   format='json')
+        self.assertEqual(response.status_code, 200, response.json())
+        detail = self.client.get(f'/transactions/{orphan.id}/').json()
+        self.assertEqual(detail['party_payment']['supplier']['id'],
+                         self.jotun.id)
+
     def test_a_note_can_be_edited_and_keeps_its_party(self):
         txn_id = self.create_note().json().get('id') or \
             Transaction.objects.get(type='supplier_credit_note').id

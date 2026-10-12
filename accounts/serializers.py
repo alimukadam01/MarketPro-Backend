@@ -395,7 +395,29 @@ class BaseTransactionWriteSerializer(serializers.ModelSerializer):
                 'customer': 'Name either a customer or a supplier, not both.'
             })
 
+        # On-account money must name its party. It used to be optional, and
+        # the create screen listed only parties with an opening balance, so a
+        # supplier payment to anyone else was saved with no supplier at all:
+        # it lowered no khaata and the update screen had nothing to show.
+        party_kind = self.ON_ACCOUNT_PARTY.get(txn_type)
+        if party_kind and not attrs.get(party_kind):
+            existing = getattr(self.instance, 'party_payment', None) \
+                if self.instance is not None else None
+            if not getattr(existing, f'{party_kind}_id', None):
+                raise serializers.ValidationError({
+                    party_kind: f'Select the {party_kind} this money is for.'
+                })
+
         return attrs
+
+    # Which party each on-account money type names. Notes are checked in
+    # _validate_note.
+    ON_ACCOUNT_PARTY = {
+        'customer_receipt': 'customer',
+        'sales_return_refund': 'customer',
+        'supplier_payment': 'supplier',
+        'purchase_return_refund': 'supplier',
+    }
 
 
 class TransactionCreateSerializer(BaseTransactionWriteSerializer):
