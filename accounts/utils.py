@@ -732,6 +732,44 @@ def daily_summary(business_id, day):
 
 # ── Munafa ────────────────────────────────────────────────────────────────────
 
+def revenue_net_of_notes(business_id, date_from, date_to, customer_id=None,
+                         created_by_id=None, status=None):
+    """
+    Invoiced sales revenue, less customer credit notes and plus customer debit
+    notes in the window (credit-debit-notes plan, 5.5). The targets catalogue
+    resolves sales_revenue here.
+
+    Lives in accounts because it spans two apps: sales cannot import accounts.
+    Filtering by invoice status leaves notes out - a note has no invoice
+    status. Filtering by who entered it applies to notes too.
+    """
+    value = SalesInvoice.objects.revenue(
+        business_id, date_from, date_to, customer_id=customer_id,
+        created_by_id=created_by_id, status=status)
+    if status is not None:
+        return value
+    return value + Transaction.objects.note_adjustment(
+        business_id, 'customer', date_from, date_to,
+        party_id=customer_id, created_by_id=created_by_id)
+
+
+def purchase_value_net_of_notes(business_id, date_from, date_to,
+                                supplier_id=None, created_by_id=None,
+                                status=None):
+    """
+    Invoiced purchase value, less supplier credit notes and plus supplier
+    debit notes in the window. The supplier-side twin of revenue_net_of_notes.
+    """
+    value = PurchaseInvoice.objects.purchase_value(
+        business_id, date_from, date_to, supplier_id=supplier_id,
+        created_by_id=created_by_id, status=status)
+    if status is not None:
+        return value
+    return value + Transaction.objects.note_adjustment(
+        business_id, 'supplier', date_from, date_to,
+        party_id=supplier_id, created_by_id=created_by_id)
+
+
 def profit_estimate(business_id, date_from, date_to):
     """
     Revenue less cost of goods sold less expenses. An estimate only — it is
@@ -785,12 +823,23 @@ def profit_estimate(business_id, date_from, date_to):
         .aggregate(total=Sum('amount'))['total'] or 0
     )
 
-    salaries = Transaction.objects.totals_by_type(
-        business_id, date_from, date_to).get('salary_payment', 0)
+    by_type = Transaction.objects.totals_by_type(business_id, date_from, date_to)
+    salaries = by_type.get('salary_payment', 0)
+
+    # Notes, dated by their own date (credit-debit-notes plan, 5.5). A credit
+    # note to a customer gives back revenue and a debit note adds to it. A
+    # supplier's credit note (a target rebate) is money the business keeps, so
+    # it adds to profit on its own line rather than through COGS, which is
+    # read from current unit costs; a supplier's debit note takes it away.
+    revenue += (by_type.get('customer_debit_note', 0)
+                - by_type.get('customer_credit_note', 0))
+    supplier_credits = (by_type.get('supplier_credit_note', 0)
+                        - by_type.get('supplier_debit_note', 0))
 
     return {
         'revenue': round(revenue),
         'cost_of_goods_sold': round(cogs),
         'expenses': round(expenses + salaries),
-        'profit': round(revenue - cogs - expenses - salaries),
+        'supplier_credits': round(supplier_credits),
+        'profit': round(revenue - cogs - expenses - salaries + supplier_credits),
     }

@@ -343,6 +343,33 @@ class TransactionManager(models.Manager):
             payment_method=payment_method,
         )
 
+    def note_adjustment(self, business_id, party_kind, date_from, date_to,
+                        party_id=None, created_by_id=None):
+        """
+        Debit notes less credit notes for one party kind over a window, dated
+        by the note's own date. Added to invoice-based revenue (customer
+        notes) or purchase value (supplier notes) - see the credit-debit-notes
+        plan, 5.5. Notes are always cleared, so .cleared() changes nothing
+        today; it keeps the rule the same as every other money figure.
+        """
+        credit, debit = f'{party_kind}_credit_note', f'{party_kind}_debit_note'
+        queryset = (
+            self.get_queryset()
+            .for_business(business_id)
+            .cleared()
+            .in_range('date', date_from, date_to)
+            .filter(type__in=[credit, debit])
+        )
+        if party_id is not None:
+            queryset = queryset.filter(
+                **{f'party_payment__{party_kind}_id': party_id})
+        if created_by_id is not None:
+            queryset = queryset.filter(created_by_id=created_by_id)
+        return queryset.aggregate(value=(
+            Coalesce(models.Sum('amount', filter=Q(type=debit)), 0)
+            - Coalesce(models.Sum('amount', filter=Q(type=credit)), 0)
+        ))['value'] or 0
+
     def cash_paid(self, business_id, date_from, date_to,
                   supplier_id=None, payment_method=None):
         """

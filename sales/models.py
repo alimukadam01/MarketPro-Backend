@@ -534,20 +534,28 @@ class PurchaseInvoiceManager(models.Manager):
         )
 
     def total_pending_invoices(self, business_id):
-        # An invoice is pending until the receipts against it cover its total.
-        return (
+        """
+        Invoices not yet paid in full - by their own payments AND what the
+        supplier's khaata settles onto them, the same payment_status the
+        purchases table shows. Drafts and cancelled invoices are not debts,
+        so they are not pending either.
+
+        This used to count every invoice whose own receipts fell short,
+        cancelled ones included, so an invoice the khaata had settled stayed
+        "pending" here for ever.
+        """
+        # Function-level import: accounts imports this module at load time.
+        from accounts.settlement import attach_settlement
+
+        model = self.model
+        invoices = list(
             self.get_queryset()
             .for_business(business_id)
-            .annotate(paid=Sum(
-                'payment_receipts__amount',
-                filter=(
-                    Q(payment_receipts__transaction_record__isnull=True) |
-                    Q(payment_receipts__transaction_record__status='C')
-                ),
-            ))
-            .filter(Q(paid__isnull=True) | Q(paid__lt=F('total')))
-            .count()
+            .exclude(status__in=model.CANCELLED_STATUSES + model.DRAFT_STATUSES)
+            .prefetch_related('payment_receipts__transaction_record')
         )
+        attach_settlement(invoices)
+        return sum(1 for invoice in invoices if invoice.payment_status != 'P')
 
 
 class PurchaseInvoice(SettledInvoiceMixin, models.Model):
