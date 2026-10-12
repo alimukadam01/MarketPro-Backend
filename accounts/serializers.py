@@ -205,8 +205,10 @@ class BaseTransactionWriteSerializer(serializers.ModelSerializer):
     Shared validation for creating and updating a transaction.
     """
 
+    # Not required at the field: a note has no account. validate() requires it
+    # for every other type, which is what the field used to enforce.
     account = serializers.PrimaryKeyRelatedField(
-        queryset=MoneyAccount.objects.none())
+        queryset=MoneyAccount.objects.none(), required=False, allow_null=True)
     transfer_account = serializers.PrimaryKeyRelatedField(
         queryset=MoneyAccount.objects.none(), required=False, allow_null=True)
     customer = serializers.PrimaryKeyRelatedField(
@@ -258,11 +260,79 @@ class BaseTransactionWriteSerializer(serializers.ModelSerializer):
                     .exclude(status__in=PurchaseInvoice.CANCELLED_STATUSES)
                 )
 
+    # Fields that describe money moving. A note moves none, so it may carry
+    # none of them.
+    MONEY_ONLY_FIELDS = (
+        'account', 'transfer_account', 'payment_method',
+        'cheque_number', 'cheque_due_date',
+    )
+
+    def _validate_note(self, attrs, txn_type):
+        """
+        A note names exactly one party of its own kind and nothing about money.
+        It is cleared the moment it exists: there is no cheque to wait on.
+        """
+        for field in self.MONEY_ONLY_FIELDS:
+            if attrs.get(field):
+                raise serializers.ValidationError({
+                    field: 'A credit or debit note moves no money, so it has '
+                           'no account, payment method or cheque.'
+                })
+
+        party_kind = Transaction.NOTE_PARTY[txn_type]
+        other_kind = 'supplier' if party_kind == 'customer' else 'customer'
+        if attrs.get(other_kind):
+            raise serializers.ValidationError({
+                other_kind: f'This note is for a {party_kind}, not a {other_kind}.'
+            })
+
+        party = attrs.get(party_kind)
+        if party is None and self.instance is not None:
+            # An update that leaves the party alone keeps the one on file.
+            existing = getattr(self.instance, 'party_payment', None)
+            party = getattr(existing, party_kind, None) if existing else None
+            if party is not None:
+                attrs[party_kind] = party
+        if party is None:
+            raise serializers.ValidationError({
+                party_kind: f'A {party_kind} note must name the {party_kind}.'
+            })
+
+        for field in self.MONEY_ONLY_FIELDS:
+            attrs[field] = None
+        attrs['status'] = 'C'
+        return attrs
+
     def validate(self, attrs):
         txn_type = attrs.get('type') or getattr(self.instance, 'type', None)
         amount = attrs.get('amount', getattr(self.instance, 'amount', 0))
+
+        if txn_type in Transaction.NOTE_TYPES:
+            if amount is not None and amount <= 0:
+                raise serializers.ValidationError({
+                    'amount': 'Amount must be greater than zero.'
+                })
+            customer = attrs.get('customer')
+            supplier = attrs.get('supplier')
+            if customer and supplier:
+                raise serializers.ValidationError({
+                    'customer': 'Name either a customer or a supplier, not both.'
+                })
+            return self._validate_note(attrs, txn_type)
+
+        # Every type except a note moves money through an account.
+        account = attrs.get('account', getattr(self.instance, 'account', None))
+        if account is None:
+            raise serializers.ValidationError({
+                'account': 'This field is required.'
+            })
         method = attrs.get(
-            'payment_method', getattr(self.instance, 'payment_method', 'cash'))
+            'payment_method', getattr(self.instance, 'payment_method', None))
+        if not method:
+            # The column is nullable only for notes. A money transaction sent
+            # without a method - or one that used to be a note - gets the same
+            # default the field always had.
+            attrs['payment_method'] = method = 'cash'
 
         # Whole rupees only; negatives are meaningful for adjustments alone.
         if txn_type != 'cash_adjustment' and amount is not None and amount <= 0:
@@ -362,6 +432,18 @@ class TransactionCreateSerializer(BaseTransactionWriteSerializer):
 
         txn_type = attrs.get('type')
         amount = float(attrs.get('amount') or 0)
+
+        # A note never names an invoice: it settles the party's khaata, oldest
+        # debt first (accounts/settlement.py). Naming one here would suggest a
+        # link the system does not make.
+        if txn_type in Transaction.NOTE_TYPES:
+            for field in ('sales_invoice', 'purchase_invoice', 'expense_name'):
+                if attrs.get(field):
+                    raise serializers.ValidationError({
+                        field: 'A credit or debit note settles the khaata, '
+                               'not a single invoice or expense.'
+                    })
+            return attrs
 
         # A sale or purchase payment settles an invoice, so it must name one.
         # Without this the screen can manufacture revenue that no customer is
@@ -548,6 +630,18 @@ class TransactionUpdateSerializer(BaseTransactionWriteSerializer):
             'cheque_number', 'cheque_due_date', 'customer', 'supplier',
         ]
         extra_kwargs = {'image': {'required': False}}
+
+    def validate(self, attrs):
+        # A receipt- or expense-backed transaction mirrors its source; editing
+        # it here lets the two disagree (the receipt says 50,000, the
+        # transaction says 40,000). The update screen already locks these
+        # fields, but only in the browser - this is the server-side lock.
+        if self.instance is not None and self.instance.is_source_linked:
+            raise serializers.ValidationError({
+                'detail': 'This transaction came from an invoice payment or '
+                          'an expense. Edit it from that record instead.'
+            })
+        return super().validate(attrs)
 
     def update(self, instance, validated_data):
         customer = validated_data.pop('customer', None)
