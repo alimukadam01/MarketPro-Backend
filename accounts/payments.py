@@ -27,8 +27,9 @@ from root.models import Customer, Supplier
 from sales.models import PurchaseInvoice, SalesInvoice
 from sales.utils import invoice_room, live_receipt_total
 
+from .settlement import attach_settlement
 from .utils import (
-    CANCELLED_PURCHASE_STATUSES, CANCELLED_SALES_STATUSES,
+    NOT_A_DEBT_PURCHASE_STATUSES, NOT_A_DEBT_SALES_STATUSES,
     opening_balance_remaining,
 )
 
@@ -54,7 +55,7 @@ def _invoice_queryset(business_id, party, party_id):
         return (
             SalesInvoice.objects
             .filter(business_id=business_id, customer_id=party_id)
-            .exclude(status__in=CANCELLED_SALES_STATUSES)
+            .exclude(status__in=NOT_A_DEBT_SALES_STATUSES)
             .prefetch_related('payment_receipts__transaction_record')
             .order_by('date_issued', 'id')
         )
@@ -62,7 +63,7 @@ def _invoice_queryset(business_id, party, party_id):
     return (
         PurchaseInvoice.objects
         .filter(business_id=business_id, supplier_id=party_id)
-        .exclude(status__in=CANCELLED_PURCHASE_STATUSES)
+        .exclude(status__in=NOT_A_DEBT_PURCHASE_STATUSES)
         .prefetch_related('payment_receipts__transaction_record')
         .order_by('date_issued', 'id')
     )
@@ -97,21 +98,25 @@ def settleable_items(business_id, party, party_id):
             'kind': OPENING_BALANCE,
             'id': party_id,
             'label': 'Outstanding balance',
-            'sub': 'On account · excludes pending invoices',
+            'sub': 'On account · settles the opening balance, then pending invoices',
             'date': opening.as_of_date.isoformat() if opening else None,
             'total': owed,
             'room': room,
             'reserved': max(owed - room, 0),
         })
 
-    for invoice in _invoice_queryset(business_id, party, party_id):
+    # One khaata pass for the party, not one per invoice: invoice_room reads
+    # each invoice's pool share, which attach_settlement fills in.
+    invoices = attach_settlement(
+        list(_invoice_queryset(business_id, party, party_id)))
+    for invoice in invoices:
         room = int(invoice_room(invoice))
         if room <= 0:
             continue
 
         total = float(invoice.total or 0)
         reserved = round(float(live_receipt_total(invoice))
-                         - float(invoice.amount_paid or 0))
+                         - float(invoice.receipts_paid or 0))
 
         items.append({
             'kind': INVOICE,

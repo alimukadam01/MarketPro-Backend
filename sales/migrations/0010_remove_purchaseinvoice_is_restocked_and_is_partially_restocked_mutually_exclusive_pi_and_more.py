@@ -9,27 +9,13 @@ class Migration(migrations.Migration):
         ('sales', '0009_alter_purchaseinvoiceitemrestock_received_at_and_more'),
     ]
 
+    # This migration used to open with five RemoveConstraint operations for
+    # the *_mutually_exclusive_* check constraints. No migration in this repo
+    # ever creates them - 0005 has its AddConstraint calls commented out - so a
+    # database built from scratch (every test run) failed here with "No
+    # constraint named ...". Databases that already applied this migration are
+    # unaffected by the removal: Django never re-runs an applied migration.
     operations = [
-        migrations.RemoveConstraint(
-            model_name='purchaseinvoice',
-            name='is_restocked_and_is_partially_restocked_mutually_exclusive_pi',
-        ),
-        migrations.RemoveConstraint(
-            model_name='purchaseinvoiceitem',
-            name='is_restocked_and_is_partially_restocked_mutually_exclusive_pii',
-        ),
-        migrations.RemoveConstraint(
-            model_name='salesinvoice',
-            name='is_deducted_and_is_partially_deducted_mutually_exclusive_si',
-        ),
-        migrations.RemoveConstraint(
-            model_name='salesinvoiceitem',
-            name='is_returned_and_is_partially_returned_mutually_exclusive',
-        ),
-        migrations.RemoveConstraint(
-            model_name='salesinvoiceitem',
-            name='is_deducted_and_is_partially_deducted_mutually_exclusive_sii',
-        ),
         migrations.AddField(
             model_name='returneditem',
             name='is_damaged',
