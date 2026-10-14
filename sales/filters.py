@@ -1,36 +1,42 @@
-"""Filters for the sales invoice list.
+"""Filters for the sales and purchase invoice lists.
 
-`payment_status` is a property rather than a column: it is derived from the
-receipts recorded against the invoice, which is why nothing stores it
-(SalesInvoice.payment_status). DjangoFilterBackend can only filter columns, so
-a ?payment_status= parameter was accepted and then silently ignored - the list
-came back unfiltered and looked like the filter had simply matched everything.
+`payment_status` is a property rather than a column (SettledInvoiceMixin), so
+DjangoFilterBackend cannot filter it: a ?payment_status= parameter used to be
+accepted and silently ignored.
 
-This reproduces the property in SQL so the filter and the column shown in the
-table cannot disagree. The arithmetic is kept deliberately close to
-SalesInvoice.payment_status; if that changes, this has to change with it.
+It used to be reproduced here in SQL from the invoice's own receipts. Since
+credit and debit notes (credit-debit-notes plan), an invoice is also paid by
+whatever its party's khaata settles onto it - opening balance first, then
+oldest debts - and that matching cannot be expressed as a per-row subquery.
+So the filter now asks the same property the table prints, after one khaata
+pass per party (accounts.settlement.attach_settlement). The filter and the
+column cannot disagree, because they are the same code.
 """
-from django.db.models import F, FloatField, OuterRef, Q, Subquery, Sum
-from django.db.models.functions import Coalesce
 from django_filters import rest_framework as filters
 
-from .models import (
-    PurchaseInvoice, PurchaseReceipt, SalesInvoice, SalesReceipt,
-)
+from .models import PurchaseInvoice, SalesInvoice
 
-# Only money that has cleared pays an invoice down. Mirrors
-# SalesInvoice.amount_paid: a receipt whose transaction is pending or bounced
-# has settled nothing, while one with no transaction at all predates the
-# accounting module and always counts.
-CLEARED_RECEIPT = (
-    Q(transaction_record__isnull=True) | Q(transaction_record__status='C')
-)
+
+def filter_by_payment_status(queryset, value):
+    """
+    The invoices in `queryset` whose payment_status is `value`, still as a
+    queryset so ordering, search and the other filters compose with it.
+    """
+    # Function-level import: accounts imports sales at load time.
+    from accounts.settlement import attach_settlement
+
+    invoices = list(
+        queryset.prefetch_related('payment_receipts__transaction_record'))
+    attach_settlement(invoices)
+    return queryset.filter(
+        id__in=[invoice.id for invoice in invoices
+                if invoice.payment_status == value])
 
 
 class SalesInvoiceFilter(filters.FilterSet):
 
-    # payment_status is computed from the receipts, so these three are the only
-    # values an invoice can ever report. The model also defines 'C' and 'RF',
+    # payment_status is derived (own receipts plus the khaata's pool), so these
+    # three are the only values an invoice can ever report. The model also defines 'C' and 'RF',
     # but the property never returns them, and offering a choice that can match
     # nothing is worse than leaving it out.
     PAYMENT_STATUS_CHOICES = [
@@ -71,54 +77,16 @@ class SalesInvoiceFilter(filters.FilterSet):
         ]
 
     def filter_payment_status(self, queryset, name, value):
-        # Named amount_paid_value, not amount_paid: an annotation that shares a
-        # name with the property would shadow it on every instance and the
-        # serializer would then report the annotation instead.
-        paid = Subquery(
-            SalesReceipt.objects
-            .filter(sales_invoice=OuterRef('pk'))
-            .filter(CLEARED_RECEIPT)
-            .values('sales_invoice')
-            .annotate(cleared=Sum('amount'))
-            .values('cleared')[:1],
-            output_field=FloatField(),
-        )
-        queryset = queryset.annotate(
-            amount_paid_value=Coalesce(paid, 0.0),
-            # total is nullable, and NULL would make every comparison below
-            # drop the row rather than treat it as unpaid.
-            invoice_total=Coalesce(F('total'), 0.0),
-        )
-
-        if value == 'P':
-            return queryset.filter(
-                invoice_total__gt=0,
-                amount_paid_value__gte=F('invoice_total'),
-            )
-
-        if value == 'PP':
-            # Anything paid that is not fully paid. Written as the property's
-            # second branch - paid > 0 having already failed the PAID test -
-            # rather than as paid < total, which would also catch a zero-total
-            # invoice with money against it.
-            return queryset.filter(amount_paid_value__gt=0).exclude(
-                invoice_total__gt=0,
-                amount_paid_value__gte=F('invoice_total'),
-            )
-
-        if value == 'PEN':
-            return queryset.filter(amount_paid_value__lte=0)
-
-        return queryset
+        return filter_by_payment_status(queryset, value)
 
 
 class PurchaseInvoiceFilter(filters.FilterSet):
     """
     The purchase-side twin of SalesInvoiceFilter.
 
-    PurchaseInvoice.payment_status is derived exactly as the sales one is -
-    cleared receipts against the total - so the same three values are the only
-    ones an invoice can report, and the same SQL reproduces them.
+    PurchaseInvoice.payment_status is derived exactly as the sales one is, so
+    the same three values are the only ones an invoice can report, and the
+    same function filters them.
     """
 
     PAYMENT_STATUS_CHOICES = SalesInvoiceFilter.PAYMENT_STATUS_CHOICES
@@ -151,33 +119,4 @@ class PurchaseInvoiceFilter(filters.FilterSet):
         ]
 
     def filter_payment_status(self, queryset, name, value):
-        paid = Subquery(
-            PurchaseReceipt.objects
-            .filter(purchase_invoice=OuterRef('pk'))
-            .filter(CLEARED_RECEIPT)
-            .values('purchase_invoice')
-            .annotate(cleared=Sum('amount'))
-            .values('cleared')[:1],
-            output_field=FloatField(),
-        )
-        queryset = queryset.annotate(
-            amount_paid_value=Coalesce(paid, 0.0),
-            invoice_total=Coalesce(F('total'), 0.0),
-        )
-
-        if value == 'P':
-            return queryset.filter(
-                invoice_total__gt=0,
-                amount_paid_value__gte=F('invoice_total'),
-            )
-
-        if value == 'PP':
-            return queryset.filter(amount_paid_value__gt=0).exclude(
-                invoice_total__gt=0,
-                amount_paid_value__gte=F('invoice_total'),
-            )
-
-        if value == 'PEN':
-            return queryset.filter(amount_paid_value__lte=0)
-
-        return queryset
+        return filter_by_payment_status(queryset, value)

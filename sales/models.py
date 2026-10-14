@@ -48,6 +48,76 @@ class PaymentReceipt(models.Model):
         abstract = True
 
 
+class SettledInvoiceMixin:
+    """
+    What an invoice has been paid, shared by sales and purchase invoices.
+
+    Two layers, always in this order (credit-debit-notes plan, section 4):
+
+    1. receipts_paid - payments recorded against THIS invoice. Stored; the
+       owner chose them.
+    2. pool_applied - the share of the party's unnamed money (credit notes,
+       on-account payments, overpayments, a credit opening balance) that the
+       khaata settles onto this invoice, opening balance first and then
+       oldest-first. Computed by accounts.settlement, never stored.
+
+    amount_paid is the sum, so every reader that means "how much of this
+    invoice is settled" - status, pending balance, the WhatsApp message -
+    agrees with the khaata.
+    """
+
+    @property
+    def receipts_paid(self):
+        # Python-side sum so prefetched receipts are reused on list views.
+        # Only money that has actually cleared pays the invoice down — a
+        # pending or bounced cheque is recorded against it but settles
+        # nothing until it clears. The settlement engine reads THIS, never
+        # amount_paid, which would recurse into it.
+        total = 0
+        for receipt in self.payment_receipts.all():
+            transaction = getattr(receipt, 'transaction_record', None)
+            if transaction and transaction.status != 'C':
+                continue
+            total += receipt.amount or 0
+        return total
+
+    @property
+    def pool_applied(self):
+        """
+        Cached on the instance: accounts.settlement.attach_settlement sets it
+        for a whole page of invoices in one pass per party. A lone invoice
+        computes its party's khaata on first use.
+        """
+        cached = getattr(self, '_pool_applied', None)
+        if cached is None:
+            # Function-level import: accounts imports this module at load
+            # time, so importing accounts back at module level would make a
+            # cycle on startup.
+            from accounts.settlement import attach_settlement
+            attach_settlement([self])
+            cached = self._pool_applied
+        return cached
+
+    @property
+    def amount_paid(self):
+        return self.receipts_paid + self.pool_applied
+
+    @property
+    def payment_status(self):
+        """
+        Always derived - from the invoice's own payments plus what the khaata
+        settles onto it. Never stored, never set by hand.
+        """
+        paid = self.amount_paid
+        invoice_total = self.total or 0
+
+        if invoice_total > 0 and paid >= invoice_total:
+            return 'P'
+        if paid > 0:
+            return 'PP'
+        return 'PEN'
+
+
 class SalesInvoiceQuerySet(BaseQuerySet):
 
     pass
@@ -147,7 +217,7 @@ class SalesInvoiceManager(models.Manager):
         )
 
 
-class SalesInvoice(models.Model):
+class SalesInvoice(SettledInvoiceMixin, models.Model):
 
     SALES_INVOICE_STATUS_CHOICES = [
         ("D", "DRAFT"),
@@ -162,6 +232,8 @@ class SalesInvoice(models.Model):
     # from accounts, which imports this module and cannot be imported back.
     # Note 'C' means COMPLETED here and CANCELLED on a purchase invoice.
     CANCELLED_STATUSES = ["X"]
+    # Not confirmed yet, so not a debt: left out of the khaata with cancelled.
+    DRAFT_STATUSES = ["D"]
 
     PAYMENT_STATUS_CHOICES = [
         ("P", "PAID"),
@@ -203,35 +275,6 @@ class SalesInvoice(models.Model):
     is_partially_deducted = models.BooleanField(default=False)
 
     objects = SalesInvoiceManager()
-
-    @property
-    def amount_paid(self):
-        # Python-side sum so prefetched receipts are reused on list views.
-        # Only money that has actually cleared pays the invoice down — a
-        # pending or bounced cheque is recorded against it but settles
-        # nothing until it clears.
-        total = 0
-        for receipt in self.payment_receipts.all():
-            transaction = getattr(receipt, 'transaction_record', None)
-            if transaction and transaction.status != 'C':
-                continue
-            total += receipt.amount or 0
-        return total
-
-    @property
-    def payment_status(self):
-        """
-        Always derived from the payments recorded against the invoice.
-        Never stored, never set by hand.
-        """
-        paid = self.amount_paid
-        invoice_total = self.total or 0
-
-        if invoice_total > 0 and paid >= invoice_total:
-            return 'P'
-        if paid > 0:
-            return 'PP'
-        return 'PEN'
 
     def update_deduction_flags(self):
         items = self.invoice_items.all()
@@ -491,23 +534,31 @@ class PurchaseInvoiceManager(models.Manager):
         )
 
     def total_pending_invoices(self, business_id):
-        # An invoice is pending until the receipts against it cover its total.
-        return (
+        """
+        Invoices not yet paid in full - by their own payments AND what the
+        supplier's khaata settles onto them, the same payment_status the
+        purchases table shows. Drafts and cancelled invoices are not debts,
+        so they are not pending either.
+
+        This used to count every invoice whose own receipts fell short,
+        cancelled ones included, so an invoice the khaata had settled stayed
+        "pending" here for ever.
+        """
+        # Function-level import: accounts imports this module at load time.
+        from accounts.settlement import attach_settlement
+
+        model = self.model
+        invoices = list(
             self.get_queryset()
             .for_business(business_id)
-            .annotate(paid=Sum(
-                'payment_receipts__amount',
-                filter=(
-                    Q(payment_receipts__transaction_record__isnull=True) |
-                    Q(payment_receipts__transaction_record__status='C')
-                ),
-            ))
-            .filter(Q(paid__isnull=True) | Q(paid__lt=F('total')))
-            .count()
+            .exclude(status__in=model.CANCELLED_STATUSES + model.DRAFT_STATUSES)
+            .prefetch_related('payment_receipts__transaction_record')
         )
+        attach_settlement(invoices)
+        return sum(1 for invoice in invoices if invoice.payment_status != 'P')
 
 
-class PurchaseInvoice(models.Model):
+class PurchaseInvoice(SettledInvoiceMixin, models.Model):
 
     PURCHASE_INVOICE_STATUS_CHOICES = [
         ("D", "DRAFT"),
@@ -521,6 +572,8 @@ class PurchaseInvoice(models.Model):
     # Always reach for this constant; a literal here is the likeliest way to
     # get a purchase figure wrong.
     CANCELLED_STATUSES = ["C"]
+    # Not confirmed yet, so not a debt: left out of the khaata with cancelled.
+    DRAFT_STATUSES = ["D"]
 
     PAYMENT_STATUS_CHOICES = [
         ("P", "PAID"),
@@ -561,35 +614,6 @@ class PurchaseInvoice(models.Model):
     is_partially_restocked = models.BooleanField(default=False)
 
     objects = PurchaseInvoiceManager()
-
-    @property
-    def amount_paid(self):
-        # Python-side sum so prefetched receipts are reused on list views.
-        # Only money that has actually cleared pays the invoice down — a
-        # pending or bounced cheque is recorded against it but settles
-        # nothing until it clears.
-        total = 0
-        for receipt in self.payment_receipts.all():
-            transaction = getattr(receipt, 'transaction_record', None)
-            if transaction and transaction.status != 'C':
-                continue
-            total += receipt.amount or 0
-        return total
-
-    @property
-    def payment_status(self):
-        """
-        Always derived from the payments recorded against the invoice.
-        Never stored, never set by hand.
-        """
-        paid = self.amount_paid
-        invoice_total = self.total or 0
-
-        if invoice_total > 0 and paid >= invoice_total:
-            return 'P'
-        if paid > 0:
-            return 'PP'
-        return 'PEN'
 
     def __str__(self):
         return f"{self.id}-{self.invoice_number}-{self.total}-{self.status}"

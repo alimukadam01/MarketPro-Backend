@@ -11,6 +11,7 @@ from sales.models import (
     SalesReceipt
 )
 from .models import MoneyAccount, PartyOpeningBalance, PartyPayment, Transaction
+from .settlement import settle_parties, settle_party
 
 
 MODULE = 'accounting'
@@ -34,12 +35,33 @@ PARTY_ON_ACCOUNT = {
     'customer': {
         'payment': 'customer_receipt',
         'refund': 'sales_return_refund',
+        'credit_note': 'customer_credit_note',
+        'debit_note': 'customer_debit_note',
     },
     'supplier': {
         'payment': 'supplier_payment',
         'refund': 'purchase_return_refund',
+        'credit_note': 'supplier_credit_note',
+        'debit_note': 'supplier_debit_note',
     },
 }
+
+
+def note_totals(business_id, party_filter, kinds):
+    """
+    One party's credit and debit notes. Always cleared - a note is never
+    pending - so there is no status question to answer here.
+    """
+    rows = (
+        PartyPayment.objects
+        .filter(business_id=business_id, transaction__status='C',
+                transaction__type__in=[kinds['credit_note'], kinds['debit_note']],
+                **party_filter)
+        .values('transaction__type')
+        .annotate(total=Sum('transaction__amount'))
+    )
+    totals = {row['transaction__type']: row['total'] or 0 for row in rows}
+    return totals.get(kinds['credit_note'], 0), totals.get(kinds['debit_note'], 0)
 
 
 def on_account_totals(business_id, party_filter, kinds, statuses=CLEARED_ONLY):
@@ -79,9 +101,18 @@ def receipt_date(receipt):
         return transaction.date
     return local_date(receipt.created_at)
 
-# Invoices in these states never count toward what a party owes.
+# Invoices in these states never happened. Reporting (revenue, purchase value,
+# targets) excludes only these.
 CANCELLED_SALES_STATUSES = ['X']
 CANCELLED_PURCHASE_STATUSES = ['C']
+
+# Invoices that are not debts on the khaata: cancelled ones never happened and
+# drafts are not confirmed yet (credit-debit-notes plan, D11). A khaata rule
+# only - reporting keeps counting drafts as it always has.
+NOT_A_DEBT_SALES_STATUSES = (
+    SalesInvoice.CANCELLED_STATUSES + SalesInvoice.DRAFT_STATUSES)
+NOT_A_DEBT_PURCHASE_STATUSES = (
+    PurchaseInvoice.CANCELLED_STATUSES + PurchaseInvoice.DRAFT_STATUSES)
 
 
 def has_accounting_access(request, business):
@@ -137,208 +168,150 @@ def previous_month_bounds(day=None):
 
 def party_invoiced(business_id, customer=None, supplier=None):
     """
-    Everything ever billed to a party, cancelled invoices excluded. This is the
-    total business done with them, and the figure every balance starts from.
+    Everything billed to a party that is a debt: cancelled invoices never
+    happened and drafts are not confirmed yet, so neither counts. The figure
+    every balance starts from.
     """
     if customer:
         return (
             SalesInvoice.objects
             .filter(business_id=business_id, customer_id=customer.id)
-            .exclude(status__in=CANCELLED_SALES_STATUSES)
+            .exclude(status__in=NOT_A_DEBT_SALES_STATUSES)
             .aggregate(total=Sum('total'))['total'] or 0
         )
 
     return (
         PurchaseInvoice.objects
         .filter(business_id=business_id, supplier_id=supplier.id)
-        .exclude(status__in=CANCELLED_PURCHASE_STATUSES)
+        .exclude(status__in=NOT_A_DEBT_PURCHASE_STATUSES)
         .aggregate(total=Sum('total'))['total'] or 0
     )
 
 
-def customer_balance(customer, business_id):
+def _party_balance(business_id, kind, party, receipts):
     """
-    What a customer owes: invoiced, less what they have paid, plus whatever
-    they already owed on the paper khaata.
+    invoiced - paid against invoices - paid on account + refunded
+             - credit notes + debit notes + opening balance
+
+    Four aggregates rather than a settlement pass, because list screens call
+    this once per party. The engine's balance is the same figure by
+    construction; accounts.tests_settlement asserts it.
+
+    `paid` counts every cleared receipt, including one on a draft or
+    cancelled invoice: that money was still received. The engine keeps it as
+    credit for the same reason.
     """
-    invoiced = party_invoiced(business_id, customer=customer)
+    party_filter = {f'{kind}_id': party.id}
+    kinds = PARTY_ON_ACCOUNT[kind]
+    invoiced = party_invoiced(business_id, **{kind: party})
+    paid = receipts.filter(CLEARED_RECEIPT).aggregate(
+        total=Sum('amount'))['total'] or 0
+    settled, refunded = on_account_totals(business_id, party_filter, kinds)
+    credited, debited = note_totals(business_id, party_filter, kinds)
 
-    paid = (
-        SalesReceipt.objects
-        .filter(sales_invoice__business_id=business_id,
-                sales_invoice__customer_id=customer.id)
-        .filter(CLEARED_RECEIPT)
-        .aggregate(total=Sum('amount'))['total'] or 0
-    )
-
-    settled, refunded = on_account_totals(
-        business_id, {'customer_id': customer.id},
-        PARTY_ON_ACCOUNT['customer'],
-    )
-
-    opening = getattr(customer, 'opening_balance', None)
+    opening = getattr(party, 'opening_balance', None)
     opening_amount = opening.amount if opening else 0
 
-    return round(invoiced - paid - settled + refunded + opening_amount)
+    return round(invoiced - paid - settled + refunded
+                 - credited + debited + opening_amount)
+
+
+def customer_balance(customer, business_id):
+    """
+    What a customer owes (negative: what the business owes them).
+    """
+    receipts = SalesReceipt.objects.filter(
+        sales_invoice__business_id=business_id,
+        sales_invoice__customer_id=customer.id)
+    return _party_balance(business_id, 'customer', customer, receipts)
 
 
 def supplier_balance(supplier, business_id):
     """
-    What we owe a supplier, mirroring customer_balance.
+    What the business owes a supplier (negative: what they owe the business),
+    mirroring customer_balance.
     """
-    invoiced = party_invoiced(business_id, supplier=supplier)
-
-    paid = (
-        PurchaseReceipt.objects
-        .filter(purchase_invoice__business_id=business_id,
-                purchase_invoice__supplier_id=supplier.id)
-        .filter(CLEARED_RECEIPT)
-        .aggregate(total=Sum('amount'))['total'] or 0
-    )
-
-    settled, refunded = on_account_totals(
-        business_id, {'supplier_id': supplier.id},
-        PARTY_ON_ACCOUNT['supplier'],
-    )
-
-    opening = getattr(supplier, 'opening_balance', None)
-    opening_amount = opening.amount if opening else 0
-
-    return round(invoiced - paid - settled + refunded + opening_amount)
+    receipts = PurchaseReceipt.objects.filter(
+        purchase_invoice__business_id=business_id,
+        purchase_invoice__supplier_id=supplier.id)
+    return _party_balance(business_id, 'supplier', supplier, receipts)
 
 
 def aging_buckets(business_id, customer):
     """
     What a customer owes, split by how long it has been owed.
 
-    Aged first-in-first-out, the way a khaata is settled in practice. Every
-    rupee owed is a dated debt: each invoice's unpaid part, and a debit
-    opening balance carried over from paper. Money in the customer's favour
-    that is not tied to one invoice - on-account payments, a credit opening
-    balance, overpayment on an invoice - clears the oldest debt first. The
-    buckets therefore always add up to customer_balance().
-
-    Each invoice used to be aged against its own receipts only, so on-account
-    payments and opening balances never reached the buckets, and the three of
-    them overstated the Receivable card they sit under.
+    Read straight off the khaata settlement (accounts/settlement.py): the
+    debts left after the pool has settled the opening balance first and then
+    the oldest debts, each aged from its own date. The buckets always add up
+    to the balance.
     """
-    today = timezone.localdate()
-    buckets = {'current': 0, 'days_31_60': 0, 'days_over_60': 0}
-    debts = []      # (date owed since, amount)
-    credit = 0      # money in their favour, not yet set against a debt
+    return settle_party(business_id, 'customer', customer.id).aging()
 
-    invoices = (
-        SalesInvoice.objects
-        .filter(business_id=business_id, customer_id=customer.id)
-        .exclude(status__in=CANCELLED_SALES_STATUSES)
-        .prefetch_related('payment_receipts__transaction_record')
+
+def _khaata_sides(business_id):
+    """
+    Every party's settled khaata, split by who owes whom (plan D10).
+
+    Receivables: customers who owe the business, and suppliers who owe it
+    (more credit than debt - a rebate, an advance). Payables: the mirror.
+    Four queries per party kind, however many parties.
+    """
+    receivable, payable = [], []
+    kinds = (
+        ('customer', Customer.objects.filter(business_id=business_id)),
+        ('supplier', Supplier.objects.filter(business_id=business_id)),
     )
-
-    for invoice in invoices:
-        outstanding = (invoice.total or 0) - invoice.amount_paid
-        issued = local_date(invoice.date_issued) if invoice.date_issued else today
-        if outstanding > 0:
-            debts.append((issued, outstanding))
-        else:
-            # Overpaid. The excess still counts in customer_balance, so it
-            # pays down their other invoices here too.
-            credit -= outstanding
-
-    opening = getattr(customer, 'opening_balance', None)
-    if opening and opening.amount > 0:
-        debts.append((opening.as_of_date, opening.amount))
-    elif opening and opening.amount < 0:
-        credit -= opening.amount
-
-    settled, refunded = on_account_totals(
-        business_id, {'customer_id': customer.id},
-        PARTY_ON_ACCOUNT['customer'],
-    )
-    credit += settled - refunded
-    if credit < 0:
-        # More refunded than was ever paid on account: money that went back
-        # out and is owed again. on_account_totals gives no date, so it is
-        # aged from today rather than guessed.
-        debts.append((today, -credit))
-        credit = 0
-
-    for owed_since, amount in sorted(debts, key=lambda debt: debt[0]):
-        applied = min(credit, amount)
-        credit -= applied
-        remaining = amount - applied
-        if remaining <= 0:
-            continue
-
-        age = (today - owed_since).days
-        if age <= 30:
-            buckets['current'] += remaining
-        elif age <= 60:
-            buckets['days_31_60'] += remaining
-        else:
-            buckets['days_over_60'] += remaining
-
-    return {key: round(value) for key, value in buckets.items()}
+    for kind, parties in kinds:
+        settled = settle_parties(business_id, kind)
+        for party in parties:
+            khaata = settled.get(party.id)
+            if khaata is None:
+                continue
+            balance = round(khaata.balance)
+            if balance == 0:
+                continue
+            owes_business = balance > 0 if kind == 'customer' else balance < 0
+            row = {
+                'id': party.id,
+                'party_kind': kind,
+                'name': party.name,
+                'business_name': getattr(party, 'business_name', None),
+                'phone': party.phone,
+                'balance': abs(balance),
+                'aging': khaata.aging(),
+            }
+            (receivable if owes_business else payable).append(row)
+    return receivable, payable
 
 
 def receivables(business_id):
     """
-    Every customer with money outstanding, largest first, plus aging (§6.5).
+    Everyone who owes the business, largest first, plus aging (§6.5) - the
+    customers with a balance, and any supplier holding the business's money.
     """
-    rows = []
-    total = 0
+    rows, _ = _khaata_sides(business_id)
     totals = {'current': 0, 'days_31_60': 0, 'days_over_60': 0}
-
-    customers = Customer.objects.filter(
-        business_id=business_id).select_related('opening_balance')
-
-    for customer in customers:
-        balance = customer_balance(customer, business_id)
-        if balance <= 0:
-            continue
-
-        total += balance
-        buckets = aging_buckets(business_id, customer)
+    for row in rows:
         for key in totals:
-            totals[key] += buckets[key]
-
-        rows.append({
-            'id': customer.id,
-            'name': customer.name,
-            'phone': customer.phone,
-            'balance': balance,
-            'aging': buckets,
-        })
+            totals[key] += row['aging'][key]
 
     rows.sort(key=lambda row: row['balance'], reverse=True)
-    return {'total': total, 'parties': rows, 'aging': totals}
+    return {
+        'total': sum(row['balance'] for row in rows),
+        'parties': rows,
+        'aging': totals,
+    }
 
 
 def payables(business_id):
     """
-    Every supplier we owe, largest first.
+    Everyone the business owes, largest first - suppliers with a balance, and
+    any customer it holds money for (an overpayment, a credit note).
     """
-    rows = []
-    total = 0
-
-    suppliers = Supplier.objects.filter(
-        business_id=business_id).select_related('opening_balance')
-
-    for supplier in suppliers:
-        balance = supplier_balance(supplier, business_id)
-        if balance <= 0:
-            continue
-
-        total += balance
-        rows.append({
-            'id': supplier.id,
-            'name': supplier.name,
-            'business_name': supplier.business_name,
-            'phone': supplier.phone,
-            'balance': balance,
-        })
-
+    _, rows = _khaata_sides(business_id)
     rows.sort(key=lambda row: row['balance'], reverse=True)
-    return {'total': total, 'parties': rows}
+    return {'total': sum(row['balance'] for row in rows), 'parties': rows}
 
 
 def opening_balance_remaining(business_id, party, party_id, opening=None,
@@ -349,11 +322,17 @@ def opening_balance_remaining(business_id, party, party_id, opening=None,
     Returns (opening_balance, settled, remaining); remaining is never negative,
     and a party with no opening balance is (0, 0, 0).
 
-    include_pending=True counts money held by a pending cheque as already
-    spoken for, which is what a payment picker must use - otherwise a cheque
-    for the whole opening balance leaves it still on offer, and clearing the
-    cheque after a second payment settles the same debt twice. Leave it False
-    for anything that reports what the party owes.
+    The pool settles the opening balance before anything else (plan D5), so
+    "settled" is whatever of it the khaata's on-account payments and credit
+    notes have reached - read from the settlement, not summed separately.
+
+    include_pending=True also holds back on-account money sitting in a pending
+    cheque, which is what a payment picker must use - otherwise a cheque for
+    the whole opening balance leaves it still on offer, and clearing the
+    cheque after a second payment settles the same debt twice. A pending
+    cheque would settle the opening balance first when it clears, so that is
+    where it is reserved. Leave it False for anything that reports what the
+    party owes.
 
     uncleared_opening_balances below calls this, and so does settleable_items,
     so the party page and the dialog can never disagree. Pass `opening` when
@@ -369,13 +348,21 @@ def opening_balance_remaining(business_id, party, party_id, opening=None,
     if opening is None:
         return 0, 0, 0
 
-    settled, _ = on_account_totals(
-        business_id, {f'{party}_id': party_id}, PARTY_ON_ACCOUNT[party],
-        statuses=LIVE_ON_ACCOUNT if include_pending else CLEARED_ONLY,
-    )
-
     opening_amount = opening.amount or 0
-    return opening_amount, round(settled), max(round(opening_amount - settled), 0)
+    if opening_amount <= 0:
+        return opening_amount, 0, 0
+
+    remaining = settle_party(business_id, party, party_id).opening_remaining()
+    settled = opening_amount - remaining
+    if include_pending:
+        pending, _ = on_account_totals(
+            business_id, {f'{party}_id': party_id}, PARTY_ON_ACCOUNT[party],
+            statuses=('PEN',),
+        )
+        settled += min(pending, remaining)
+        remaining = max(remaining - pending, 0)
+
+    return opening_amount, round(settled), max(round(remaining), 0)
 
 
 def uncleared_opening_balances(business_id, party):
@@ -385,11 +372,11 @@ def uncleared_opening_balances(business_id, party):
 
     Deliberately NOT the same figure as payables()/receivables(). Those are the
     whole relationship - invoices included. This is only the balance carried
-    across from the paper khaata at onboarding, because that is the only thing
-    an on-account payment settles: money owed against an invoice is settled by
-    paying that invoice.
+    across from the paper khaata at onboarding. The khaata's pool (on-account
+    payments, credit notes, a credit opening balance, overpayments) settles it
+    before anything else, so:
 
-        remaining = opening balance - on-account payments already made
+        remaining = opening balance - what the pool has reached of it
 
     party is 'customer' or 'supplier'.
     """
@@ -461,7 +448,7 @@ def party_ledger(business_id, customer=None, supplier=None,
         invoices = (
             SalesInvoice.objects
             .filter(business_id=business_id, customer_id=customer.id)
-            .exclude(status__in=CANCELLED_SALES_STATUSES)
+            .exclude(status__in=NOT_A_DEBT_SALES_STATUSES)
         )
         for invoice in invoices:
             rows.append({
@@ -494,7 +481,7 @@ def party_ledger(business_id, customer=None, supplier=None,
         invoices = (
             PurchaseInvoice.objects
             .filter(business_id=business_id, supplier_id=supplier.id)
-            .exclude(status__in=CANCELLED_PURCHASE_STATUSES)
+            .exclude(status__in=NOT_A_DEBT_PURCHASE_STATUSES)
         )
         for invoice in invoices:
             rows.append({
@@ -527,8 +514,9 @@ def party_ledger(business_id, customer=None, supplier=None,
                 'jama': round(receipt.amount or 0),
             })
 
-    # On-account money carries no invoice. A payment settles the balance; a
-    # refund is money going back out, so it lands on the other side.
+    # Everything on account carries no invoice. A payment or a credit note
+    # lowers the balance; a refund (money going back out) or a debit note
+    # raises it, so those land on the other side.
     if customer:
         party_filter = {'customer_id': customer.id}
         kinds = PARTY_ON_ACCOUNT['customer']
@@ -536,20 +524,27 @@ def party_ledger(business_id, customer=None, supplier=None,
         party_filter = {'supplier_id': supplier.id}
         kinds = PARTY_ON_ACCOUNT['supplier']
 
+    descriptions = {
+        kinds['payment']: ('On-account payment', 'jama'),
+        kinds['credit_note']: ('Credit note', 'jama'),
+        kinds['refund']: ('Refund', 'naam'),
+        kinds['debit_note']: ('Debit note', 'naam'),
+    }
     on_account = PartyPayment.objects.filter(
         business_id=business_id, transaction__status='C',
-        transaction__type__in=[kinds['payment'], kinds['refund']],
+        transaction__type__in=list(descriptions),
         **party_filter
     ).select_related('transaction')
     for payment in on_account:
-        is_refund = payment.transaction.type == kinds['refund']
+        description, side = descriptions[payment.transaction.type]
+        amount = payment.transaction.amount
         rows.append({
             'date': payment.transaction.date.isoformat(),
             '_seq': payment.created_at.isoformat(),
-            'description': 'Refund' if is_refund else 'On-account payment',
+            'description': description,
             'reference': payment.transaction.reference,
-            'naam': payment.transaction.amount if is_refund else 0,
-            'jama': 0 if is_refund else payment.transaction.amount,
+            'naam': amount if side == 'naam' else 0,
+            'jama': amount if side == 'jama' else 0,
         })
 
     rows = [row for row in rows if row['date']]
@@ -672,7 +667,8 @@ def daily_summary(business_id, day):
     credit_extended = (
         SalesInvoice.objects
         .filter(business_id=business_id, date_issued__date=day)
-        .exclude(status__in=CANCELLED_SALES_STATUSES)
+        # A draft extends no credit yet (plan D11).
+        .exclude(status__in=NOT_A_DEBT_SALES_STATUSES)
         .aggregate(total=Sum('total'))['total'] or 0
     )
     cash_sales = totals.get('sale_payment', 0)
@@ -736,6 +732,44 @@ def daily_summary(business_id, day):
 
 # ── Munafa ────────────────────────────────────────────────────────────────────
 
+def revenue_net_of_notes(business_id, date_from, date_to, customer_id=None,
+                         created_by_id=None, status=None):
+    """
+    Invoiced sales revenue, less customer credit notes and plus customer debit
+    notes in the window (credit-debit-notes plan, 5.5). The targets catalogue
+    resolves sales_revenue here.
+
+    Lives in accounts because it spans two apps: sales cannot import accounts.
+    Filtering by invoice status leaves notes out - a note has no invoice
+    status. Filtering by who entered it applies to notes too.
+    """
+    value = SalesInvoice.objects.revenue(
+        business_id, date_from, date_to, customer_id=customer_id,
+        created_by_id=created_by_id, status=status)
+    if status is not None:
+        return value
+    return value + Transaction.objects.note_adjustment(
+        business_id, 'customer', date_from, date_to,
+        party_id=customer_id, created_by_id=created_by_id)
+
+
+def purchase_value_net_of_notes(business_id, date_from, date_to,
+                                supplier_id=None, created_by_id=None,
+                                status=None):
+    """
+    Invoiced purchase value, less supplier credit notes and plus supplier
+    debit notes in the window. The supplier-side twin of revenue_net_of_notes.
+    """
+    value = PurchaseInvoice.objects.purchase_value(
+        business_id, date_from, date_to, supplier_id=supplier_id,
+        created_by_id=created_by_id, status=status)
+    if status is not None:
+        return value
+    return value + Transaction.objects.note_adjustment(
+        business_id, 'supplier', date_from, date_to,
+        party_id=supplier_id, created_by_id=created_by_id)
+
+
 def profit_estimate(business_id, date_from, date_to):
     """
     Revenue less cost of goods sold less expenses. An estimate only — it is
@@ -789,12 +823,23 @@ def profit_estimate(business_id, date_from, date_to):
         .aggregate(total=Sum('amount'))['total'] or 0
     )
 
-    salaries = Transaction.objects.totals_by_type(
-        business_id, date_from, date_to).get('salary_payment', 0)
+    by_type = Transaction.objects.totals_by_type(business_id, date_from, date_to)
+    salaries = by_type.get('salary_payment', 0)
+
+    # Notes, dated by their own date (credit-debit-notes plan, 5.5). A credit
+    # note to a customer gives back revenue and a debit note adds to it. A
+    # supplier's credit note (a target rebate) is money the business keeps, so
+    # it adds to profit on its own line rather than through COGS, which is
+    # read from current unit costs; a supplier's debit note takes it away.
+    revenue += (by_type.get('customer_debit_note', 0)
+                - by_type.get('customer_credit_note', 0))
+    supplier_credits = (by_type.get('supplier_credit_note', 0)
+                        - by_type.get('supplier_debit_note', 0))
 
     return {
         'revenue': round(revenue),
         'cost_of_goods_sold': round(cogs),
         'expenses': round(expenses + salaries),
-        'profit': round(revenue - cogs - expenses - salaries),
+        'supplier_credits': round(supplier_credits),
+        'profit': round(revenue - cogs - expenses - salaries + supplier_credits),
     }
