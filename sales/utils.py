@@ -202,17 +202,19 @@ def updateInventoryOnSale(instance: SalesInvoice):
         else:
             quantity_field = getRestockField(True)
 
-        invoice_items_dict = instance.map_to_products()
+        invoice_items_dict = instance.items_by_product()
         product_ids = set(invoice_items_dict)
         existing, _, new_ids = spiltNewAndOldProducts(product_ids, instance.business.id)
 
         for inventory_item in existing:
-            item = invoice_items_dict[inventory_item.product_id]
-            delta = item.compute_restock_delta()
-            if delta > 0:
-                inventory_item.apply_restock_delta(True, delta, generateTransactionId(instance))
-                logRestockEvent(item, delta, instance)
-                item.update_restock_flags()
+            # See the same loop in signals.py: one product can be on several
+            # lines, and every line's quantity has to leave stock.
+            for item in invoice_items_dict[inventory_item.product_id]:
+                delta = item.compute_restock_delta()
+                if delta > 0:
+                    inventory_item.apply_restock_delta(True, delta, generateTransactionId(instance))
+                    logRestockEvent(item, delta, instance)
+                    item.update_restock_flags()
 
         instance.update_deduction_flags()
         instance.save()

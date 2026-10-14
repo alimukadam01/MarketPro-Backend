@@ -1,6 +1,6 @@
 from calendar import monthrange
 from datetime import datetime
-from typing import Dict
+from typing import Dict, List
 from django.db import models
 from django.db.models import Avg, Sum, F, Q
 from django.core.exceptions import ValidationError
@@ -357,8 +357,20 @@ class SalesInvoice(SettledInvoiceMixin, models.Model):
         self.is_partially_restocked = False
         self.status = 'C'
 
-    def map_to_products(self) -> Dict[int, 'SalesInvoiceItem']:
-        return {item.product_id: item for item in self.invoice_items.all()}
+    def items_by_product(self) -> Dict[int, List['SalesInvoiceItem']]:
+        """
+        This invoice's lines grouped by product - a LIST per product, because
+        one product may now appear on several lines at different prices.
+
+        It used to be {product_id: item}, which silently kept only the last
+        line, so stock for every earlier line of the same product was never
+        deducted. The purchase side keeps its one-item map: its lines are
+        still unique per product.
+        """
+        grouped: Dict[int, List['SalesInvoiceItem']] = {}
+        for item in self.invoice_items.all():
+            grouped.setdefault(item.product_id, []).append(item)
+        return grouped
 
 
 class SalesInvoiceItemQuerySet(BaseQuerySet):
@@ -466,7 +478,13 @@ class SalesInvoiceItem(BaseItem):
         return f'{self.id}_{self.product.base.name} ({self.product.name})_{self.sales_invoice.id}_{self.sales_invoice.invoice_number}'
     
     class Meta:
-        unique_together = [('sales_invoice', 'product')]
+        # unit_price is part of the key: a shop bills the same product at
+        # different prices on one invoice - four paint colours off one base
+        # product, an old price beside a new one - and that was a 500 while
+        # the key was (invoice, product) alone. Billing it twice at the SAME
+        # price is still refused, because that is a double-entered line: the
+        # invoice screen merges it into the existing row's quantity instead.
+        unique_together = [('sales_invoice', 'product', 'unit_price')]
 
 
 class SalesReceipt(PaymentReceipt):

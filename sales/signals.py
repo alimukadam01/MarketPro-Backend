@@ -71,17 +71,20 @@ def updateInventoryOnSale(sender, instance: SalesInvoice, **kwargs):
         else:
             quantity_field = getRestockField(True)
 
-        invoice_items_dict = instance.map_to_products()
+        invoice_items_dict = instance.items_by_product()
         product_ids = set(invoice_items_dict)
         existing, _, new_ids = spiltNewAndOldProducts(product_ids, instance.business.id)
 
         for inventory_item in existing:
-            item = invoice_items_dict[inventory_item.product_id]
-            delta = item.compute_restock_delta()
-            if delta > 0:
-                inventory_item.apply_restock_delta(True, delta, generateTransactionId(instance))
-                logRestockEvent(item, delta, instance)
-                item.update_restock_flags()
+            # A product may be on several lines at different prices, and each
+            # one sells its own quantity. Iterating the group deducts them all;
+            # the old single-item lookup deducted only the last.
+            for item in invoice_items_dict[inventory_item.product_id]:
+                delta = item.compute_restock_delta()
+                if delta > 0:
+                    inventory_item.apply_restock_delta(True, delta, generateTransactionId(instance))
+                    logRestockEvent(item, delta, instance)
+                    item.update_restock_flags()
 
         ### Fix logic here
         instance.update_deduction_flags()

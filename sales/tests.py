@@ -10,6 +10,7 @@ from root.models import (
     ProductVariant, Supplier, Unit,
 )
 
+from inventory.models import Inventory, InventoryItem
 from .models import (
     PurchaseInvoice, PurchaseInvoiceItem, SalesInvoice, SalesInvoiceItem,
     SalesInvoiceItemDeduction,
@@ -305,3 +306,115 @@ class CaptureWalkInCustomerTests(TestCase):
         self.assertEqual(
             SalesInvoiceItemDeduction.objects.filter(sales_invoice=invoice).count(), 0
         )
+
+
+class RepeatedProductOnSalesInvoiceTests(TestCase):
+    """POST /sales-invoices/create-with-items/ with one product on several lines.
+
+    A shop bills the same base product at different prices on one invoice -
+    four paint colours off a single product, an old price beside a new one.
+    That used to violate unique_together('sales_invoice', 'product') and came
+    back as a 500 with no explanation (production invoice 1304). The key now
+    includes unit_price, so different prices are separate lines and the same
+    price is still refused as a double-entered line.
+    """
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.user = User.objects.create_user(
+            email="repeated@example.com", password="pw-for-tests"
+        )
+        cls.city = City.objects.create(name="Karachi", postal_code="75000")
+        cls.business = Business.objects.create(
+            name="Repeat Paints", owner=cls.user,
+            phone="03001234567", is_active=True,
+        )
+        cls.customer = Customer.objects.get(
+            business=cls.business, name=WALK_IN_CUSTOMER_NAME
+        )
+        cls.unit = Unit.objects.create(name="Pieces", abv="Pcs")
+        cls.product = Product.objects.create(
+            business=cls.business, name="Paint 1L", unit=cls.unit
+        )
+        cls.variant = ProductVariant.objects.create(
+            base=cls.product, name="default", sku="RPT-1"
+        )
+
+    def setUp(self):
+        self.client = APIClient()
+        self.client.force_authenticate(self.user)
+
+    def post(self, number, items, status="D"):
+        return self.client.post(
+            "/sales-invoices/create-with-items/",
+            {
+                "invoice_number": number,
+                "customer": str(self.customer.id),
+                "date_issued": "2026-05-10",
+                "date_due": "2026-05-10",
+                "discount": {"value": 0, "type": "amount"},
+                "tax": {"value": 0, "type": "percentage"},
+                "status": status,
+                "project": None,
+                "items": items,
+            },
+            format="json",
+        )
+
+    def line(self, price, quantity=1):
+        return {"product_id": self.variant.id, "quantity": quantity,
+                "unit_price": price}
+
+    def test_one_product_at_four_prices_is_four_lines(self):
+        """The exact shape of production invoice 1304."""
+        response = self.post(
+            "1304", [self.line(p) for p in (11271, 11458, 11556, 15457)]
+        )
+        self.assertEqual(response.status_code, 201, response.content)
+
+        invoice = SalesInvoice.objects.get(
+            business=self.business, invoice_number="1304"
+        )
+        self.assertEqual(invoice.invoice_items.count(), 4)
+        self.assertEqual(
+            sorted(item.unit_price for item in invoice.invoice_items.all()),
+            [11271, 11458, 11556, 15457],
+        )
+        self.assertEqual(invoice.sub_total, 49742)
+
+    def test_the_same_product_at_the_same_price_is_still_refused(self):
+        """Two identical lines are one line entered twice; the invoice screen
+        merges them into a single row's quantity rather than sending both.
+
+        The view turns the constraint error into a 500, which is the shape it
+        has always had for a failed write here. Nothing is left behind.
+        """
+        response = self.post("1306", [self.line(500), self.line(500)])
+        self.assertEqual(response.status_code, 500)
+        self.assertFalse(
+            SalesInvoice.objects.filter(
+                business=self.business, invoice_number="1306").exists()
+        )
+
+    def test_every_repeated_line_deducts_its_own_stock(self):
+        """items_by_product() groups lines per product. While it returned one
+        item per product, only the last line's quantity ever left stock."""
+        inventory = Inventory.objects.get(business=self.business)
+        stock = InventoryItem.objects.create(
+            business=self.business, inventory=inventory, product=self.variant,
+            quantity=100, quantity_on_hand=100, unit_cost=50,
+        )
+
+        response = self.post(
+            "1307",
+            [self.line(100, 2), self.line(200, 3), self.line(300, 5)],
+            status="C",
+        )
+        self.assertEqual(response.status_code, 201, response.content)
+
+        stock.refresh_from_db()
+        self.assertEqual(stock.quantity, 90)   # 2 + 3 + 5 all left
+        invoice = SalesInvoice.objects.get(
+            business=self.business, invoice_number="1307"
+        )
+        self.assertEqual(invoice.total, 2 * 100 + 3 * 200 + 5 * 300)
