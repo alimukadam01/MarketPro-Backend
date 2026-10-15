@@ -30,8 +30,25 @@ class PaymentReceiptSerializer(serializers.Serializer):
     account = serializers.SerializerMethodField()
     payment_method = serializers.SerializerMethodField()
     status = serializers.SerializerMethodField()
+    date = serializers.SerializerMethodField()
     created_at = serializers.DateTimeField(read_only=True)
     updated_at = serializers.DateTimeField(read_only=True)
+
+    def get_date(self, receipt):
+        """
+        The day the money moved, which is what the payments dialog shows.
+
+        created_at is the day the row was typed, and backdating is
+        unrestricted, so the two differ whenever a payment is entered late.
+        The date itself lives on the mirrored transaction, like the account
+        and the method below.
+
+        Imported inside the method on purpose: accounts imports sales at load
+        time, so a module-level import here would be a cycle. Same convention
+        as SalesInvoice.pool_applied.
+        """
+        from accounts.utils import receipt_date
+        return receipt_date(receipt)
 
     def get_account(self, receipt):
         """
