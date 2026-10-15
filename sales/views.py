@@ -18,7 +18,7 @@ from accounts.models import Transaction
 from accounts.settlement import attach_settlement
 from accounts.utils import month_bounds, payables
 from .filters import PurchaseInvoiceFilter, SalesInvoiceFilter
-from .models import PurchaseInvoice, PurchaseInvoiceItem, PurchaseQuotation, PurchaseQuotationItem, PurchaseReceipt, ReturnedItem, SalesInvoice, SalesInvoiceItem, SalesReceipt
+from .models import InvoiceImage, PurchaseInvoice, PurchaseInvoiceItem, PurchaseQuotation, PurchaseQuotationItem, PurchaseReceipt, ReturnedItem, SalesInvoice, SalesInvoiceItem, SalesReceipt
 from .utils import build_whatsapp_payload, invoice_room, restockOnCancel, updateInventoryOnSale
 from .serializers import (
     PaymentReceiptSerializer,
@@ -54,7 +54,8 @@ from .serializers import (
     SimplePurchaseQuotationItemSerializer,
     SimpleSalesInvoiceItemSerializer,
     SimpleSalesInvoiceSerializer,
-    GenerateInvoiceSerializer
+    GenerateInvoiceSerializer,
+    InvoiceImageSerializer
 )
 
 # Create your views here.
@@ -343,6 +344,10 @@ class PurchaseReceiptsViewSet(ModelViewSet):
     
     def get_serializer_context(self):
         return {
+            # request is what turns a payment's image into an absolute URL.
+            # A context without it replaces DRF's default, which is how every
+            # transaction image once came back as a bare /media/... path.
+            'request': self.request,
             "purchase_invoice_id": self.kwargs['purchase_invoice_pk']
         }
 
@@ -851,6 +856,9 @@ class SalesReceiptsViewSet(ModelViewSet):
     
     def get_serializer_context(self):
         return {
+            # See PurchaseReceiptsViewSet: without request, a payment's image
+            # is a host-less path the frontend cannot load.
+            'request': self.request,
             "sales_invoice_id": self.kwargs['sales_invoice_pk']
         }
 
@@ -1336,3 +1344,87 @@ class PurchaseQuotationItemViewSet(ModelViewSet):
             return Response({
                 "detail": "Internal Server Error"
             }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+class InvoiceImageViewSet(ModelViewSet):
+    """
+    The photos on one invoice: list them, upload one, delete one.
+
+    Base class for the two nested routes below. Which invoice is read from the
+    URL and scoped to the active business - not taken from the payload - so a
+    photo cannot be attached to another business's invoice by sending its id.
+
+    DRF's default parsers already accept multipart, so no parser_classes are
+    needed for the upload.
+    """
+
+    serializer_class = InvoiceImageSerializer
+
+    # Set by the two subclasses: the FK column on InvoiceImage, and the URL
+    # kwarg the nested router supplies.
+    invoice_field = None
+    url_kwarg = None
+    invoice_model = None
+
+    def get_invoice(self):
+        """The parent invoice, or None if it is not this business's."""
+        business = get_active_business(self.request)
+        if not business:
+            return None
+        return self.invoice_model.objects.filter(
+            id=self.kwargs[self.url_kwarg], business_id=business.id
+        ).first()
+
+    def get_queryset(self):
+        invoice = self.get_invoice()
+        if not invoice:
+            return InvoiceImage.objects.none()
+        return InvoiceImage.objects.filter(**{self.invoice_field: invoice.id})
+
+    def get_serializer_context(self):
+        # request is what turns the stored path into an absolute URL. A context
+        # without it replaces DRF's default and every image comes back as a
+        # bare /media/... path the frontend cannot load.
+        return {'request': self.request}
+
+    def create(self, request, *args, **kwargs):
+        invoice = self.get_invoice()
+        if not invoice:
+            return Response({'detail': 'Not Found.'},
+                            status=status.HTTP_404_NOT_FOUND)
+
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            serializer.save(**{
+                self.invoice_field: invoice,
+                'uploaded_by': request.user,
+            })
+            return Response(serializer.data, status=status.HTTP_201_CREATED)
+        except Exception as error:
+            print(error)
+            return Response({'detail': 'Internal Server Error.'},
+                            status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    def perform_destroy(self, instance):
+        # The file goes with the row. Django stopped deleting files on
+        # delete() in 1.3, so an untouched default leaves the storage filling
+        # up with photos no invoice references any more.
+        stored = instance.image
+        instance.delete()
+        if stored:
+            stored.delete(save=False)
+
+
+class SalesInvoiceImageViewSet(InvoiceImageViewSet):
+
+    invoice_field = 'sales_invoice'
+    url_kwarg = 'sales_invoice_pk'
+    invoice_model = SalesInvoice
+
+
+class PurchaseInvoiceImageViewSet(InvoiceImageViewSet):
+
+    invoice_field = 'purchase_invoice'
+    url_kwarg = 'purchase_invoice_pk'
+    invoice_model = PurchaseInvoice

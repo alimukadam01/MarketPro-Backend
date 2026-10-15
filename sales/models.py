@@ -1078,3 +1078,75 @@ class ReturnedItem(models.Model):
     def __str__(self):
         return f"Return for {self.invoice_item.product.base.name} ({self.invoice_item.product.name}) from Invoice {self.invoice_item.sales_invoice.invoice_number} on {local_date(self.created_at)}"
 
+
+
+class InvoiceImage(models.Model):
+    """
+    A photo attached to a sales or a purchase invoice. Several per invoice: a
+    shop photographs the signed delivery note, the goods as they arrived and
+    the supplier's own bill, and all three belong to the same invoice.
+
+    Two nullable foreign keys rather than one generic relation. It is how
+    "one of these two" is already modelled here - PartyPayment and the source
+    links on Transaction both do it - and it keeps the database able to say
+    what an image belongs to: a generic key is an opaque (type, id) pair that
+    no join and no `on_delete` understands.
+
+    Exactly one of the two is set, which `clean` and the CheckConstraint below
+    both insist on. A payment image is a different thing and is not stored
+    here: a payment carries at most one, on the transaction it is mirrored
+    into, which needs no table of its own.
+    """
+
+    sales_invoice = models.ForeignKey(
+        SalesInvoice, models.CASCADE, related_name='images',
+        null=True, blank=True)
+    purchase_invoice = models.ForeignKey(
+        PurchaseInvoice, models.CASCADE, related_name='images',
+        null=True, blank=True)
+    image = models.ImageField(upload_to='invoices')
+    caption = models.CharField(max_length=256, null=True, blank=True)
+    uploaded_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, models.SET_NULL,
+        related_name='uploaded_invoice_images', null=True, blank=True)
+    uploaded_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        # Newest first: the last photo taken is the one being looked for.
+        ordering = ['-uploaded_at', '-id']
+        constraints = [
+            models.CheckConstraint(
+                check=(
+                    Q(sales_invoice__isnull=False,
+                      purchase_invoice__isnull=True)
+                    | Q(sales_invoice__isnull=True,
+                        purchase_invoice__isnull=False)
+                ),
+                name='invoice_image_belongs_to_exactly_one_invoice',
+            ),
+        ]
+
+    def clean(self):
+        # The constraint is the guarantee; this is what turns a violation into
+        # a readable error in the admin instead of an IntegrityError.
+        if bool(self.sales_invoice_id) == bool(self.purchase_invoice_id):
+            raise ValidationError(
+                'An invoice image belongs to exactly one invoice - either a '
+                'sales invoice or a purchase invoice, not both and not '
+                'neither.'
+            )
+
+    @property
+    def invoice(self):
+        """Whichever invoice this image is attached to."""
+        return self.sales_invoice or self.purchase_invoice
+
+    def __str__(self):
+        return f"Image for invoice {self.invoice_id_label} ({self.image.name})"
+
+    @property
+    def invoice_id_label(self):
+        invoice = self.invoice
+        if not invoice:
+            return 'unattached'
+        return invoice.invoice_number or invoice.id

@@ -1,7 +1,13 @@
+import os
+import tempfile
 from datetime import date
+from io import BytesIO
+
+from PIL import Image
 
 from django.contrib.auth import get_user_model
-from django.test import TestCase
+from django.core.files.uploadedfile import SimpleUploadedFile
+from django.test import TestCase, override_settings
 from django.urls import reverse
 
 from rest_framework.test import APIClient
@@ -14,8 +20,8 @@ from root.models import (
 
 from inventory.models import Inventory, InventoryItem
 from .models import (
-    PurchaseInvoice, PurchaseInvoiceItem, SalesInvoice, SalesInvoiceItem,
-    SalesInvoiceItemDeduction,
+    InvoiceImage, PurchaseInvoice, PurchaseInvoiceItem, SalesInvoice,
+    SalesInvoiceItem, SalesInvoiceItemDeduction,
 )
 from accounts.utils import party_invoiced, profit_estimate
 from .models import SalesReceipt
@@ -1053,3 +1059,308 @@ class SalesInvoiceExtraChargesTests(TestCase):
         self.assertIsNotNone(payload)
         self.assertIn("Delivery: PKR 500", payload["message"])
         self.assertIn("Total: PKR 1,500", payload["message"])
+
+
+# Writes go to a temporary directory on disk, never to the configured store.
+#
+# MEDIA_ROOT on its own is not enough: USE_S3 switches STORAGES['default'] to
+# S3Storage independently of DEBUG, and a test run that leaves it alone uploads
+# its fixtures to the real bucket. STORAGES has to be overridden with it.
+local_files = override_settings(
+    MEDIA_ROOT=tempfile.mkdtemp(),
+    STORAGES={
+        'default': {
+            'BACKEND': 'django.core.files.storage.FileSystemStorage',
+        },
+        'staticfiles': {
+            'BACKEND': 'django.contrib.staticfiles.storage.StaticFilesStorage',
+        },
+    },
+)
+
+
+def a_png(name="slip.png"):
+    """A real 1x1 PNG, as an upload.
+
+    Encoded here rather than pasted as a base64 blob: ImageField validates by
+    opening the file, so a file that merely ends in .png is rejected, and
+    Pillow - which ImageField needs anyway - is the only thing that can be
+    trusted to produce one it accepts.
+    """
+    buffer = BytesIO()
+    Image.new("RGB", (1, 1), "white").save(buffer, format="PNG")
+    return SimpleUploadedFile(name, buffer.getvalue(),
+                              content_type="image/png")
+
+
+@local_files
+class InvoiceImageTests(TestCase):
+    """Several photos per invoice: the delivery note, the goods, the bill.
+
+    See local_files above for why the storage backend is overridden and not
+    just MEDIA_ROOT.
+    """
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.user = User.objects.create_user(
+            email="invoice-images@example.com", password="pw-for-tests"
+        )
+        City.objects.create(name="Quetta", postal_code="87300")
+        cls.business = Business.objects.create(
+            name="Imaged Paints", owner=cls.user,
+            phone="03001234567", is_active=True,
+        )
+        cls.customer = Customer.objects.get(
+            business=cls.business, name=WALK_IN_CUSTOMER_NAME
+        )
+        cls.supplier = Supplier.objects.create(
+            business=cls.business, name="Imaged Supply Co"
+        )
+        cls.invoice = SalesInvoice.objects.create(
+            business=cls.business, customer=cls.customer,
+            created_by=cls.user, invoice_number="IMG-1",
+        )
+        cls.purchase = PurchaseInvoice.objects.create(
+            business=cls.business, supplier=cls.supplier,
+            created_by=cls.user, status="D", invoice_number="PIMG-1",
+        )
+
+    def setUp(self):
+        self.client = APIClient()
+        self.client.force_authenticate(self.user)
+
+    def url(self, invoice=None):
+        return f"/sales-invoices/{(invoice or self.invoice).pk}/images/"
+
+    def purchase_url(self, invoice=None):
+        return f"/purchase-invoices/{(invoice or self.purchase).pk}/images/"
+
+    # --- uploading --------------------------------------------------------
+
+    def test_an_invoice_takes_several_images(self):
+        for name in ("note.png", "goods.png", "bill.png"):
+            response = self.client.post(
+                self.url(), {"image": a_png(name)}, format="multipart")
+            self.assertEqual(response.status_code, 201, response.content)
+
+        self.assertEqual(self.invoice.images.count(), 3)
+
+    def test_the_upload_records_who_did_it_and_the_invoice(self):
+        response = self.client.post(
+            self.url(), {"image": a_png(), "caption": "Signed delivery note"},
+            format="multipart")
+        self.assertEqual(response.status_code, 201, response.content)
+
+        image = InvoiceImage.objects.get(id=response.json()["id"])
+        self.assertEqual(image.sales_invoice_id, self.invoice.id)
+        self.assertIsNone(image.purchase_invoice_id)
+        self.assertEqual(image.uploaded_by_id, self.user.id)
+        self.assertEqual(image.caption, "Signed delivery note")
+
+    def test_a_purchase_invoice_takes_images_on_its_own_route(self):
+        response = self.client.post(
+            self.purchase_url(), {"image": a_png()}, format="multipart")
+        self.assertEqual(response.status_code, 201, response.content)
+
+        image = InvoiceImage.objects.get(id=response.json()["id"])
+        self.assertEqual(image.purchase_invoice_id, self.purchase.id)
+        self.assertIsNone(image.sales_invoice_id)
+
+    def test_a_file_that_is_not_an_image_is_refused(self):
+        response = self.client.post(
+            self.url(),
+            {"image": SimpleUploadedFile(
+                "notes.png", b"this is not a png", content_type="image/png")},
+            format="multipart",
+        )
+        self.assertEqual(response.status_code, 400, response.content)
+        self.assertEqual(self.invoice.images.count(), 0)
+
+    def test_an_invoice_id_in_the_payload_is_ignored(self):
+        """Which invoice an image belongs to comes from the URL. Taking it from
+        the body would be a way to attach a photo to another business's
+        invoice."""
+        other_user = User.objects.create_user(
+            email="other-images@example.com", password="pw-for-tests")
+        other_business = Business.objects.create(
+            name="Someone Else", owner=other_user,
+            phone="03009999999", is_active=True)
+        other_invoice = SalesInvoice.objects.create(
+            business=other_business,
+            customer=Customer.objects.get(
+                business=other_business, name=WALK_IN_CUSTOMER_NAME),
+            created_by=other_user, invoice_number="OTHER-1")
+
+        response = self.client.post(
+            self.url(),
+            {"image": a_png(), "sales_invoice": other_invoice.id},
+            format="multipart",
+        )
+        self.assertEqual(response.status_code, 201, response.content)
+        self.assertEqual(
+            InvoiceImage.objects.get(id=response.json()["id"]).sales_invoice_id,
+            self.invoice.id,
+        )
+
+    # --- reading ----------------------------------------------------------
+
+    def test_the_url_comes_back_absolute(self):
+        """The page is served from another origin, so a bare /media/... path
+        cannot be loaded. request has to be in the serializer context."""
+        response = self.client.post(
+            self.url(), {"image": a_png()}, format="multipart")
+        self.assertEqual(response.status_code, 201, response.content)
+        self.assertTrue(response.json()["image"].startswith("http"),
+                        response.json()["image"])
+
+    def test_the_images_are_listed_on_the_invoice_detail(self):
+        self.client.post(self.url(), {"image": a_png()}, format="multipart")
+        response = self.client.get(f"/sales-invoices/{self.invoice.pk}/")
+        self.assertEqual(response.status_code, 200, response.content)
+        self.assertEqual(len(response.json()["images"]), 1)
+
+    def test_newest_first(self):
+        first = self.client.post(
+            self.url(), {"image": a_png("first.png")}, format="multipart")
+        second = self.client.post(
+            self.url(), {"image": a_png("second.png")}, format="multipart")
+
+        listed = self.client.get(self.url()).json()
+        rows = listed["results"] if isinstance(listed, dict) else listed
+        self.assertEqual(
+            [row["id"] for row in rows],
+            [second.json()["id"], first.json()["id"]],
+        )
+
+    def test_another_businesss_invoice_has_no_reachable_images(self):
+        other_user = User.objects.create_user(
+            email="other-images-2@example.com", password="pw-for-tests")
+        other_business = Business.objects.create(
+            name="Someone Else Again", owner=other_user,
+            phone="03008888888", is_active=True)
+        other_invoice = SalesInvoice.objects.create(
+            business=other_business,
+            customer=Customer.objects.get(
+                business=other_business, name=WALK_IN_CUSTOMER_NAME),
+            created_by=other_user, invoice_number="OTHER-2")
+
+        response = self.client.post(
+            self.url(other_invoice), {"image": a_png()}, format="multipart")
+        self.assertEqual(response.status_code, 404, response.content)
+
+        listed = self.client.get(self.url(other_invoice)).json()
+        rows = listed["results"] if isinstance(listed, dict) else listed
+        self.assertEqual(rows, [])
+
+    # --- deleting ---------------------------------------------------------
+
+    def test_deleting_an_image_removes_the_row_and_the_file(self):
+        created = self.client.post(
+            self.url(), {"image": a_png()}, format="multipart").json()
+        image = InvoiceImage.objects.get(id=created["id"])
+        path = image.image.path
+        self.assertTrue(os.path.exists(path))
+
+        response = self.client.delete(f"{self.url()}{created['id']}/")
+        self.assertEqual(response.status_code, 204, response.content)
+        self.assertFalse(InvoiceImage.objects.filter(id=created["id"]).exists())
+        # Django stopped deleting files with the row in 1.3, so an untouched
+        # default would leave this behind for ever.
+        self.assertFalse(os.path.exists(path))
+
+    def test_deleting_the_invoice_takes_its_images_with_it(self):
+        self.client.post(self.url(), {"image": a_png()}, format="multipart")
+        invoice_id = self.invoice.id
+        SalesInvoice.objects.filter(id=invoice_id).delete()
+        self.assertEqual(
+            InvoiceImage.objects.filter(sales_invoice_id=invoice_id).count(), 0)
+
+    # --- the model's own rule ---------------------------------------------
+
+    def test_an_image_cannot_belong_to_both_invoices(self):
+        with self.assertRaises(Exception):
+            InvoiceImage.objects.create(
+                sales_invoice=self.invoice, purchase_invoice=self.purchase,
+                image="invoices/whatever.png")
+
+    def test_an_image_cannot_belong_to_neither(self):
+        with self.assertRaises(Exception):
+            InvoiceImage.objects.create(image="invoices/whatever.png")
+
+
+@local_files
+class PaymentImageTests(TestCase):
+    """One photo per payment, on the transaction the receipt is mirrored into.
+
+    No new column and no new table: a receipt is already mirrored 1:1 into a
+    Transaction, and Transaction has carried an image since the accounting
+    module landed.
+    """
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.user = User.objects.create_user(
+            email="payment-images@example.com", password="pw-for-tests"
+        )
+        City.objects.create(name="Sialkot", postal_code="51310")
+        cls.business = Business.objects.create(
+            name="Paid Paints", owner=cls.user,
+            phone="03001234567", is_active=True,
+        )
+        cls.customer = Customer.objects.get(
+            business=cls.business, name=WALK_IN_CUSTOMER_NAME
+        )
+        cls.invoice = SalesInvoice.objects.create(
+            business=cls.business, customer=cls.customer,
+            created_by=cls.user, invoice_number="PAY-IMG-1", total=5000,
+        )
+
+    def setUp(self):
+        self.client = APIClient()
+        self.client.force_authenticate(self.user)
+
+    def url(self):
+        return f"/sales-invoices/{self.invoice.pk}/payments/"
+
+    def test_a_payment_can_carry_a_photo(self):
+        response = self.client.post(
+            self.url(),
+            {"amount": "1000", "desc": "Cash", "image": a_png("cash.png")},
+            format="multipart",
+        )
+        self.assertEqual(response.status_code, 201, response.content)
+
+        receipt = SalesReceipt.objects.get(sales_invoice=self.invoice)
+        self.assertTrue(receipt.transaction_record.image)
+
+    def test_the_photo_comes_back_absolute_on_the_payments_list(self):
+        self.client.post(
+            self.url(),
+            {"amount": "1000", "image": a_png("cash.png")},
+            format="multipart",
+        )
+        response = self.client.get(self.url())
+        self.assertEqual(response.status_code, 200, response.content)
+        body = response.json()
+        rows = body["results"] if isinstance(body, dict) else body
+        self.assertEqual(len(rows), 1)
+        self.assertTrue(rows[0]["image"].startswith("http"), rows[0]["image"])
+
+    def test_a_payment_without_a_photo_reports_none(self):
+        response = self.client.post(
+            self.url(), {"amount": 1000}, format="json")
+        self.assertEqual(response.status_code, 201, response.content)
+
+        body = self.client.get(self.url()).json()
+        rows = body["results"] if isinstance(body, dict) else body
+        self.assertIsNone(rows[0]["image"])
+
+    def test_a_payment_still_posts_as_plain_json(self):
+        """The dialog only switches to multipart when a file is attached, so
+        the numbers stay typed in the ordinary case."""
+        response = self.client.post(
+            self.url(), {"amount": 1500, "desc": "Bank"}, format="json")
+        self.assertEqual(response.status_code, 201, response.content)
+        self.assertEqual(
+            SalesReceipt.objects.get(sales_invoice=self.invoice).amount, 1500)

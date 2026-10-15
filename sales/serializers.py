@@ -13,7 +13,7 @@ from root.serializers import (
     SupplierSerializer, BaseItemSerializer
 )
 from inventory.models import InventoryItem
-from .models import PurchaseInvoice, PurchaseInvoiceItem, PurchaseQuotation, PurchaseQuotationItem, PurchaseReceipt, SalesInvoice, SalesInvoiceItem, ReturnedItem, SalesReceipt
+from .models import InvoiceImage, PurchaseInvoice, PurchaseInvoiceItem, PurchaseQuotation, PurchaseQuotationItem, PurchaseReceipt, SalesInvoice, SalesInvoiceItem, ReturnedItem, SalesReceipt
 from .utils import (
     apply_money_details,
     checkPurchaseInvoiceItemFields,
@@ -123,6 +123,37 @@ class ExtraChargesValidationMixin:
         return cleaned
 
 
+class InvoiceImageSerializer(serializers.ModelSerializer):
+    """
+    One photo on an invoice, for reading and for uploading.
+
+    `image` is left as the ModelSerializer's own ImageField rather than a
+    method field, so DRF builds an absolute URL from the request in the
+    context - which is why the viewset puts it there. A presigned S3 link is
+    already absolute and comes through unchanged.
+
+    Which invoice it belongs to comes from the URL, not the payload: these are
+    nested routes under an invoice the viewset has already scoped to the
+    active business, so accepting an invoice id in the body would be a way to
+    attach a photo to someone else's invoice.
+    """
+
+    uploaded_by = SimpleUserSerializer(read_only=True)
+
+    class Meta:
+        model = InvoiceImage
+        fields = ['id', 'image', 'caption', 'uploaded_by', 'uploaded_at']
+        read_only_fields = ['id', 'uploaded_by', 'uploaded_at']
+
+
+class SimpleInvoiceImageSerializer(serializers.ModelSerializer):
+    """The same photo, as it is listed inline on an invoice."""
+
+    class Meta:
+        model = InvoiceImage
+        fields = ['id', 'image', 'caption', 'uploaded_at']
+
+
 class PaymentReceiptSerializer(serializers.Serializer):
 
     id = serializers.IntegerField(read_only=True)
@@ -132,6 +163,7 @@ class PaymentReceiptSerializer(serializers.Serializer):
     payment_method = serializers.SerializerMethodField()
     status = serializers.SerializerMethodField()
     date = serializers.SerializerMethodField()
+    image = serializers.SerializerMethodField()
     created_at = serializers.DateTimeField(read_only=True)
     updated_at = serializers.DateTimeField(read_only=True)
 
@@ -150,6 +182,26 @@ class PaymentReceiptSerializer(serializers.Serializer):
         """
         from accounts.utils import receipt_date
         return receipt_date(receipt)
+
+    def get_image(self, receipt):
+        """
+        The photo of the slip, cheque or receipt, on the mirrored transaction
+        like everything else about the money.
+
+        Absolute, because the page that shows it is served from another
+        origin. A presigned S3 URL is already absolute and comes back
+        unchanged; a local one is a bare /media/... path that only works once
+        the host is on the front. Without `request` in the serializer context
+        there is no host to add, which is why both receipt viewsets put it
+        there - the same omission broke every transaction image once.
+        """
+        transaction = getattr(receipt, 'transaction_record', None)
+        image = getattr(transaction, 'image', None) if transaction else None
+        if not image:
+            return None
+
+        request = self.context.get('request')
+        return request.build_absolute_uri(image.url) if request else image.url
 
     def get_account(self, receipt):
         """
@@ -188,9 +240,14 @@ class PaymentReceiptCreateSerializer(PaymentReceiptSerializer):
     cheque_number = serializers.CharField(
         required=False, allow_null=True, allow_blank=True)
     cheque_due_date = serializers.DateField(required=False, allow_null=True)
+    # Declared writable here, where the read serializer has it as a method
+    # field: a payment carries at most one photo, and it is stored on the
+    # transaction the receipt is mirrored into, so this needs no new column.
+    image = serializers.ImageField(required=False, allow_null=True)
 
     MONEY_FIELDS = [
-        'account', 'payment_method', 'date', 'cheque_number', 'cheque_due_date'
+        'account', 'payment_method', 'date', 'cheque_number',
+        'cheque_due_date', 'image'
     ]
 
     def pop_money_details(self):
@@ -300,6 +357,7 @@ class PurchaseInvoiceSerializer(serializers.ModelSerializer):
     created_by = SimpleUserSerializer(read_only=True)
     projects = ProjectPurchaseInvoiceLinker(many=True)
     payment_receipts = PaymentReceiptSerializer(many=True, read_only=True)
+    images = SimpleInvoiceImageSerializer(many=True, read_only=True)
 
     class Meta:
         model = PurchaseInvoice
@@ -307,7 +365,8 @@ class PurchaseInvoiceSerializer(serializers.ModelSerializer):
             'id', 'invoice_number', 'business', 'supplier',
             'date_issued', 'created_at', 'updated_at', 'date_due', 'status', 'payment_status',
             'sub_total', 'tax',  'amount_paid', 'total', 'delivery', 'created_by',
-            'notes', 'invoice_items', 'is_restocked', 'is_partially_restocked', 'projects', 'payment_receipts'
+            'notes', 'invoice_items', 'is_restocked', 'is_partially_restocked',
+            'projects', 'payment_receipts', 'images'
         ]
 
 
@@ -707,6 +766,7 @@ class SalesInvoiceSerializer(serializers.ModelSerializer):
     customer = SimpleCustomerSerializer(read_only=True)
     projects = ProjectSalesInvoiceLinker(many=True)
     payment_receipts = PaymentReceiptSerializer(many=True)
+    images = SimpleInvoiceImageSerializer(many=True, read_only=True)
     # The column holds Draft, Completed or Cancelled; Overdue is worked out
     # here, because whether an invoice is overdue depends on what the khaata
     # has settled onto it and on today's date, neither of which writes to the
@@ -722,7 +782,8 @@ class SalesInvoiceSerializer(serializers.ModelSerializer):
             'id', 'invoice_number', 'business', 'customer', 'date_issued', 'date_due', 'payment_status',
             'status', 'sub_total', 'tax', 'discount', 'extra_charges',
             'extra_charges_total', 'total', 'amount_paid' ,'created_by', 'created_at',
-            'notes', 'is_deducted', 'invoice_items', 'projects', 'payment_receipts'
+            'notes', 'is_deducted', 'invoice_items', 'projects',
+            'payment_receipts', 'images'
         ]
         # Derived from extra_charges by adjust_totals. A client-sent value is
         # ignored rather than trusted - it is the figure every revenue and
