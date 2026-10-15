@@ -34,7 +34,33 @@ class InventoryItemsViewSet(ModelViewSet):
     ]
 
     def get_queryset(self):
-        return InventoryItem.objects.filter(inventory_id = self.kwargs['inventory_pk'])
+        """
+        One business's stock, A-Z.
+
+        Ordered by the base product then the variant, which is how both
+        InventoryItem.__str__ and transformInventoryItem on the client build
+        the "Product" cell - so the order matches the text on screen. Without
+        an order_by the database returned rows in whatever order it liked.
+
+        Scoped by business rather than by the inventory_pk in the URL. An
+        Inventory is one-per-business, but the two primary keys are separate
+        sequences that only coincide because the signal has created them in
+        step so far; InventoryQuerySet.get_items was already fixed for this
+        and says so, and this read was the one left trusting the id.
+
+        select_related because the nested ProductVariantSerializer reaches
+        product.base on every row - the ordering forces those joins anyway.
+        """
+        business = get_active_business(self.request)
+        if not business:
+            return InventoryItem.objects.none()
+
+        return (
+            InventoryItem.objects
+            .filter(inventory__business_id=business.id)
+            .select_related('product__base', 'location')
+            .order_by('product__base__name', 'product__name')
+        )
     
     def get_serializer_class(self):
         method = self.request.method
