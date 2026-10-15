@@ -2,7 +2,8 @@ from calendar import monthrange
 from datetime import datetime
 from typing import Dict, List
 from django.db import models
-from django.db.models import Avg, Sum, F, Q
+from django.db.models import Avg, Sum, F, Q, Value
+from django.db.models.functions import Coalesce
 from django.core.exceptions import ValidationError
 from django.conf import settings
 from django.utils import timezone
@@ -118,6 +119,22 @@ class SettledInvoiceMixin:
         return 'PEN'
 
 
+# An invoice total with its extra charges taken back out.
+#
+# A delivery or labour charge is money collected alongside the sale, not sales
+# value, so it is excluded from revenue, from profit and from the dashboard
+# sales figure - while the customer is still invoiced for it and still owes it,
+# which is why the ledger, the party balance and payment_status all use `total`
+# unchanged.
+#
+# Coalesce guards the aggregate, not the column: extra_charges_total is
+# non-null with a default of 0.0, but an expression over a LEFT JOIN or a
+# values() on a related model can still hand it NULL, and one NULL would make
+# the whole subtraction NULL. `total` itself stays nullable, so an itemless
+# invoice drops out of a Sum exactly as it did before.
+GOODS_TOTAL = F('total') - Coalesce(F('extra_charges_total'), Value(0.0))
+
+
 class SalesInvoiceQuerySet(BaseQuerySet):
 
     pass
@@ -134,10 +151,12 @@ class SalesInvoiceManager(models.Manager):
         if num_days:
             queryset = queryset.in_period(num_days)
 
-        return queryset.aggregate(total=Sum("total"))["total"] or 0
+        return queryset.aggregate(total=Sum(GOODS_TOTAL))["total"] or 0
 
     def monthly_sales_trend(self, business_id):
-        return self.get_queryset().monthly_trend(business_id, 'total')
+        # An expression rather than a field name: monthly_trend passes whatever
+        # it is given straight to Sum(), which takes either.
+        return self.get_queryset().monthly_trend(business_id, GOODS_TOTAL)
 
     def recent_sales(self, business_id):
         queryset = self.get_queryset().for_business(
@@ -165,6 +184,10 @@ class SalesInvoiceManager(models.Manager):
         # value order and drags the average down, while an invoice that really
         # totals 0.0 still counts. Returns 0 for a business with no invoices,
         # matching total_sales above.
+        #
+        # Charges are deliberately left in, unlike total_sales and revenue:
+        # this is the average bill a customer was handed, and the delivery fee
+        # was on it.
         queryset = self.get_queryset().for_business(business_id)
 
         return int(queryset.aggregate(avg=Avg("total"))["avg"] or 0)
@@ -183,6 +206,9 @@ class SalesInvoiceManager(models.Manager):
 
         Cancelled invoices never count. Drafts do, which matches what
         party_invoiced, profit_estimate and the Sales page already show.
+
+        Net of extra charges - see GOODS_TOTAL. A sales target is a target for
+        selling things, and a delivery fee is not a thing sold.
         """
         return (
             self.get_queryset()
@@ -194,7 +220,7 @@ class SalesInvoiceManager(models.Manager):
                 created_by_id=created_by_id,
                 status=status,
             )
-            .aggregate(value=Sum('total'))['value'] or 0
+            .aggregate(value=Sum(GOODS_TOTAL))['value'] or 0
         )
 
     def invoice_count(self, business_id, date_from, date_to,
@@ -281,6 +307,21 @@ class SalesInvoice(SettledInvoiceMixin, models.Model):
         default=dict,
         help_text='e.g., {"value": 10.0, "type": "percentage" or "amount"}'
     )
+    # Named charges added after tax - delivery, labour, a cutting fee. A list
+    # rather than a column per charge, because which ones a shop adds is its
+    # own business and they differ per invoice.
+    extra_charges = models.JSONField(
+        null=True,
+        blank=True,
+        default=list,
+        help_text='e.g., [{"label": "Delivery", "amount": 500.0}]'
+    )
+    # Denormalised from extra_charges by adjust_totals, and written nowhere
+    # else. It is what keeps "revenue excluding charges" a plain subtraction in
+    # SQL: summing inside a JSON column is not portable between the SQLite used
+    # in development and the PostgreSQL used in production. sub_total is
+    # already exactly this kind of stored derivation.
+    extra_charges_total = models.FloatField(default=0.0)
     total = models.FloatField(null=True, blank=True)
     created_by = models.ForeignKey(
         settings.AUTH_USER_MODEL, models.CASCADE, 'created_sales_invoices'
@@ -361,9 +402,31 @@ class SalesInvoice(SettledInvoiceMixin, models.Model):
     def __str__(self):
         return f"{self.id}-{self.invoice_number}-{self.total}-{self.status}"
 
+    def extra_charges_sum(self):
+        """
+        This invoice's named charges, totalled.
+
+        Tolerant of a malformed row rather than raising: adjust_totals runs
+        from a signal on every item save, and an exception there would fail a
+        write the serializer has already accepted. The serializer is what
+        rejects a bad charge, at the point a person can still be told about it.
+        """
+        total = 0.0
+        for charge in (self.extra_charges or []):
+            try:
+                total += float(charge.get('amount') or 0)
+            except (AttributeError, TypeError, ValueError):
+                continue
+        return round(total, 2)
+
     def adjust_totals(self):
         items = self.invoice_items.exclude(returned_quantity = F("quantity"))
         if not items:
+            # An invoice with no lines keeps a NULL total, which
+            # average_order_value relies on to drop it from the average rather
+            # than counting it as an order worth nothing. Its charges are left
+            # on the record but are not a total on their own: a delivery fee
+            # with nothing being delivered is an invoice still being written.
             return
 
         subtotal = sum(item.net_quantity * item.unit_price for item in items)
@@ -406,9 +469,19 @@ class SalesInvoice(SettledInvoiceMixin, models.Model):
             else:
                 raise Exception("incorrect value")
 
+        # Charges are added after tax and are not part of sub_total.
+        #
+        # Both matter. Invoice.jsx recomputes a percentage tax and discount
+        # from sub_total to print them, so folding the charges in would have it
+        # charge tax on the delivery fee; and adding them before tax would
+        # charge real tax on it here. A charge is a pass-through, so it is
+        # taxed by neither.
+        charges = self.extra_charges_sum()
+
         self.sub_total = subtotal
-        self.total = subtotal + tax - discount
-        self.save(update_fields=["sub_total", "total"])
+        self.extra_charges_total = charges
+        self.total = subtotal + tax - discount + charges
+        self.save(update_fields=["sub_total", "total", "extra_charges_total"])
 
     # is_fulfilled() stood here and was dead: nothing called it, and it
     # assigned self.is_restocked / self.is_partially_restocked, which are

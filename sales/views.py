@@ -4,7 +4,7 @@ from datetime import datetime
 from django.db import transaction
 from django.utils import timezone
 
-from rest_framework import status
+from rest_framework import exceptions, status
 from rest_framework.viewsets import GenericViewSet, ModelViewSet, ViewSet
 from rest_framework.decorators import action
 from rest_framework.response import Response
@@ -541,6 +541,13 @@ class SalesInvoiceViewSet(SettledInvoiceViewMixin, ModelViewSet):
                 res_serializer = SalesInvoiceSerializer(sales_invoice)
                 return Response(res_serializer.data, status=status.HTTP_201_CREATED)
 
+            except exceptions.APIException:
+                # Let a validation error through. is_valid(raise_exception=True)
+                # raises one, and the blanket handler below was turning it into
+                # a 500 with no message - so every reason a payload was
+                # rejected, down to which extra charge was wrong, was lost.
+                raise
+
             except Exception as error:
                 print(error)
                 return Response({
@@ -597,6 +604,13 @@ class SalesInvoiceViewSet(SettledInvoiceViewMixin, ModelViewSet):
 
                 res_serializer = SalesInvoiceSerializer(sales_invoice)
                 return Response(res_serializer.data, status=status.HTTP_200_OK)
+
+            except exceptions.APIException:
+                # Let a validation error through. is_valid(raise_exception=True)
+                # raises one, and the blanket handler below was turning it into
+                # a 500 with no message - so every reason a payload was
+                # rejected, down to which extra charge was wrong, was lost.
+                raise
 
             except Exception as error:
                 print(error)

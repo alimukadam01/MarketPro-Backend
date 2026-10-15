@@ -1,3 +1,5 @@
+import math
+
 from django.db import transaction
 from django.db.models import Q, Sum
 from rest_framework import serializers
@@ -20,6 +22,105 @@ from .utils import (
     invoice_room,
     updateInventoryOnSale
 )
+
+
+MAX_EXTRA_CHARGES = 20
+MAX_EXTRA_CHARGE_LABEL = 64
+
+
+class ExtraChargesValidationMixin:
+    """
+    Validates the `extra_charges` list a sales invoice carries.
+
+    The column is a JSONField, which accepts any shape at all, and
+    SalesInvoice.extra_charges_sum() is deliberately forgiving because it runs
+    from a signal where raising would fail an already-accepted write. So this
+    is the only place a bad charge can be refused while there is still someone
+    to tell about it.
+
+    What it refuses, and why each one matters:
+
+    - an unknown key. A typo'd "ammount" would otherwise print as a charge on
+      the invoice and count as zero in the total, which is the worst possible
+      outcome: a figure that is wrong and looks deliberate.
+    - a negative amount. That is a discount, and because charges are subtracted
+      from revenue a negative one would add to it - money appearing in the
+      sales figures that nobody was billed.
+    - a blank label, a very long one (the PDF column is narrow), or a
+      non-finite amount, which no arithmetic survives.
+
+    Duplicate labels are allowed: two separate deliveries on one invoice is an
+    ordinary thing. Zero-amount rows are dropped rather than refused, since an
+    empty row left behind on the form is a slip, not an error.
+    """
+
+    def validate_extra_charges(self, value):
+        if value in (None, ''):
+            return []
+
+        if not isinstance(value, list):
+            raise serializers.ValidationError(
+                'Extra charges must be a list of {"label": ..., "amount": ...} '
+                'objects.'
+            )
+
+        if len(value) > MAX_EXTRA_CHARGES:
+            raise serializers.ValidationError(
+                f'An invoice can carry at most {MAX_EXTRA_CHARGES} extra '
+                f'charges.'
+            )
+
+        cleaned = []
+        for position, charge in enumerate(value, start=1):
+            if not isinstance(charge, dict):
+                raise serializers.ValidationError(
+                    f'Extra charge {position} must be an object with a label '
+                    f'and an amount.'
+                )
+
+            unknown = sorted(set(charge) - {'label', 'amount'})
+            if unknown:
+                raise serializers.ValidationError(
+                    f'Extra charge {position} has unexpected '
+                    f'{"keys" if len(unknown) > 1 else "key"} '
+                    f'{", ".join(unknown)}. Only label and amount are allowed.'
+                )
+
+            label = str(charge.get('label') or '').strip()
+            if not label:
+                raise serializers.ValidationError(
+                    f'Extra charge {position} needs a label.'
+                )
+            if len(label) > MAX_EXTRA_CHARGE_LABEL:
+                raise serializers.ValidationError(
+                    f'The label on extra charge {position} is longer than '
+                    f'{MAX_EXTRA_CHARGE_LABEL} characters.'
+                )
+
+            try:
+                amount = float(charge.get('amount'))
+            except (TypeError, ValueError):
+                raise serializers.ValidationError(
+                    f'The amount on extra charge {position} is not a number.'
+                )
+            if not math.isfinite(amount):
+                raise serializers.ValidationError(
+                    f'The amount on extra charge {position} is not a finite '
+                    f'number.'
+                )
+            if amount < 0:
+                raise serializers.ValidationError(
+                    f'The amount on extra charge {position} cannot be '
+                    f'negative. Use the discount field instead.'
+                )
+
+            amount = round(amount, 2)
+            if amount == 0:
+                continue
+
+            cleaned.append({'label': label, 'amount': amount})
+
+        return cleaned
 
 
 class PaymentReceiptSerializer(serializers.Serializer):
@@ -619,9 +720,14 @@ class SalesInvoiceSerializer(serializers.ModelSerializer):
         model = SalesInvoice
         fields = [
             'id', 'invoice_number', 'business', 'customer', 'date_issued', 'date_due', 'payment_status',
-            'status', 'sub_total', 'tax', 'discount', 'total', 'amount_paid' ,'created_by', 'created_at',
+            'status', 'sub_total', 'tax', 'discount', 'extra_charges',
+            'extra_charges_total', 'total', 'amount_paid' ,'created_by', 'created_at',
             'notes', 'is_deducted', 'invoice_items', 'projects', 'payment_receipts'
         ]
+        # Derived from extra_charges by adjust_totals. A client-sent value is
+        # ignored rather than trusted - it is the figure every revenue and
+        # profit aggregate subtracts.
+        read_only_fields = ['extra_charges_total']
 
 
 class SimpleSalesInvoiceSerializer(serializers.ModelSerializer):
@@ -675,12 +781,15 @@ class SimpleSalesInvoiceSerializer(serializers.ModelSerializer):
         model = SalesInvoice
         fields = [
             'id', 'invoice_number', 'customer', 'date_issued', 'date_due',
-            'payment_status', 'status', 'sub_total', 'tax', 'discount', 'total',
+            'payment_status', 'status', 'sub_total', 'tax', 'discount',
+            'extra_charges', 'extra_charges_total', 'total',
             'amount_paid', 'total_items', 'projects'
         ]
+        read_only_fields = ['extra_charges_total']
 
 
-class SalesInvoiceCreateSerializer(serializers.ModelSerializer):
+class SalesInvoiceCreateSerializer(ExtraChargesValidationMixin,
+                                   serializers.ModelSerializer):
 
     business = SimpleBusinessSerializer(read_only=True)
 
@@ -688,7 +797,7 @@ class SalesInvoiceCreateSerializer(serializers.ModelSerializer):
         model = SalesInvoice
         fields = [
             'id', 'invoice_number', 'business', 'customer', 'date_issued', 'date_due',
-            'payment_status', 'tax', 'discount', 'notes'
+            'payment_status', 'tax', 'discount', 'extra_charges', 'notes'
         ]
 
     def validate(self, attrs):
@@ -702,13 +811,15 @@ class SalesInvoiceCreateSerializer(serializers.ModelSerializer):
         )
 
 
-class SalesInvoiceUpdateSerializer(serializers.ModelSerializer):
+class SalesInvoiceUpdateSerializer(ExtraChargesValidationMixin,
+                                   serializers.ModelSerializer):
 
     class Meta:
         model = SalesInvoice
         fields = [
             'id', 'invoice_number', 'customer', 'date_issued', 'date_due',
-            'payment_status', 'sub_total', 'tax', 'discount', 'total', 'notes'
+            'payment_status', 'sub_total', 'tax', 'discount', 'extra_charges',
+            'total', 'notes'
         ]
 
     def save(self, **kwargs):
@@ -793,7 +904,8 @@ class RestockSerializer(serializers.Serializer):
         return True
 
 
-class SalesInvoiceAndItemsCreateSerializer(serializers.ModelSerializer):
+class SalesInvoiceAndItemsCreateSerializer(ExtraChargesValidationMixin,
+                                           serializers.ModelSerializer):
 
     items = serializers.ListField()
     project = serializers.IntegerField(required=False, allow_null=True)
@@ -866,6 +978,7 @@ class SalesInvoiceAndItemsCreateSerializer(serializers.ModelSerializer):
             'date_due',
             'discount',
             'tax',
+            'extra_charges',
             'payment_status',
             'items',
             'project',
@@ -873,7 +986,8 @@ class SalesInvoiceAndItemsCreateSerializer(serializers.ModelSerializer):
         ]
 
 
-class SalesInvoiceAndItemsUpdateSerializer(serializers.ModelSerializer):
+class SalesInvoiceAndItemsUpdateSerializer(ExtraChargesValidationMixin,
+                                           serializers.ModelSerializer):
 
     items = serializers.ListField()
     project = serializers.IntegerField(required=False, allow_null=True)
@@ -980,6 +1094,7 @@ class SalesInvoiceAndItemsUpdateSerializer(serializers.ModelSerializer):
             'date_due',
             'discount',
             'tax',
+            'extra_charges',
             'payment_status',
             'items',
             'project'
@@ -1096,7 +1211,7 @@ class GenerateInvoiceSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'created_at', 'date_issued', 'business', 'customer',
             'invoice_number', 'invoice_items', 'discount', 'tax', 'sub_total',
-            'total', 'amount_paid'
+            'extra_charges', 'extra_charges_total', 'total', 'amount_paid'
         ]
 
 

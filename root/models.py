@@ -49,6 +49,13 @@ class BaseQuerySet(models.QuerySet):
         })
 
     def monthly_trend(self, business_id, field):
+        """
+        A value per day for the current month, zero on the days with none.
+
+        `field` is anything Sum() takes - a column name, or an expression. The
+        sales trend passes one, to sum invoice totals net of their extra
+        charges.
+        """
         today = timezone.localdate()
         year = today.year
         month = today.month

@@ -324,8 +324,20 @@ def build_whatsapp_payload(invoice):
             f"Date: {issued.strftime('%d/%m/%Y')}",
             "",
             f"Items: {invoice.invoice_items.count()}",
-            f"Total: PKR {total:,}",
         ]
+
+        # Itemised above the total, not folded into it. A customer who is being
+        # asked for a delivery fee should be able to see that is what it is.
+        for charge in (invoice.extra_charges or []):
+            try:
+                label = str(charge.get('label') or '').strip()
+                amount = round(float(charge.get('amount') or 0))
+            except (AttributeError, TypeError, ValueError):
+                continue
+            if label and amount:
+                lines.append(f"{label}: PKR {amount:,}")
+
+        lines.append(f"Total: PKR {total:,}")
 
         # A customer who has cleared the bill should not be shown a balance
         # line at all - it reads like a demand.

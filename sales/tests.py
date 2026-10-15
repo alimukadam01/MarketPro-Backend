@@ -1,3 +1,5 @@
+from datetime import date
+
 from django.contrib.auth import get_user_model
 from django.test import TestCase
 from django.urls import reverse
@@ -15,7 +17,9 @@ from .models import (
     PurchaseInvoice, PurchaseInvoiceItem, SalesInvoice, SalesInvoiceItem,
     SalesInvoiceItemDeduction,
 )
-from .utils import updateInventoryOnSale
+from accounts.utils import party_invoiced, profit_estimate
+from .models import SalesReceipt
+from .utils import build_whatsapp_payload, invoice_room, updateInventoryOnSale
 
 User = get_user_model()
 
@@ -772,3 +776,280 @@ class DerivedSalesInvoiceStatusTests(TestCase):
         invoice = SalesInvoice.objects.get(
             business=self.business, invoice_number="DRV-16")
         self.assertEqual(invoice.status, "C")
+
+
+class SalesInvoiceExtraChargesTests(TestCase):
+    """Named charges added after tax, and out of revenue but not out of the bill.
+
+    A shop bills PKR 500 for delivery on top of PKR 1000 of paint. The
+    customer owes 1500 and the ledger says so, but only 1000 of it was a sale:
+    the delivery fee is collected alongside the goods, not earned on them, and
+    there is no cost of goods behind it. So `total` carries the charge and
+    GOODS_TOTAL - revenue, profit and the dashboard sales figure - does not.
+    """
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.user = User.objects.create_user(
+            email="charges@example.com", password="pw-for-tests"
+        )
+        City.objects.create(name="Multan", postal_code="60000")
+        cls.business = Business.objects.create(
+            name="Charged Paints", owner=cls.user,
+            phone="03001234567", is_active=True,
+        )
+        cls.customer = Customer.objects.get(
+            business=cls.business, name=WALK_IN_CUSTOMER_NAME
+        )
+        cls.unit = Unit.objects.create(name="Gallons", abv="Gal")
+        cls.product = Product.objects.create(
+            business=cls.business, name="Enamel 1G", unit=cls.unit
+        )
+        cls.variant = ProductVariant.objects.create(
+            base=cls.product, name="black", sku="CHG-1"
+        )
+
+    def setUp(self):
+        self.client = APIClient()
+        self.client.force_authenticate(self.user)
+
+    def post(self, number, charges, tax=0, discount=0, quantity=1,
+             price=1000, expect=201):
+        response = self.client.post(
+            "/sales-invoices/create-with-items/",
+            {
+                "invoice_number": number,
+                "customer": str(self.customer.id),
+                "date_issued": "2026-05-10",
+                "date_due": FAR_FUTURE,
+                "discount": {"value": discount, "type": "amount"},
+                "tax": {"value": tax, "type": "percentage"},
+                "extra_charges": charges,
+                "project": None,
+                "items": [{"product_id": self.variant.id,
+                           "quantity": quantity, "unit_price": price}],
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, expect, response.content)
+        if expect != 201:
+            return response
+        return SalesInvoice.objects.get(
+            business=self.business, invoice_number=number)
+
+    # --- the maths --------------------------------------------------------
+
+    def test_a_charge_is_added_after_tax_and_is_not_itself_taxed(self):
+        """Goods 1000, 10% tax, 100 discount, a 500 delivery charge.
+
+        sub_total stays goods-only, so the tax is 100 and not 150: a delivery
+        fee is a pass-through, and taxing it would overcharge the customer.
+        Invoice.jsx recomputes a percentage tax from sub_total to print it, so
+        the two agree only while the charges stay out of it.
+        """
+        invoice = self.post("CHG-1", [{"label": "Delivery", "amount": 500}],
+                            tax=10, discount=100)
+        self.assertEqual(invoice.sub_total, 1000)
+        self.assertEqual(invoice.extra_charges_total, 500)
+        self.assertEqual(invoice.total, 1000 + 100 - 100 + 500)
+
+    def test_several_charges_are_totalled(self):
+        invoice = self.post("CHG-2", [
+            {"label": "Delivery", "amount": 500},
+            {"label": "Labour", "amount": 250.5},
+        ])
+        self.assertEqual(invoice.extra_charges_total, 750.5)
+        self.assertEqual(invoice.total, 1750.5)
+
+    def test_two_charges_may_share_a_label(self):
+        """Two deliveries on one invoice is an ordinary thing."""
+        invoice = self.post("CHG-3", [
+            {"label": "Delivery", "amount": 300},
+            {"label": "Delivery", "amount": 200},
+        ])
+        self.assertEqual(invoice.extra_charges_total, 500)
+        self.assertEqual(len(invoice.extra_charges), 2)
+
+    def test_no_charges_leaves_the_total_as_it_was(self):
+        invoice = self.post("CHG-4", [])
+        self.assertEqual(invoice.extra_charges_total, 0)
+        self.assertEqual(invoice.total, 1000)
+
+    def test_a_charge_survives_an_item_being_added(self):
+        """adjust_totals runs again from the item signal, and it rewrites both
+        the total and the denormalised charges figure from the same source."""
+        invoice = self.post("CHG-5", [{"label": "Delivery", "amount": 500}])
+        SalesInvoiceItem.objects.create(
+            business=self.business, sales_invoice=invoice,
+            product=self.variant, quantity=1, unit_price=250,
+        )
+        invoice.refresh_from_db()
+        self.assertEqual(invoice.sub_total, 1250)
+        self.assertEqual(invoice.extra_charges_total, 500)
+        self.assertEqual(invoice.total, 1750)
+
+    # --- what the charge is and is not part of ----------------------------
+
+    def test_revenue_excludes_the_charge_but_the_bill_includes_it(self):
+        """The whole decision, in one test."""
+        invoice = self.post("CHG-6", [{"label": "Delivery", "amount": 500}])
+
+        self.assertEqual(invoice.total, 1500)
+        self.assertEqual(
+            SalesInvoice.objects.revenue(
+                self.business.id, date(2026, 5, 1), date(2026, 5, 31)),
+            1000,
+        )
+        self.assertEqual(
+            SalesInvoice.objects.total_sales(self.business.id), 1000)
+        self.assertEqual(
+            profit_estimate(self.business.id,
+                            date(2026, 5, 1), date(2026, 5, 31))['revenue'],
+            1000,
+        )
+        # The customer genuinely owes the delivery fee, so everything that
+        # answers "what is owed" counts it.
+        self.assertEqual(
+            party_invoiced(self.business.id, customer=self.customer),
+            1500,
+        )
+        self.assertEqual(invoice_room(invoice), 1500)
+
+    def test_the_charge_counts_towards_being_paid_in_full(self):
+        invoice = self.post("CHG-7", [{"label": "Delivery", "amount": 500}])
+        SalesReceipt.objects.create(sales_invoice=invoice, amount=1000)
+        invoice.refresh_from_db()
+        self.assertEqual(invoice.payment_status, "PP")
+
+        SalesReceipt.objects.create(sales_invoice=invoice, amount=500)
+        invoice.refresh_from_db()
+        self.assertEqual(invoice.payment_status, "P")
+
+    def test_the_average_order_value_keeps_the_charge(self):
+        """Unlike revenue: this is the average bill a customer was handed, and
+        the delivery fee was on it."""
+        self.post("CHG-8", [{"label": "Delivery", "amount": 500}])
+        self.assertEqual(
+            SalesInvoice.objects.average_order_value(self.business.id), 1500)
+
+    def test_the_monthly_trend_excludes_the_charge(self):
+        """monthly_trend is given an expression rather than a field name."""
+        self.post("CHG-9", [{"label": "Delivery", "amount": 500}])
+        trend = SalesInvoice.objects.monthly_sales_trend(self.business.id)
+        self.assertEqual(sum(day["value"] for day in trend), 1000)
+
+    def test_a_cancelled_charged_invoice_is_in_no_figure_at_all(self):
+        invoice = self.post("CHG-10", [{"label": "Delivery", "amount": 500}])
+        self.client.post(f"/sales-invoices/{invoice.pk}/cancel/")
+        self.assertEqual(
+            SalesInvoice.objects.revenue(
+                self.business.id, date(2026, 5, 1), date(2026, 5, 31)),
+            0,
+        )
+
+    def test_an_invoice_with_no_charges_column_set_still_aggregates(self):
+        """GOODS_TOTAL subtracts a column, so a row that predates it must not
+        drop out of the sum. The migration defaults it to 0.0 rather than NULL
+        for exactly this reason."""
+        invoice = self.post("CHG-11", [])
+        SalesInvoice.objects.filter(pk=invoice.pk).update(extra_charges=None)
+        self.assertEqual(
+            SalesInvoice.objects.total_sales(self.business.id), 1000)
+
+    # --- validation -------------------------------------------------------
+
+    def test_a_negative_charge_is_refused(self):
+        """It would be a discount - and because charges are subtracted from
+        revenue, a negative one would add to it: money in the sales figures
+        that nobody was ever billed."""
+        self.post("CHG-12", [{"label": "Rebate", "amount": -500}], expect=400)
+
+    def test_a_blank_label_is_refused(self):
+        self.post("CHG-13", [{"label": "   ", "amount": 500}], expect=400)
+
+    def test_an_unknown_key_is_refused(self):
+        """A typo'd "ammount" would print as a charge and count as zero."""
+        self.post("CHG-14", [{"label": "Delivery", "ammount": 500}],
+                  expect=400)
+
+    def test_an_object_instead_of_a_list_is_refused(self):
+        self.post("CHG-15", {"label": "Delivery", "amount": 500}, expect=400)
+
+    def test_a_non_numeric_amount_is_refused(self):
+        self.post("CHG-16", [{"label": "Delivery", "amount": "lots"}],
+                  expect=400)
+
+    def test_an_over_long_label_is_refused(self):
+        self.post("CHG-17", [{"label": "D" * 65, "amount": 500}], expect=400)
+
+    def test_too_many_charges_are_refused(self):
+        self.post(
+            "CHG-18",
+            [{"label": f"Charge {n}", "amount": 10} for n in range(21)],
+            expect=400,
+        )
+
+    def test_a_zero_charge_is_dropped_rather_than_refused(self):
+        """An empty row left on the form is a slip, not an error."""
+        invoice = self.post("CHG-19", [
+            {"label": "Delivery", "amount": 500},
+            {"label": "Labour", "amount": 0},
+        ])
+        self.assertEqual(len(invoice.extra_charges), 1)
+        self.assertEqual(invoice.extra_charges_total, 500)
+
+    def test_an_amount_is_rounded_and_a_label_stripped(self):
+        invoice = self.post("CHG-20", [{"label": "  Delivery  ",
+                                        "amount": 500.456}])
+        self.assertEqual(invoice.extra_charges,
+                         [{"label": "Delivery", "amount": 500.46}])
+
+    def test_a_client_sent_total_is_ignored(self):
+        """extra_charges_total is derived. It is the figure every revenue and
+        profit aggregate subtracts, so a client must not be able to set it."""
+        response = self.client.post(
+            "/sales-invoices/create-with-items/",
+            {
+                "invoice_number": "CHG-21",
+                "customer": str(self.customer.id),
+                "date_issued": "2026-05-10",
+                "date_due": FAR_FUTURE,
+                "discount": {"value": 0, "type": "amount"},
+                "tax": {"value": 0, "type": "percentage"},
+                "extra_charges": [{"label": "Delivery", "amount": 500}],
+                "extra_charges_total": 999999,
+                "project": None,
+                "items": [{"product_id": self.variant.id,
+                           "quantity": 1, "unit_price": 1000}],
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, 201, response.content)
+        invoice = SalesInvoice.objects.get(
+            business=self.business, invoice_number="CHG-21")
+        self.assertEqual(invoice.extra_charges_total, 500)
+
+    # --- the surfaces -----------------------------------------------------
+
+    def test_the_charges_reach_the_pdf_payload(self):
+        """Without these two fields on GenerateInvoiceSerializer the printed
+        invoice cannot show a charge the customer is being billed for."""
+        invoice = self.post("CHG-22", [{"label": "Delivery", "amount": 500}])
+        response = self.client.get(f"/sales-invoices/{invoice.pk}/print-invoice/")
+        self.assertEqual(response.status_code, 200, response.content)
+        body = response.json()
+        self.assertEqual(body["extra_charges"],
+                         [{"label": "Delivery", "amount": 500.0}])
+        self.assertEqual(body["extra_charges_total"], 500.0)
+        self.assertEqual(body["sub_total"], 1000)
+
+    def test_the_charges_reach_the_whatsapp_message(self):
+        invoice = self.post("CHG-23", [{"label": "Delivery", "amount": 500}])
+        self.customer.phone = "03001234567"
+        self.customer.save(update_fields=["phone"])
+        invoice.refresh_from_db()
+
+        payload = build_whatsapp_payload(invoice)
+        self.assertIsNotNone(payload)
+        self.assertIn("Delivery: PKR 500", payload["message"])
+        self.assertIn("Total: PKR 1,500", payload["message"])
