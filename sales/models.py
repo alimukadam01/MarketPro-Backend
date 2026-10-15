@@ -894,6 +894,14 @@ class SalesInvoiceItemDeduction(BaseRestock):
         return f"{self.sales_invoice.id}: {self.sales_invoice_item.product.base.name} ({self.sales_invoice_item.product.name}) x {self.quantity}"
 
 
+# Dead. Nothing creates a SalesReservation anywhere, and nothing reads one:
+# it was meant to hold stock for an invoice that had not completed yet, which
+# the derived status made unnecessary - an invoice with lines is complete and
+# its stock has left. The table is kept rather than dropped because a migration
+# to remove it would have to be reversed by hand if reserving is ever wanted,
+# and an empty table costs nothing. The `deductions` accessors it defines are
+# the confusing part: the real deduction ledger is SalesInvoiceItemDeduction,
+# reached through `restocks`.
 class SalesReservation(BaseRestock):
     sales_invoice = models.ForeignKey(
         SalesInvoice, models.CASCADE, related_name='deductions')

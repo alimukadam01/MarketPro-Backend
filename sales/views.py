@@ -476,8 +476,12 @@ class SalesInvoiceViewSet(SettledInvoiceViewMixin, ModelViewSet):
     # DjangoFilterBackend to match and the parameter used to be ignored.
     # The column-backed fields are unchanged, declared in its Meta.
     filterset_class = SalesInvoiceFilter
+    # 'status' is deliberately absent. Search is an icontains across every
+    # field at once, and the column holds one-letter codes - so searching for
+    # anything with a "c" in it matched every completed invoice, and a search
+    # for a customer called Dawood matched every draft.
     search_fields = [
-        'id', 'invoice_number', 'customer__name', 'status', 'sub_total', 'total', 'discount', 'tax', 'notes', 'created_by__email'
+        'id', 'invoice_number', 'customer__name', 'sub_total', 'total', 'discount', 'tax', 'notes', 'created_by__email'
     ]
 
     def get_queryset(self):
