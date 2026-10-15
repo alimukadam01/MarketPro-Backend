@@ -136,9 +136,6 @@ class SalesInvoiceManager(models.Manager):
 
         return queryset.aggregate(total=Sum("total"))["total"] or 0
 
-    def total_invoices(self, business_id, num_days=None):
-        return self.get_queryset().for_business(business_id).in_period(num_days).count() 
-
     def monthly_sales_trend(self, business_id):
         return self.get_queryset().monthly_trend(business_id, 'total')
 
@@ -508,9 +505,6 @@ class PurchaseInvoiceManager(models.Manager):
             queryset = queryset.in_period(num_days)
 
         return queryset.aggregate(total=Sum("total"))["total"] or 0
-
-    def total_invoices(self, business_id, num_days=None):
-        return self.get_queryset().for_business(business_id).in_period(num_days).count() 
 
     def purchase_value(self, business_id, date_from, date_to,
                        supplier_id=None, created_by_id=None, status=None):

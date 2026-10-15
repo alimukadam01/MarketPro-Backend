@@ -806,8 +806,16 @@ class SalesKPIViewSet(GenericViewSet):
                     'detail': 'No active business exists. Please contact admin.'
                 }, status=status.HTTP_400_BAD_REQUEST)
 
-            total_invoices = SalesInvoice.objects.total_invoices(
-                business.id, 1)
+            # Dated on the invoice, not on created_at. total_invoices() went
+            # through BaseQuerySet.in_period, which filters created_at over a
+            # rolling 24 hours, so an invoice backdated to yesterday was
+            # counted today and a late-entered one was counted on the wrong
+            # day. invoice_count() filters date_issued and drops cancelled
+            # invoices - the same fix daily-total-items and
+            # monthly-total-purchase-invoices already carry.
+            today = timezone.localdate()
+            total_invoices = SalesInvoice.objects.invoice_count(
+                business.id, today, today)
             return Response({
                 "total_invoices": total_invoices
             }, status=status.HTTP_200_OK)
