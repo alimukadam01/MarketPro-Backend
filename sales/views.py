@@ -19,7 +19,7 @@ from accounts.settlement import attach_settlement
 from accounts.utils import month_bounds, payables
 from .filters import PurchaseInvoiceFilter, SalesInvoiceFilter
 from .models import PurchaseInvoice, PurchaseInvoiceItem, PurchaseQuotation, PurchaseQuotationItem, PurchaseReceipt, ReturnedItem, SalesInvoice, SalesInvoiceItem, SalesReceipt
-from .utils import build_whatsapp_payload, invoice_room
+from .utils import build_whatsapp_payload, invoice_room, restockOnCancel, updateInventoryOnSale
 from .serializers import (
     PaymentReceiptSerializer,
     PurchaseInvoiceAndItemsCreateSerializer,
@@ -626,6 +626,77 @@ class SalesInvoiceViewSet(SettledInvoiceViewMixin, ModelViewSet):
         return Response(payload, status=status.HTTP_200_OK)
 
     ### a counter sale gets a name when it is printed
+    @action(['POST'], detail=True, url_path='cancel', url_name='cancel')
+    def cancel(self, request, pk=None):
+        """
+        Cancel an invoice and return its goods to stock.
+
+        The one status transition a person makes: every other value is derived
+        from the invoice's contents, so cancelling is an action rather than a
+        field. A cancelled invoice is not a debt, so it also leaves the party's
+        khaata.
+        """
+        business = get_active_business(request)
+        if not business:
+            return Response(
+                {'detail': 'No active business exists. Please contact admin.'},
+                status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            invoice = self.get_object()
+            if invoice.status in SalesInvoice.CANCELLED_STATUSES:
+                return Response({'detail': 'This invoice is already cancelled.'},
+                                status=status.HTTP_400_BAD_REQUEST)
+
+            with transaction.atomic():
+                # Stock first: restockOnCancel reads the deduction ledger, and
+                # it is cleared here so un-cancelling deducts exactly once more.
+                restockOnCancel(invoice)
+                invoice.status = 'X'
+                SalesInvoice.objects.filter(pk=invoice.pk).update(status='X')
+
+            invoice.refresh_from_db()
+            return Response(SalesInvoiceSerializer(invoice).data,
+                            status=status.HTTP_200_OK)
+        except Exception as error:
+            print(error)
+            return Response({'detail': 'Internal Server Error.'},
+                            status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    @action(['POST'], detail=True, url_path='uncancel', url_name='uncancel')
+    def uncancel(self, request, pk=None):
+        """
+        Reinstate a cancelled invoice: the status goes back to being derived
+        from its lines, and the goods leave stock again.
+        """
+        business = get_active_business(request)
+        if not business:
+            return Response(
+                {'detail': 'No active business exists. Please contact admin.'},
+                status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            invoice = self.get_object()
+            if invoice.status not in SalesInvoice.CANCELLED_STATUSES:
+                return Response({'detail': 'This invoice is not cancelled.'},
+                                status=status.HTTP_400_BAD_REQUEST)
+
+            with transaction.atomic():
+                # Out of the manual state first, so recalculate_status stops
+                # treating it as sticky and can derive from the lines again.
+                invoice.status = 'D'
+                SalesInvoice.objects.filter(pk=invoice.pk).update(status='D')
+                invoice.recalculate_status()
+                updateInventoryOnSale(invoice)
+
+            invoice.refresh_from_db()
+            return Response(SalesInvoiceSerializer(invoice).data,
+                            status=status.HTTP_200_OK)
+        except Exception as error:
+            print(error)
+            return Response({'detail': 'Internal Server Error.'},
+                            status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
     @action(['POST'], detail=True, url_path='capture-customer', url_name='capture-customer')
     def capture_customer(self, request, pk=None):
         """
@@ -651,9 +722,10 @@ class SalesInvoiceViewSet(SettledInvoiceViewMixin, ModelViewSet):
         try:
             with transaction.atomic():
                 customer = serializer.save()
-                # .update() rather than invoice.save(): moving the buyer must
-                # not fire updateInventoryOnSale, which would take a stock
-                # deduction pass as a side effect of a name change.
+                # .update() rather than invoice.save(): a one-column write, and
+                # nothing else should be touched by a change of buyer. It used
+                # to be here to dodge a post_save receiver that ran a stock
+                # deduction pass on any invoice save; that receiver is gone.
                 SalesInvoice.objects.filter(pk=invoice.pk).update(customer=customer)
 
             invoice.refresh_from_db()
@@ -676,7 +748,7 @@ class SalesInvoiceItemViewSet(ModelViewSet):
 
     filter_backends = [SearchFilter, DjangoFilterBackend]
     filterset_fields = [
-        'sales_invoice__id', 'sales_invoice__invoice_number', 'is_deducted', 'is_partially_deducted',
+        'sales_invoice__id', 'sales_invoice__invoice_number', 'is_deducted',
         'product__name', 'product__base__name', 'track_code', 'unit_price', 'quantity_received'
     ]
     search_fields = [
@@ -1202,7 +1274,7 @@ class PurchaseQuotationItemViewSet(ModelViewSet):
     filter_backends = [SearchFilter, DjangoFilterBackend]
     '''
     filterset_fields = [
-        'sales_invoice__id', 'sales_invoice__invoice_number', 'is_deducted', 'is_partially_deducted',
+        'sales_invoice__id', 'sales_invoice__invoice_number', 'is_deducted',
         'product__name', 'product__base__name', 'track_code', 'unit_price', 'quantity_received'
     ]
     search_fields = [

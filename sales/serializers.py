@@ -526,7 +526,7 @@ class SalesInvoiceItemSerializer(serializers.ModelSerializer):
         model = SalesInvoiceItem
         fields = [
             'id', 'sales_invoice', 'product', 'unit_price', 'quantity', 'returned_quantity', 'net_quantity',
-            'track_code', 'notes', 'quantity_received', 'is_deducted', 'is_partially_deducted', 'is_returned'
+            'track_code', 'notes', 'quantity_received', 'is_deducted', 'is_returned'
         ]
 
     def update(self, instance, validated_data):
@@ -546,7 +546,7 @@ class SimpleSalesInvoiceItemSerializer(serializers.ModelSerializer):
         model = SalesInvoiceItem
         fields = [
             'id', 'sales_invoice', 'product', 'unit_price', 'quantity', 'returned_quantity', 'net_quantity',
-            'quantity_received', 'discount', 'is_deducted', 'is_partially_deducted', 'is_returned'
+            'quantity_received', 'discount', 'is_deducted', 'is_returned'
         ]
 
 
@@ -606,13 +606,21 @@ class SalesInvoiceSerializer(serializers.ModelSerializer):
     customer = SimpleCustomerSerializer(read_only=True)
     projects = ProjectSalesInvoiceLinker(many=True)
     payment_receipts = PaymentReceiptSerializer(many=True)
+    # The column holds Draft, Completed or Cancelled; Overdue is worked out
+    # here, because whether an invoice is overdue depends on what the khaata
+    # has settled onto it and on today's date, neither of which writes to the
+    # invoice. display_status is the one definition of the rule.
+    status = serializers.SerializerMethodField()
+
+    def get_status(self, obj):
+        return obj.display_status
 
     class Meta:
         model = SalesInvoice
         fields = [
             'id', 'invoice_number', 'business', 'customer', 'date_issued', 'date_due', 'payment_status',
             'status', 'sub_total', 'tax', 'discount', 'total', 'amount_paid' ,'created_by', 'created_at',
-            'notes', 'is_deducted', 'is_partially_deducted', 'invoice_items', 'projects', 'payment_receipts'
+            'notes', 'is_deducted', 'invoice_items', 'projects', 'payment_receipts'
         ]
 
 
@@ -622,6 +630,7 @@ class SimpleSalesInvoiceSerializer(serializers.ModelSerializer):
     total_items = serializers.SerializerMethodField()
     amount_paid = serializers.SerializerMethodField()
     projects = ProjectSalesInvoiceLinker(many=True)
+    status = serializers.SerializerMethodField()
 
     def get_total_items(self, obj):
         """
@@ -655,6 +664,13 @@ class SimpleSalesInvoiceSerializer(serializers.ModelSerializer):
             return obj.sales_invoice.amount_paid
         return obj.amount_paid
 
+    def get_status(self, obj):
+        # Overdue is derived, not stored - see SalesInvoiceSerializer above.
+        # The list view attaches the settlement and prefetches the items, so
+        # this costs no extra queries per row.
+        invoice = obj.sales_invoice if type(obj) == ProjectSalesInvoice else obj
+        return invoice.display_status
+
     class Meta:
         model = SalesInvoice
         fields = [
@@ -672,7 +688,7 @@ class SalesInvoiceCreateSerializer(serializers.ModelSerializer):
         model = SalesInvoice
         fields = [
             'id', 'invoice_number', 'business', 'customer', 'date_issued', 'date_due',
-            'payment_status', 'status', 'tax', 'discount', 'notes'
+            'payment_status', 'tax', 'discount', 'notes'
         ]
 
     def validate(self, attrs):
@@ -692,7 +708,7 @@ class SalesInvoiceUpdateSerializer(serializers.ModelSerializer):
         model = SalesInvoice
         fields = [
             'id', 'invoice_number', 'customer', 'date_issued', 'date_due',
-            'payment_status', 'status', 'sub_total', 'tax', 'discount', 'total', 'notes'
+            'payment_status', 'sub_total', 'tax', 'discount', 'total', 'notes'
         ]
 
     def save(self, **kwargs):
@@ -815,7 +831,9 @@ class SalesInvoiceAndItemsCreateSerializer(serializers.ModelSerializer):
 
             sales_invoice.refresh_from_db()
             sales_invoice.adjust_totals()
-            # No need to call this, it's called in adjust_totals.
+            # Status before stock: it is derived from the lines, and
+            # updateInventoryOnSale only deducts for a COMPLETED invoice.
+            sales_invoice.recalculate_status()
             updateInventoryOnSale(sales_invoice)
 
             # Money received at the time of sale becomes a payment record;
@@ -849,7 +867,6 @@ class SalesInvoiceAndItemsCreateSerializer(serializers.ModelSerializer):
             'discount',
             'tax',
             'payment_status',
-            'status',
             'items',
             'project',
             'amount_paid'
@@ -923,6 +940,10 @@ class SalesInvoiceAndItemsUpdateSerializer(serializers.ModelSerializer):
 
                 self.instance.refresh_from_db()
                 self.instance.adjust_totals()
+                # Deliberately here and not beside the invoice save above: the
+                # lines are only final once the new ones are created and the
+                # removed ones deleted, and the status is derived from them.
+                self.instance.recalculate_status()
                 updateInventoryOnSale(self.instance)
 
                 # Handle Projects Addition/Updation/Deletion Logic
@@ -960,7 +981,6 @@ class SalesInvoiceAndItemsUpdateSerializer(serializers.ModelSerializer):
             'discount',
             'tax',
             'payment_status',
-            'status',
             'items',
             'project'
         ]

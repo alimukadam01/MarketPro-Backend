@@ -216,13 +216,20 @@ class SalesInvoiceManager(models.Manager):
 
 class SalesInvoice(SettledInvoiceMixin, models.Model):
 
+    # Status is derived, not chosen. An invoice is a Draft until it carries a
+    # line, Completed once it does, and Overdue while it is unpaid past its due
+    # date. Cancelling is the one transition a person makes, and it sticks.
+    #
+    #   ("S",  "SENT")                 removed - no client used it
+    #   ("PC", "PARTIALLY_COMPLETED")  removed - it was never a document state,
+    #                                  only a copy of how much stock had moved,
+    #                                  and writing it over the user's choice is
+    #                                  what made an edited invoice unfixable.
     SALES_INVOICE_STATUS_CHOICES = [
         ("D", "DRAFT"),
-        ("S", "SENT"),
         ("O", "OVERDUE"),
         ("X", "CANCELLED"),
         ("C", "COMPLETED"),
-        ("PC", "PARTIALLY_COMPLETED")
     ]
 
     # Which states mean the sale never happened. Kept here rather than imported
@@ -231,6 +238,14 @@ class SalesInvoice(SettledInvoiceMixin, models.Model):
     CANCELLED_STATUSES = ["X"]
     # Not confirmed yet, so not a debt: left out of the khaata with cancelled.
     DRAFT_STATUSES = ["D"]
+    # Set by a person and never recalculated away.
+    MANUAL_STATUSES = ["X"]
+    # Worked out on every read and never stored: whether an invoice is overdue
+    # depends on what it has been paid, and the khaata settles that on read
+    # (accounts/settlement.py stores nothing). It also changes when the date
+    # rolls over, with no write to the invoice at all, so a stored value would
+    # be wrong by construction and there is no scheduler here to refresh it.
+    DERIVED_ONLY_STATUSES = ["O"]
 
     PAYMENT_STATUS_CHOICES = [
         ("P", "PAID"),
@@ -247,8 +262,12 @@ class SalesInvoice(SettledInvoiceMixin, models.Model):
     # Editable, so a sale entered a day late can carry the day it happened.
     date_issued = models.DateTimeField(default=timezone.now)
     date_due = models.DateField(null=True, blank=True)
+    # 'D' as a plain string. This read SALES_INVOICE_STATUS_CHOICES[2], which
+    # is the whole ("O", "OVERDUE") tuple rather than a code - and once SENT
+    # and PARTIALLY_COMPLETED were removed, index 2 became CANCELLED, which
+    # would have quietly dropped every defaulted invoice out of the khaata.
     status = models.CharField(
-        max_length=256, choices=SALES_INVOICE_STATUS_CHOICES, default=SALES_INVOICE_STATUS_CHOICES[2])
+        max_length=256, choices=SALES_INVOICE_STATUS_CHOICES, default='D')
     sub_total = models.FloatField(null=True, blank=True)
     tax = models.JSONField(
         null=True,
@@ -269,28 +288,75 @@ class SalesInvoice(SettledInvoiceMixin, models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     notes = models.TextField(null=True, blank=True)
     is_deducted = models.BooleanField(default=False)
-    is_partially_deducted = models.BooleanField(default=False)
 
     objects = SalesInvoiceManager()
 
     def update_deduction_flags(self):
+        """
+        Whether every line has left stock. A stock fact only - it no longer
+        touches `status`, which is what made an invoice stick on PARTIALLY
+        COMPLETED for ever once a line was added during an update.
+        """
         items = self.invoice_items.all()
-        deducted = 0
+        self.is_deducted = bool(items) and all(
+            item.is_deducted for item in items)
 
-        for obj in items:
-            if obj.is_partially_deducted:
-                self.is_partially_deducted = True
-                self.is_deducted = False
-                self.status = 'PC'
-                return
+    @property
+    def amount_due(self):
+        """
+        What is still owed: the total less its own receipts AND whatever the
+        party's khaata settles onto it. Never negative-by-rounding.
+        """
+        return round(float(self.total or 0) - float(self.amount_paid or 0), 2)
 
-            if obj.is_deducted:
-                deducted += 1
+    @property
+    def is_overdue(self):
+        # The same epsilon accounts/settlement.py uses, so a rounding tail
+        # cannot make a settled invoice look overdue.
+        return bool(
+            self.date_due
+            and self.date_due < timezone.localdate()
+            and self.amount_due > 0.005
+        )
 
-        if deducted == len(items):
-            self.is_partially_deducted = False
-            self.is_deducted = True
-            self.status = 'C'
+    @property
+    def display_status(self):
+        """
+        The status a person should see. The single definition of the rule:
+        the serializers, the list filter and recalculate_status all read it,
+        so they cannot drift apart.
+        """
+        if self.status in self.MANUAL_STATUSES:
+            return self.status
+        # len() rather than .exists(): the list view prefetches invoice_items,
+        # and len() reuses that cache while .exists() costs a query per row.
+        if not len(self.invoice_items.all()):
+            return 'D'
+        if self.is_overdue:
+            return 'O'
+        return 'C'
+
+    @property
+    def stored_status(self):
+        """display_status with Overdue folded back into Completed."""
+        derived = self.display_status
+        return 'C' if derived in self.DERIVED_ONLY_STATUSES else derived
+
+    def recalculate_status(self):
+        """
+        Bring the stored status back in line with the invoice's contents.
+
+        Written with a queryset update rather than self.save(): that fires no
+        signals, so a status write can never re-enter the item/invoice save
+        cycle that adjust_totals already runs inside. The in-memory value is
+        set too, so the response serialises the new status without a refetch.
+        """
+        new_status = self.stored_status
+        if new_status == self.status:
+            return False
+        self.status = new_status
+        SalesInvoice.objects.filter(pk=self.pk).update(status=new_status)
+        return True
 
     def __str__(self):
         return f"{self.id}-{self.invoice_number}-{self.total}-{self.status}"
@@ -344,15 +410,11 @@ class SalesInvoice(SettledInvoiceMixin, models.Model):
         self.total = subtotal + tax - discount
         self.save(update_fields=["sub_total", "total"])
 
-    def is_fulfilled(self):
-        for item in self.invoice_items.all():
-            if not item.is_restocked:
-                self.is_restocked = False
-                return
-
-        self.is_restocked = True
-        self.is_partially_restocked = False
-        self.status = 'C'
+    # is_fulfilled() stood here and was dead: nothing called it, and it
+    # assigned self.is_restocked / self.is_partially_restocked, which are
+    # PurchaseInvoice fields that SalesInvoice does not have - so it would
+    # have raised had anything ever reached it. It also set status = 'C',
+    # which is now derived. Removed with the rest of the status overload.
 
     def items_by_product(self) -> Dict[int, List['SalesInvoiceItem']]:
         """
@@ -437,7 +499,6 @@ class SalesInvoiceItem(BaseItem):
     quantity_received = models.IntegerField(default=0)
     returned_quantity = models.PositiveIntegerField(default=0)
     is_deducted = models.BooleanField(default=False)
-    is_partially_deducted = models.BooleanField(default=False)
 
     objects = SalesInvoiceItemManager()
 
@@ -463,13 +524,23 @@ class SalesInvoiceItem(BaseItem):
 
     def update_restock_flags(self):
         """
-        Exactly one of is_restocked / is_partially_restocked should be True.
-        """
+        Whether this line has fully left stock.
 
-        full = (self.quantity_received >= self.quantity)
-        self.is_deducted = full
-        self.is_partially_deducted = not full
-        self.save(update_fields=['is_deducted', 'is_partially_deducted'])
+        Read from the deduction ledger, not from quantity_received. The two
+        disagree: compute_restock_delta() above measures what is left to
+        deduct as quantity minus the logged deductions, while this used to
+        compare quantity_received - a field the sales update path never set.
+        So a line could be fully deducted in the ledger and still be flagged
+        partial for ever, which is exactly what pinned an edited invoice to
+        PARTIALLY COMPLETED.
+
+        Only ever called right after a deduction is logged, so the ledger is
+        current when it runs.
+        """
+        deducted = self.restocks.aggregate(
+            total=models.Sum('quantity'))['total'] or 0
+        self.is_deducted = deducted >= self.quantity
+        self.save(update_fields=['is_deducted'])
     
     def __str__(self):
         return f'{self.id}_{self.product.base.name} ({self.product.name})_{self.sales_invoice.id}_{self.sales_invoice.invoice_number}'

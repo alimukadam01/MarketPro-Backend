@@ -15,8 +15,13 @@ from .models import (
     PurchaseInvoice, PurchaseInvoiceItem, SalesInvoice, SalesInvoiceItem,
     SalesInvoiceItemDeduction,
 )
+from .utils import updateInventoryOnSale
 
 User = get_user_model()
+
+# A due date no test run will ever be past, so an unpaid invoice reads as
+# Completed rather than deriving to Overdue on the day the suite runs.
+FAR_FUTURE = "2099-12-31"
 
 # Unlike any pk, quantity or date on the page, so a plain substring check is
 # enough to prove absence.
@@ -177,7 +182,7 @@ class CaptureWalkInCustomerTests(TestCase):
         )
         cls.invoice = SalesInvoice.objects.create(
             business=cls.business, customer=cls.walk_in,
-            created_by=cls.user, status="S", invoice_number="INV-CAP-1",
+            created_by=cls.user, status="C", invoice_number="INV-CAP-1",
             sub_total=1000, total=1000,
         )
 
@@ -261,7 +266,7 @@ class CaptureWalkInCustomerTests(TestCase):
             business=other_business,
             customer=Customer.objects.get(
                 business=other_business, name=WALK_IN_CUSTOMER_NAME),
-            created_by=other_user, status="S", total=500,
+            created_by=other_user, status="C", total=500,
         )
 
         response = self.client.post(
@@ -344,7 +349,7 @@ class RepeatedProductOnSalesInvoiceTests(TestCase):
         self.client = APIClient()
         self.client.force_authenticate(self.user)
 
-    def post(self, number, items, status="D"):
+    def post(self, number, items):
         return self.client.post(
             "/sales-invoices/create-with-items/",
             {
@@ -354,7 +359,6 @@ class RepeatedProductOnSalesInvoiceTests(TestCase):
                 "date_due": "2026-05-10",
                 "discount": {"value": 0, "type": "amount"},
                 "tax": {"value": 0, "type": "percentage"},
-                "status": status,
                 "project": None,
                 "items": items,
             },
@@ -408,7 +412,6 @@ class RepeatedProductOnSalesInvoiceTests(TestCase):
         response = self.post(
             "1307",
             [self.line(100, 2), self.line(200, 3), self.line(300, 5)],
-            status="C",
         )
         self.assertEqual(response.status_code, 201, response.content)
 
@@ -418,3 +421,354 @@ class RepeatedProductOnSalesInvoiceTests(TestCase):
             business=self.business, invoice_number="1307"
         )
         self.assertEqual(invoice.total, 2 * 100 + 3 * 200 + 5 * 300)
+
+
+class DerivedSalesInvoiceStatusTests(TestCase):
+    """Status is derived from the invoice, not chosen - and deduction follows it.
+
+    Bug #001: adding a line while updating an invoice flipped it to
+    "Partially Completed" and it could never be set back. The cause was that
+    `status` meant two things at once - the document state a person picked, and
+    a record of how much stock had left - so `update_deduction_flags()` could
+    overwrite the chosen value on any save.
+
+    The rule now: no lines -> Draft; lines -> Completed, which deducts stock;
+    lines plus a balance past the due date -> Overdue, produced on read and
+    never stored. The only manual transition is Cancelled, which restocks.
+    """
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.user = User.objects.create_user(
+            email="derived-status@example.com", password="pw-for-tests"
+        )
+        City.objects.create(name="Lahore", postal_code="54000")
+        cls.business = Business.objects.create(
+            name="Derived Paints", owner=cls.user,
+            phone="03001234567", is_active=True,
+        )
+        cls.customer = Customer.objects.get(
+            business=cls.business, name=WALK_IN_CUSTOMER_NAME
+        )
+        cls.unit = Unit.objects.create(name="Litres", abv="L")
+        cls.product = Product.objects.create(
+            business=cls.business, name="Emulsion 4L", unit=cls.unit
+        )
+        cls.variant = ProductVariant.objects.create(
+            base=cls.product, name="white", sku="DRV-1"
+        )
+
+    def setUp(self):
+        self.client = APIClient()
+        self.client.force_authenticate(self.user)
+
+    # --- helpers ---------------------------------------------------------
+
+    def stock(self, quantity=100):
+        return InventoryItem.objects.create(
+            business=self.business,
+            inventory=Inventory.objects.get(business=self.business),
+            product=self.variant, quantity=quantity,
+            quantity_on_hand=quantity, unit_cost=50,
+        )
+
+    def line(self, price=100, quantity=1):
+        return {"product_id": self.variant.id, "quantity": quantity,
+                "unit_price": price}
+
+    def create_invoice(self, number, items, due=FAR_FUTURE):
+        response = self.client.post(
+            "/sales-invoices/create-with-items/",
+            {
+                "invoice_number": number,
+                "customer": str(self.customer.id),
+                "date_issued": "2026-05-10",
+                "date_due": due,
+                "discount": {"value": 0, "type": "amount"},
+                "tax": {"value": 0, "type": "percentage"},
+                "project": None,
+                "items": items,
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, 201, response.content)
+        return SalesInvoice.objects.get(
+            business=self.business, invoice_number=number)
+
+    def update_invoice(self, invoice, items, due=FAR_FUTURE):
+        """The bundled update, with `items` in the shape the page sends:
+        an existing line carries its id, a new line carries id=0."""
+        return self.client.post(
+            f"/sales-invoices/{invoice.pk}/update-with-items/",
+            {
+                "invoice_number": invoice.invoice_number,
+                "customer": str(self.customer.id),
+                "date_issued": "2026-05-10",
+                "date_due": due,
+                "discount": {"value": 0, "type": "amount"},
+                "tax": {"value": 0, "type": "percentage"},
+                "project": None,
+                "items": items,
+            },
+            format="json",
+        )
+
+    def existing_lines(self, invoice):
+        return [{"id": item.id, "product_id": item.product_id,
+                 "quantity": item.quantity, "unit_price": item.unit_price}
+                for item in invoice.invoice_items.all()]
+
+    def deduction_count(self, invoice):
+        return SalesInvoiceItemDeduction.objects.filter(
+            sales_invoice=invoice).count()
+
+    # --- the derived rule ------------------------------------------------
+
+    def test_an_invoice_with_no_lines_is_a_draft(self):
+        invoice = SalesInvoice.objects.create(
+            business=self.business, customer=self.customer,
+            created_by=self.user, invoice_number="DRV-EMPTY",
+        )
+        self.assertEqual(invoice.display_status, "D")
+        self.assertEqual(invoice.stored_status, "D")
+
+    def test_a_new_invoice_defaults_to_draft_not_cancelled(self):
+        """The default used to be SALES_INVOICE_STATUS_CHOICES[2] - the whole
+        tuple rather than a code. With SENT and PARTIALLY_COMPLETED gone,
+        index 2 is now CANCELLED, which would have dropped every new invoice
+        out of the party ledger.
+        """
+        invoice = SalesInvoice.objects.create(
+            business=self.business, customer=self.customer,
+            created_by=self.user, invoice_number="DRV-DEFAULT",
+        )
+        invoice.refresh_from_db()
+        self.assertEqual(invoice.status, "D")
+
+    def test_one_line_makes_it_completed(self):
+        invoice = self.create_invoice("DRV-1", [self.line()])
+        self.assertEqual(invoice.status, "C")
+        self.assertEqual(invoice.display_status, "C")
+
+    def test_removing_the_last_line_returns_it_to_draft(self):
+        invoice = self.create_invoice("DRV-2", [self.line()])
+        response = self.update_invoice(invoice, [])
+        self.assertEqual(response.status_code, 200, response.content)
+        invoice.refresh_from_db()
+        self.assertEqual(invoice.status, "D")
+
+    def test_a_balance_past_the_due_date_reads_as_overdue(self):
+        invoice = self.create_invoice("DRV-3", [self.line(1000)],
+                                      due="2020-01-01")
+        self.assertEqual(invoice.display_status, "O")
+        # Derived on read only: the column still holds the stored value.
+        invoice.refresh_from_db()
+        self.assertEqual(invoice.status, "C")
+
+    def test_overdue_is_never_written_to_the_column(self):
+        invoice = self.create_invoice("DRV-4", [self.line(1000)],
+                                      due="2020-01-01")
+        invoice.recalculate_status()
+        invoice.refresh_from_db()
+        self.assertEqual(invoice.status, "C")
+
+    def test_cancelled_is_sticky_through_an_item_change(self):
+        """The one manual status. Nothing derived may recalculate it away."""
+        invoice = self.create_invoice("DRV-5", [self.line()])
+        self.client.post(f"/sales-invoices/{invoice.pk}/cancel/")
+        invoice.refresh_from_db()
+        self.assertEqual(invoice.status, "X")
+
+        SalesInvoiceItem.objects.create(
+            business=self.business, sales_invoice=invoice,
+            product=self.variant, quantity=1, unit_price=500,
+        )
+        invoice.refresh_from_db()
+        self.assertEqual(invoice.status, "X")
+        self.assertEqual(invoice.display_status, "X")
+
+    # --- the Bug #001 regression -----------------------------------------
+
+    def test_adding_a_line_on_update_keeps_the_invoice_completed(self):
+        """The reported bug, end to end.
+
+        The update path creates items without `quantity_received`, which the
+        old update_restock_flags() read - so the new line was flagged
+        partially deducted forever, and that flag was written back onto the
+        invoice as its status.
+        """
+        self.stock(100)
+        invoice = self.create_invoice("DRV-6", [self.line(100, 2)])
+
+        response = self.update_invoice(
+            invoice,
+            self.existing_lines(invoice) + [{"id": 0, **self.line(300, 5)}],
+        )
+        self.assertEqual(response.status_code, 200, response.content)
+
+        invoice.refresh_from_db()
+        self.assertEqual(invoice.status, "C")
+        self.assertEqual(invoice.invoice_items.count(), 2)
+        self.assertTrue(
+            all(item.is_deducted for item in invoice.invoice_items.all()))
+
+        # And it stays Completed on a second update. The old flag never
+        # recovered, so the invoice could not be corrected back.
+        response = self.update_invoice(invoice, self.existing_lines(invoice))
+        self.assertEqual(response.status_code, 200, response.content)
+        invoice.refresh_from_db()
+        self.assertEqual(invoice.status, "C")
+
+    def test_a_line_added_on_update_leaves_stock(self):
+        """The invoice-level is_deducted flag stays True once an invoice has
+        been deducted, so guarding on it would mean a line added later never
+        left stock.
+        """
+        stock = self.stock(100)
+        invoice = self.create_invoice("DRV-7", [self.line(100, 2)])
+        stock.refresh_from_db()
+        self.assertEqual(stock.quantity, 98)
+
+        self.update_invoice(
+            invoice,
+            self.existing_lines(invoice) + [{"id": 0, **self.line(300, 5)}],
+        )
+        stock.refresh_from_db()
+        self.assertEqual(stock.quantity, 93)
+        self.assertEqual(self.deduction_count(invoice), 2)
+
+    # --- deduction and restocking ----------------------------------------
+
+    def test_completing_deducts_exactly_once(self):
+        stock = self.stock(100)
+        invoice = self.create_invoice("DRV-8", [self.line(100, 4)])
+        stock.refresh_from_db()
+        self.assertEqual(stock.quantity, 96)
+        self.assertEqual(self.deduction_count(invoice), 1)
+
+        # A second run must not move stock again.
+        updateInventoryOnSale(invoice)
+        stock.refresh_from_db()
+        self.assertEqual(stock.quantity, 96)
+        self.assertEqual(self.deduction_count(invoice), 1)
+
+    def test_cancelling_returns_the_stock(self):
+        stock = self.stock(100)
+        invoice = self.create_invoice("DRV-9", [self.line(100, 4)])
+
+        response = self.client.post(f"/sales-invoices/{invoice.pk}/cancel/")
+        self.assertEqual(response.status_code, 200, response.content)
+
+        stock.refresh_from_db()
+        self.assertEqual(stock.quantity, 100)
+        self.assertEqual(self.deduction_count(invoice), 0)
+        invoice.refresh_from_db()
+        self.assertFalse(invoice.is_deducted)
+
+    def test_uncancelling_deducts_again_exactly_once(self):
+        stock = self.stock(100)
+        invoice = self.create_invoice("DRV-10", [self.line(100, 4)])
+        self.client.post(f"/sales-invoices/{invoice.pk}/cancel/")
+
+        response = self.client.post(f"/sales-invoices/{invoice.pk}/uncancel/")
+        self.assertEqual(response.status_code, 200, response.content)
+
+        stock.refresh_from_db()
+        self.assertEqual(stock.quantity, 96)
+        self.assertEqual(self.deduction_count(invoice), 1)
+        invoice.refresh_from_db()
+        self.assertEqual(invoice.status, "C")
+
+    def test_a_cancelled_invoice_never_deducts(self):
+        stock = self.stock(100)
+        invoice = SalesInvoice.objects.create(
+            business=self.business, customer=self.customer,
+            created_by=self.user, invoice_number="DRV-11", status="X",
+        )
+        SalesInvoiceItem.objects.create(
+            business=self.business, sales_invoice=invoice,
+            product=self.variant, quantity=3, unit_price=100,
+        )
+        updateInventoryOnSale(invoice)
+
+        stock.refresh_from_db()
+        self.assertEqual(stock.quantity, 100)
+        self.assertEqual(self.deduction_count(invoice), 0)
+
+    def test_a_flagged_line_with_an_empty_ledger_is_left_alone(self):
+        """How the migrated invoices are stored: is_deducted True with no
+        deduction rows, precisely so that importing them moved no stock.
+        Deducting on the delta alone would empty the shelves the first time
+        one of them was edited.
+        """
+        stock = self.stock(100)
+        invoice = SalesInvoice.objects.create(
+            business=self.business, customer=self.customer,
+            created_by=self.user, invoice_number="DRV-12",
+        )
+        item = SalesInvoiceItem.objects.create(
+            business=self.business, sales_invoice=invoice,
+            product=self.variant, quantity=9, unit_price=100,
+        )
+        SalesInvoiceItem.objects.filter(pk=item.pk).update(is_deducted=True)
+        invoice.refresh_from_db()
+
+        updateInventoryOnSale(invoice)
+
+        stock.refresh_from_db()
+        self.assertEqual(stock.quantity, 100)
+        self.assertEqual(self.deduction_count(invoice), 0)
+
+    # --- the list filter --------------------------------------------------
+
+    def test_the_status_filter_separates_completed_from_overdue(self):
+        """They share the stored value 'C', so an exact column match would
+        return overdue invoices under Completed.
+        """
+        completed = self.create_invoice("DRV-13", [self.line(100)])
+        overdue = self.create_invoice("DRV-14", [self.line(100)],
+                                      due="2020-01-01")
+
+        def ids(status_code):
+            response = self.client.get(f"/sales-invoices/?status={status_code}")
+            self.assertEqual(response.status_code, 200, response.content)
+            body = response.json()
+            rows = body["results"] if isinstance(body, dict) else body
+            return {row["id"] for row in rows}
+
+        self.assertIn(overdue.id, ids("O"))
+        self.assertNotIn(completed.id, ids("O"))
+        self.assertIn(completed.id, ids("C"))
+        self.assertNotIn(overdue.id, ids("C"))
+        self.assertEqual(ids("C") & ids("O"), set())
+
+    def test_the_serializer_reports_the_derived_status(self):
+        invoice = self.create_invoice("DRV-15", [self.line(1000)],
+                                      due="2020-01-01")
+        response = self.client.get(f"/sales-invoices/{invoice.pk}/")
+        self.assertEqual(response.status_code, 200, response.content)
+        self.assertEqual(response.json()["status"], "O")
+
+    def test_a_client_cannot_set_the_status(self):
+        """It is derived, so the field is gone from every writable serializer
+        and a sent value is ignored rather than honoured.
+        """
+        response = self.client.post(
+            "/sales-invoices/create-with-items/",
+            {
+                "invoice_number": "DRV-16",
+                "customer": str(self.customer.id),
+                "date_issued": "2026-05-10",
+                "date_due": FAR_FUTURE,
+                "discount": {"value": 0, "type": "amount"},
+                "tax": {"value": 0, "type": "percentage"},
+                "status": "X",
+                "project": None,
+                "items": [self.line(100)],
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, 201, response.content)
+        invoice = SalesInvoice.objects.get(
+            business=self.business, invoice_number="DRV-16")
+        self.assertEqual(invoice.status, "C")

@@ -193,31 +193,107 @@ def reserveSalesInvoiceItem(item):
     pass
 
 def updateInventoryOnSale(instance: SalesInvoice):
-    if instance.is_deducted: return
+    """
+    Move the sold goods out of stock.
 
-    if instance.status in ('C', 'PC'):
+    Gated on the invoice being COMPLETED, which is now derived from it having
+    lines rather than chosen by hand - so completing an invoice deducts, and
+    nothing else does. It used to run for 'C' or 'PC', and 'PC' was itself
+    written by the deduction code, which made the rule circular.
 
-        if instance.status == 'C' and not instance.is_deducted:
-            quantity_field = getRestockField(False)
-        else:
-            quantity_field = getRestockField(True)
+    A cancelled invoice never deducts; restockOnCancel below puts back
+    anything it already had.
 
-        invoice_items_dict = instance.items_by_product()
-        product_ids = set(invoice_items_dict)
-        existing, _, new_ids = spiltNewAndOldProducts(product_ids, instance.business.id)
+    Guarded per line, not per invoice. A line added to an invoice that is
+    already deducted leaves the invoice flag True, so an early return on it
+    would mean the new line never left stock - Bug #001 again, one level up.
+    """
+    if instance.status in instance.CANCELLED_STATUSES:
+        return
+    if instance.stored_status != 'C':
+        return
 
-        for inventory_item in existing:
-            # See the same loop in signals.py: one product can be on several
-            # lines, and every line's quantity has to leave stock.
-            for item in invoice_items_dict[inventory_item.product_id]:
-                delta = item.compute_restock_delta()
-                if delta > 0:
-                    inventory_item.apply_restock_delta(True, delta, generateTransactionId(instance))
-                    logRestockEvent(item, delta, instance)
-                    item.update_restock_flags()
+    invoice_items_dict = instance.items_by_product()
+    if not invoice_items_dict:
+        return
 
-        instance.update_deduction_flags()
-        instance.save()
+    # The old `quantity_field = getRestockField(...)` branch stood here. It was
+    # the only thing that read the 'C' / 'PC' distinction, and nothing ever
+    # read the value it computed - the delta always came from
+    # compute_restock_delta(). Removed with the status overload.
+    product_ids = set(invoice_items_dict)
+    existing, _, new_ids = spiltNewAndOldProducts(product_ids, instance.business.id)
+
+    for inventory_item in existing:
+        # One product can be on several lines at different prices, and every
+        # line's quantity has to leave stock.
+        for item in invoice_items_dict[inventory_item.product_id]:
+            # The flag, not the delta. Most migrated lines carry is_deducted
+            # with an empty deduction ledger - deliberately, so importing them
+            # moved no stock - and for those the delta is the full quantity.
+            # Trusting the delta alone would deduct every one of them the
+            # first time its invoice was edited.
+            if item.is_deducted:
+                continue
+            delta = item.compute_restock_delta()
+            if delta > 0:
+                inventory_item.apply_restock_delta(True, delta, generateTransactionId(instance))
+                logRestockEvent(item, delta, instance)
+                item.update_restock_flags()
+
+    instance.update_deduction_flags()
+    # Narrowed from a bare save(): this instance may predate adjust_totals, so
+    # writing every column could put a stale total back.
+    instance.save(update_fields=['is_deducted'])
+
+
+def restockOnCancel(instance: SalesInvoice):
+    """
+    Cancelling an invoice returns its goods to stock.
+
+    The deduction rows are deleted rather than offset with a counter-entry,
+    because compute_restock_delta() measures what is left to deduct as
+    quantity minus the logged deductions. Clearing them makes the line look
+    undeducted again, so un-cancelling deducts it exactly once more and stock
+    cannot drift either way.
+
+    Nothing to undo for an invoice that never deducted - in particular the
+    migrated invoices, which carry is_deducted with an empty ledger precisely
+    so that their stock is never touched.
+    """
+    items_by_product = instance.items_by_product()
+    if not items_by_product:
+        return
+
+    stock_rows = InventoryItem.objects.filter(
+        business_id=instance.business_id,
+        product_id__in=set(items_by_product),
+    )
+
+    for inventory_item in stock_rows:
+        returned = 0
+        for item in items_by_product[inventory_item.product_id]:
+            deducted = item.restocks.aggregate(
+                total=Sum('quantity'))['total'] or 0
+            if not deducted:
+                continue
+            returned += deducted
+            item.restocks.all().delete()
+            item.is_deducted = False
+            item.save(update_fields=['is_deducted'])
+
+        if returned:
+            # Added directly rather than through apply_restock_delta(False, ...),
+            # which also overwrites unit_cost - a cancellation says nothing
+            # about what the stock cost.
+            inventory_item.quantity += returned
+            inventory_item.quantity_on_hand += returned
+            inventory_item.last_transaction = generateTransactionId(instance)
+            inventory_item.save(update_fields=[
+                'quantity', 'quantity_on_hand', 'last_transaction'])
+
+    instance.is_deducted = False
+    instance.save(update_fields=['is_deducted'])
 
 
 def build_whatsapp_payload(invoice):

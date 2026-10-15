@@ -12,6 +12,7 @@ So the filter now asks the same property the table prints, after one khaata
 pass per party (accounts.settlement.attach_settlement). The filter and the
 column cannot disagree, because they are the same code.
 """
+from django.utils import timezone
 from django_filters import rest_framework as filters
 
 from .models import PurchaseInvoice, SalesInvoice
@@ -68,13 +69,49 @@ class SalesInvoiceFilter(filters.FilterSet):
     date_due_to = filters.DateFilter(
         field_name='date_due', lookup_expr='lte')
 
+    # Overdue is derived on read, so the column only ever holds D, C or X and
+    # an exact match on it would never return an overdue invoice - and would
+    # wrongly include them under Completed.
+    status = filters.ChoiceFilter(
+        choices=SalesInvoice.SALES_INVOICE_STATUS_CHOICES,
+        method='filter_status')
+
     class Meta:
         model = SalesInvoice
         # The columns that were filterable before, unchanged.
         fields = [
-            'customer__name', 'status', 'sub_total', 'total',
-            'is_deducted', 'is_partially_deducted',
+            'customer__name', 'sub_total', 'total',
+            'is_deducted',
         ]
+
+    def filter_status(self, queryset, name, value):
+        """
+        Draft and Cancelled are plain column matches. Completed and Overdue
+        share the stored value 'C' and are told apart by what is still owed,
+        so they are separated here.
+
+        Narrowed in SQL first: only an invoice past its due date can be
+        overdue, so the Python pass runs over a handful of rows rather than
+        the whole table - unlike filter_by_payment_status, which has to load
+        everything.
+        """
+        if value in ('D',) + tuple(SalesInvoice.CANCELLED_STATUSES):
+            return queryset.filter(status=value)
+        if value not in ('C', 'O'):
+            return queryset
+
+        from accounts.settlement import attach_settlement
+        candidates = list(
+            queryset.filter(status='C', date_due__lt=timezone.localdate())
+            .prefetch_related('payment_receipts__transaction_record',
+                              'invoice_items')
+        )
+        attach_settlement(candidates)
+        overdue = [invoice.id for invoice in candidates if invoice.is_overdue]
+
+        if value == 'O':
+            return queryset.filter(id__in=overdue)
+        return queryset.filter(status='C').exclude(id__in=overdue)
 
     def filter_payment_status(self, queryset, name, value):
         return filter_by_payment_status(queryset, value)
