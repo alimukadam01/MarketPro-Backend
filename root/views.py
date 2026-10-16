@@ -652,6 +652,20 @@ class ExpenseViewSet(ModelViewSet):
             'business_id': business.id
         }
 
+    # An invoice's extra-charge expenses belong to the invoice, which rebuilds
+    # them from its charges and payments; deleting one here would only last
+    # until the invoice was next touched.
+    CHARGE_EXPENSE_REFUSAL = {
+        'detail': 'One or more of these expenses is an extra charge on a sales '
+                  'invoice. Change or remove the charge on the invoice instead.'
+    }
+
+    def destroy(self, request, *args, **kwargs):
+        if self.get_object().is_invoice_charge:
+            return Response(self.CHARGE_EXPENSE_REFUSAL,
+                            status=status.HTTP_400_BAD_REQUEST)
+        return super().destroy(request, *args, **kwargs)
+
     @action(['POST'], detail=False, url_path='bulk-delete', url_name='bulk-delete')
     def bulk_delete(self, request):
 
@@ -660,6 +674,11 @@ class ExpenseViewSet(ModelViewSet):
             return Response({
                 'detail': 'Bad Request.'
             }, status=status.HTTP_400_BAD_REQUEST)
+
+        if Expense.objects.filter(
+                id__in=expense_ids, sales_invoice__isnull=False).exists():
+            return Response(self.CHARGE_EXPENSE_REFUSAL,
+                            status=status.HTTP_400_BAD_REQUEST)
 
         try:
             Expense.objects.filter(id__in=expense_ids).delete()

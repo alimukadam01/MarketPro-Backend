@@ -14,8 +14,8 @@ from rest_framework.test import APIClient
 
 from core.admin_masking import MASK
 from root.models import (
-    WALK_IN_CUSTOMER_NAME, Business, City, Customer, Product,
-    ProductVariant, Supplier, Unit,
+    WALK_IN_CUSTOMER_NAME, Business, BusinessConfig, City, Customer, Expense,
+    Product, ProductVariant, Supplier, Unit,
 )
 
 from inventory.models import Inventory, InventoryItem
@@ -23,9 +23,13 @@ from .models import (
     InvoiceImage, PurchaseInvoice, PurchaseInvoiceItem, SalesInvoice,
     SalesInvoiceItem, SalesInvoiceItemDeduction,
 )
+from accounts.models import MoneyAccount
 from accounts.utils import party_invoiced, profit_estimate
 from .models import SalesReceipt
-from .utils import build_whatsapp_payload, invoice_room, updateInventoryOnSale
+from .utils import (
+    build_whatsapp_payload, invoice_room, sync_charge_expenses,
+    updateInventoryOnSale,
+)
 
 User = get_user_model()
 
@@ -785,13 +789,13 @@ class DerivedSalesInvoiceStatusTests(TestCase):
 
 
 class SalesInvoiceExtraChargesTests(TestCase):
-    """Named charges added after tax, and out of revenue but not out of the bill.
+    """Named charges added after tax, and part of every figure.
 
     A shop bills PKR 500 for delivery on top of PKR 1000 of paint. The
-    customer owes 1500 and the ledger says so, but only 1000 of it was a sale:
-    the delivery fee is collected alongside the goods, not earned on them, and
-    there is no cost of goods behind it. So `total` carries the charge and
-    GOODS_TOTAL - revenue, profit and the dashboard sales figure - does not.
+    customer owes 1500, the ledger says so, and revenue, the dashboard and
+    profit all count 1500. The delivery fee then leaves again as an
+    "invoice_extra_charge" expense once the invoice is paid (see
+    SalesInvoiceChargeExpenseTests), which is what nets it out of profit.
     """
 
     @classmethod
@@ -896,22 +900,23 @@ class SalesInvoiceExtraChargesTests(TestCase):
 
     # --- what the charge is and is not part of ----------------------------
 
-    def test_revenue_excludes_the_charge_but_the_bill_includes_it(self):
-        """The whole decision, in one test."""
+    def test_the_charge_is_in_revenue_and_in_the_bill(self):
+        """Charges are no longer subtracted from any figure. Each is expensed
+        instead, which would count it out twice if they still were."""
         invoice = self.post("CHG-6", [{"label": "Delivery", "amount": 500}])
 
         self.assertEqual(invoice.total, 1500)
         self.assertEqual(
             SalesInvoice.objects.revenue(
                 self.business.id, date(2026, 5, 1), date(2026, 5, 31)),
-            1000,
+            1500,
         )
         self.assertEqual(
-            SalesInvoice.objects.total_sales(self.business.id), 1000)
+            SalesInvoice.objects.total_sales(self.business.id), 1500)
         self.assertEqual(
             profit_estimate(self.business.id,
                             date(2026, 5, 1), date(2026, 5, 31))['revenue'],
-            1000,
+            1500,
         )
         # The customer genuinely owes the delivery fee, so everything that
         # answers "what is owed" counts it.
@@ -932,17 +937,15 @@ class SalesInvoiceExtraChargesTests(TestCase):
         self.assertEqual(invoice.payment_status, "P")
 
     def test_the_average_order_value_keeps_the_charge(self):
-        """Unlike revenue: this is the average bill a customer was handed, and
-        the delivery fee was on it."""
+        """The average bill a customer was handed, delivery fee and all."""
         self.post("CHG-8", [{"label": "Delivery", "amount": 500}])
         self.assertEqual(
             SalesInvoice.objects.average_order_value(self.business.id), 1500)
 
-    def test_the_monthly_trend_excludes_the_charge(self):
-        """monthly_trend is given an expression rather than a field name."""
+    def test_the_monthly_trend_includes_the_charge(self):
         self.post("CHG-9", [{"label": "Delivery", "amount": 500}])
         trend = SalesInvoice.objects.monthly_sales_trend(self.business.id)
-        self.assertEqual(sum(day["value"] for day in trend), 1000)
+        self.assertEqual(sum(day["value"] for day in trend), 1500)
 
     def test_a_cancelled_charged_invoice_is_in_no_figure_at_all(self):
         invoice = self.post("CHG-10", [{"label": "Delivery", "amount": 500}])
@@ -954,9 +957,7 @@ class SalesInvoiceExtraChargesTests(TestCase):
         )
 
     def test_an_invoice_with_no_charges_column_set_still_aggregates(self):
-        """GOODS_TOTAL subtracts a column, so a row that predates it must not
-        drop out of the sum. The migration defaults it to 0.0 rather than NULL
-        for exactly this reason."""
+        """A row whose charges are NULL still counts at its total."""
         invoice = self.post("CHG-11", [])
         SalesInvoice.objects.filter(pk=invoice.pk).update(extra_charges=None)
         self.assertEqual(
@@ -1364,3 +1365,332 @@ class PaymentImageTests(TestCase):
         self.assertEqual(response.status_code, 201, response.content)
         self.assertEqual(
             SalesReceipt.objects.get(sales_invoice=self.invoice).amount, 1500)
+
+
+class SalesInvoiceChargeExpenseTests(TestCase):
+    """Each extra charge on a sales invoice is paid out again as an expense.
+
+    One "invoice_extra_charge" expense per charge, dated on the invoice, out
+    of the account the customer's payment came into: cash before bank before
+    a mobile wallet. Nothing until there is a payment, nothing for a draft or
+    a cancelled invoice. The invoice owns these expenses, so they cannot be
+    edited or deleted on their own.
+    """
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.user = User.objects.create_user(
+            email="charge-expenses@example.com", password="pw-for-tests"
+        )
+        City.objects.create(name="Hyderabad", postal_code="71000")
+        cls.business = Business.objects.create(
+            name="Expensed Paints", owner=cls.user,
+            phone="03001234567", is_active=True,
+        )
+        BusinessConfig.objects.create(business=cls.business, accounting=True)
+        cls.customer = Customer.objects.get(
+            business=cls.business, name=WALK_IN_CUSTOMER_NAME
+        )
+        cls.unit = Unit.objects.create(name="Drums", abv="Drm")
+        cls.product = Product.objects.create(
+            business=cls.business, name="Primer 20L", unit=cls.unit
+        )
+        cls.variant = ProductVariant.objects.create(
+            base=cls.product, name="grey", sku="EXP-1"
+        )
+        # The business is created with its cash account.
+        cls.cash = MoneyAccount.objects.get_default_account(cls.business.id)
+        cls.bank = MoneyAccount.objects.create(
+            business=cls.business, name="Meezan", type="bank")
+        cls.wallet = MoneyAccount.objects.create(
+            business=cls.business, name="JazzCash", type="wallet")
+
+    def setUp(self):
+        self.client = APIClient()
+        self.client.force_authenticate(self.user)
+
+    # --- helpers ---------------------------------------------------------
+
+    def create(self, number, charges, items=True):
+        response = self.client.post(
+            "/sales-invoices/create-with-items/",
+            {
+                "invoice_number": number,
+                "customer": str(self.customer.id),
+                "date_issued": "2026-05-10",
+                "date_due": FAR_FUTURE,
+                "discount": {"value": 0, "type": "amount"},
+                "tax": {"value": 0, "type": "percentage"},
+                "extra_charges": charges,
+                "project": None,
+                "items": [{"product_id": self.variant.id, "quantity": 1,
+                           "unit_price": 1000}] if items else [],
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, 201, response.content)
+        return SalesInvoice.objects.get(
+            business=self.business, invoice_number=number)
+
+    def pay(self, invoice, account, amount=100, **extra):
+        response = self.client.post(
+            f"/sales-invoices/{invoice.pk}/payments/",
+            {"amount": amount, "account": account.id,
+             "payment_method": extra.pop("payment_method", "cash"),
+             "date": "2026-05-12", **extra},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 201, response.content)
+        return SalesReceipt.objects.filter(sales_invoice=invoice).latest("id")
+
+    def charge_expenses(self, invoice):
+        return list(
+            Expense.objects.filter(sales_invoice=invoice)
+            .select_related("transaction_record").order_by("id"))
+
+    def account_of(self, invoice):
+        accounts = {e.transaction_record.account_id
+                    for e in self.charge_expenses(invoice)}
+        self.assertEqual(len(accounts), 1, accounts)
+        return accounts.pop()
+
+    DELIVERY = [{"label": "Delivery", "amount": 500},
+                {"label": "Labour", "amount": 200}]
+
+    # --- when they exist ---------------------------------------------------
+
+    def test_no_payment_means_no_expense(self):
+        """A credit sale: no account to pay the charges out of yet."""
+        invoice = self.create("EXP-1", self.DELIVERY)
+        self.assertEqual(self.charge_expenses(invoice), [])
+
+    def test_a_payment_records_one_expense_per_charge(self):
+        invoice = self.create("EXP-2", self.DELIVERY)
+        self.pay(invoice, self.cash)
+
+        expenses = self.charge_expenses(invoice)
+        self.assertEqual([(e.name, e.amount) for e in expenses],
+                         [("Delivery", 500), ("Labour", 200)])
+        for expense in expenses:
+            self.assertEqual(expense.category, Expense.INVOICE_CHARGE_CATEGORY)
+            self.assertEqual(expense.business_id, self.business.id)
+            txn = expense.transaction_record
+            self.assertEqual(txn.type, "expense")
+            self.assertEqual(txn.account_id, self.cash.id)
+            self.assertEqual(txn.payment_method, "cash")
+            # The invoice's date, not the payment's (the 12th).
+            self.assertEqual(txn.date, date(2026, 5, 10))
+
+    def test_a_draft_records_none(self):
+        """No lines is not a sale yet, even with charges and a payment.
+
+        The API takes no payment for a draft - it has no total - so the
+        payment is planted directly. The state is still reachable: a paid
+        invoice whose lines are all removed (see the next test).
+        """
+        invoice = self.create("EXP-3", self.DELIVERY, items=False)
+        self.assertEqual(invoice.status, "D")
+        SalesReceipt.objects.create(sales_invoice=invoice, amount=100)
+        self.assertEqual(self.charge_expenses(invoice), [])
+
+    def test_removing_the_last_line_removes_them(self):
+        invoice = self.create("EXP-4", self.DELIVERY)
+        self.pay(invoice, self.cash)
+        self.assertEqual(len(self.charge_expenses(invoice)), 2)
+
+        invoice.invoice_items.all().delete()
+        self.assertEqual(self.charge_expenses(invoice), [])
+
+    def test_cancelling_removes_them_and_reinstating_brings_them_back(self):
+        invoice = self.create("EXP-5", self.DELIVERY)
+        self.pay(invoice, self.cash)
+
+        self.client.post(f"/sales-invoices/{invoice.pk}/cancel/")
+        self.assertEqual(self.charge_expenses(invoice), [])
+
+        self.client.post(f"/sales-invoices/{invoice.pk}/uncancel/")
+        self.assertEqual(len(self.charge_expenses(invoice)), 2)
+
+    # --- which account -----------------------------------------------------
+
+    def test_cash_wins_over_bank(self):
+        invoice = self.create("EXP-6", self.DELIVERY)
+        self.pay(invoice, self.bank, payment_method="bank_transfer")
+        self.assertEqual(self.account_of(invoice), self.bank.id)
+
+        self.pay(invoice, self.cash)
+        self.assertEqual(self.account_of(invoice), self.cash.id)
+
+    def test_bank_wins_over_a_wallet(self):
+        invoice = self.create("EXP-7", self.DELIVERY)
+        self.pay(invoice, self.wallet, payment_method="wallet")
+        self.pay(invoice, self.bank, payment_method="bank_transfer")
+        self.assertEqual(self.account_of(invoice), self.bank.id)
+
+        expense = self.charge_expenses(invoice)[0]
+        self.assertEqual(expense.transaction_record.payment_method,
+                         "bank_transfer")
+
+    def test_a_wallet_on_its_own_is_used(self):
+        invoice = self.create("EXP-8", self.DELIVERY)
+        self.pay(invoice, self.wallet, payment_method="wallet")
+        self.assertEqual(self.account_of(invoice), self.wallet.id)
+
+    def test_of_two_cash_accounts_the_one_paid_more_wins(self):
+        drawer = MoneyAccount.objects.create(
+            business=self.business, name="Drawer 2", type="cash")
+        invoice = self.create("EXP-9", self.DELIVERY)
+        self.pay(invoice, self.cash, amount=100)
+        self.pay(invoice, drawer, amount=600)
+        self.assertEqual(self.account_of(invoice), drawer.id)
+
+    def test_deleting_the_deciding_payment_moves_them(self):
+        invoice = self.create("EXP-10", self.DELIVERY)
+        self.pay(invoice, self.bank, payment_method="bank_transfer")
+        cash_receipt = self.pay(invoice, self.cash)
+        self.assertEqual(self.account_of(invoice), self.cash.id)
+
+        cash_receipt.delete()
+        self.assertEqual(self.account_of(invoice), self.bank.id)
+
+    def test_deleting_the_only_payment_removes_them(self):
+        invoice = self.create("EXP-11", self.DELIVERY)
+        receipt = self.pay(invoice, self.cash)
+        receipt.delete()
+        self.assertEqual(self.charge_expenses(invoice), [])
+
+    def test_a_bounced_cheque_does_not_decide_the_account(self):
+        """A bounced cheque never brought money into its account."""
+        invoice = self.create("EXP-12", self.DELIVERY)
+        receipt = self.pay(
+            invoice, self.bank, payment_method="cheque",
+            cheque_number="001234", cheque_due_date="2026-06-01")
+        # A pending cheque still names the account the money is going to.
+        self.assertEqual(self.account_of(invoice), self.bank.id)
+
+        txn = receipt.transaction_record
+        txn.status = "B"
+        txn.save(update_fields=["status"])
+        self.assertEqual(self.charge_expenses(invoice), [])
+
+    # --- keeping in step -----------------------------------------------------
+
+    def test_changing_the_charges_replaces_the_expenses(self):
+        invoice = self.create("EXP-13", self.DELIVERY)
+        self.pay(invoice, self.cash)
+
+        line = invoice.invoice_items.get()
+        response = self.client.post(
+            f"/sales-invoices/{invoice.pk}/update-with-items/",
+            {
+                "invoice_number": "EXP-13",
+                "customer": str(self.customer.id),
+                "date_issued": "2026-05-15",
+                "date_due": FAR_FUTURE,
+                "discount": {"value": 0, "type": "amount"},
+                "tax": {"value": 0, "type": "percentage"},
+                "extra_charges": [{"label": "Delivery", "amount": 650}],
+                "project": None,
+                "items": [{"id": line.id, "product_id": self.variant.id,
+                           "quantity": 1, "unit_price": 1000}],
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, 200, response.content)
+
+        expenses = self.charge_expenses(invoice)
+        self.assertEqual([(e.name, e.amount) for e in expenses],
+                         [("Delivery", 650)])
+        # And they follow the invoice to its new date.
+        self.assertEqual(expenses[0].transaction_record.date, date(2026, 5, 15))
+
+    def test_syncing_again_changes_nothing(self):
+        invoice = self.create("EXP-14", self.DELIVERY)
+        self.pay(invoice, self.cash)
+        before = [e.id for e in self.charge_expenses(invoice)]
+
+        sync_charge_expenses(invoice)
+        self.assertEqual([e.id for e in self.charge_expenses(invoice)], before)
+
+    def test_deleting_the_invoice_takes_them_with_it(self):
+        """Its lines and payments are deleted first, and their receivers must
+        not recreate expenses pointing at the invoice on the way out."""
+        invoice = self.create("EXP-15", self.DELIVERY)
+        self.pay(invoice, self.cash)
+        expense_ids = [e.id for e in self.charge_expenses(invoice)]
+
+        response = self.client.delete(f"/sales-invoices/{invoice.pk}/")
+        self.assertIn(response.status_code, (200, 204), response.content)
+        self.assertFalse(Expense.objects.filter(id__in=expense_ids).exists())
+        self.assertFalse(Expense.objects.filter(
+            category=Expense.INVOICE_CHARGE_CATEGORY,
+            business=self.business, sales_invoice__isnull=True).exists())
+
+    # --- the figures -------------------------------------------------------
+
+    def test_a_paid_charge_nets_to_nothing_in_profit(self):
+        """Revenue counts the charge and the expense takes it back out."""
+        with_charge = self.create("EXP-16", [{"label": "Delivery", "amount": 500}])
+        self.pay(with_charge, self.cash)
+
+        figures = profit_estimate(
+            self.business.id, date(2026, 5, 1), date(2026, 5, 31))
+        self.assertEqual(figures["revenue"], 1500)
+        self.assertEqual(figures["expenses"], 500)
+        self.assertEqual(
+            figures["profit"],
+            1000 - figures["cost_of_goods_sold"],
+        )
+
+    def test_the_expense_leaves_the_account(self):
+        invoice = self.create("EXP-17", [{"label": "Delivery", "amount": 500}])
+        before = self.cash.balance()
+        self.pay(invoice, self.cash, amount=1500)
+        # 1500 in from the customer, 500 out to the rider.
+        self.assertEqual(self.cash.balance() - before, 1000)
+
+    # --- owned by the invoice ---------------------------------------------
+
+    def test_it_cannot_be_edited_or_deleted_from_the_expenses_screen(self):
+        invoice = self.create("EXP-18", [{"label": "Delivery", "amount": 500}])
+        self.pay(invoice, self.cash)
+        expense = self.charge_expenses(invoice)[0]
+
+        response = self.client.put(
+            f"/expenses/{expense.id}/",
+            {"name": "Changed", "amount": 1, "category": "transport"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 400, response.content)
+
+        response = self.client.delete(f"/expenses/{expense.id}/")
+        self.assertEqual(response.status_code, 400, response.content)
+
+        response = self.client.post(
+            "/expenses/bulk-delete/", {"expense_ids": [expense.id]},
+            format="json")
+        self.assertEqual(response.status_code, 400, response.content)
+        self.assertTrue(Expense.objects.filter(id=expense.id).exists())
+
+    def test_it_cannot_be_deleted_from_the_transactions_screen(self):
+        invoice = self.create("EXP-19", [{"label": "Delivery", "amount": 500}])
+        self.pay(invoice, self.cash)
+        txn = self.charge_expenses(invoice)[0].transaction_record
+
+        response = self.client.delete(f"/transactions/{txn.id}/")
+        self.assertEqual(response.status_code, 400, response.content)
+
+        response = self.client.post(
+            "/transactions/bulk-delete/", {"transaction_ids": [txn.id]},
+            format="json")
+        self.assertEqual(response.status_code, 400, response.content)
+        self.assertEqual(len(self.charge_expenses(invoice)), 1)
+
+    def test_the_category_cannot_be_picked_by_hand(self):
+        response = self.client.post(
+            "/expenses/",
+            {"name": "Rider", "amount": 300,
+             "category": Expense.INVOICE_CHARGE_CATEGORY},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 400, response.content)

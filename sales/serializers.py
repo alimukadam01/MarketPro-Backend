@@ -20,6 +20,7 @@ from .utils import (
     checkPurchaseInvoiceCreateFields,
     checkSalesInvoiceItemCreateFields,
     invoice_room,
+    sync_charge_expenses,
     updateInventoryOnSale
 )
 
@@ -865,11 +866,15 @@ class SalesInvoiceCreateSerializer(ExtraChargesValidationMixin,
         super().validate(attrs)
 
     def save(self, **kwargs):
-        return SalesInvoice.objects.create(
+        invoice = SalesInvoice.objects.create(
             business_id=self.context['business_id'],
             created_by_id=self.context['user_id'],
             **self.validated_data
         )
+        # A bare invoice has no lines, so it is a draft and this records no
+        # expense; called anyway so no write path is the one that forgot.
+        sync_charge_expenses(invoice)
+        return invoice
 
 
 class SalesInvoiceUpdateSerializer(ExtraChargesValidationMixin,
@@ -889,6 +894,8 @@ class SalesInvoiceUpdateSerializer(ExtraChargesValidationMixin,
             setattr(self.instance, attr, value)
 
         self.instance.save()
+        # The charges or the invoice date may have changed.
+        sync_charge_expenses(self.instance)
         return self.instance
 
 
@@ -1008,6 +1015,10 @@ class SalesInvoiceAndItemsCreateSerializer(ExtraChargesValidationMixin,
             # updateInventoryOnSale only deducts for a COMPLETED invoice.
             sales_invoice.recalculate_status()
             updateInventoryOnSale(sales_invoice)
+            # Usually a no-op here: with no payment yet there is no account to
+            # pay the charges out of. The payment signal syncs again once one
+            # arrives.
+            sync_charge_expenses(sales_invoice)
 
             # Money received at the time of sale becomes a payment record;
             # the accounts signal mirrors it into a transaction and
@@ -1120,6 +1131,8 @@ class SalesInvoiceAndItemsUpdateSerializer(ExtraChargesValidationMixin,
                 # removed ones deleted, and the status is derived from them.
                 self.instance.recalculate_status()
                 updateInventoryOnSale(self.instance)
+                # After the status: a draft or cancelled invoice records none.
+                sync_charge_expenses(self.instance)
 
                 # Handle Projects Addition/Updation/Deletion Logic
                 if not project_id:

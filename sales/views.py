@@ -19,7 +19,7 @@ from accounts.settlement import attach_settlement
 from accounts.utils import month_bounds, payables
 from .filters import PurchaseInvoiceFilter, SalesInvoiceFilter
 from .models import InvoiceImage, PurchaseInvoice, PurchaseInvoiceItem, PurchaseQuotation, PurchaseQuotationItem, PurchaseReceipt, ReturnedItem, SalesInvoice, SalesInvoiceItem, SalesReceipt
-from .utils import build_whatsapp_payload, invoice_room, restockOnCancel, updateInventoryOnSale
+from .utils import build_whatsapp_payload, invoice_room, restockOnCancel, sync_charge_expenses, updateInventoryOnSale
 from .serializers import (
     PaymentReceiptSerializer,
     PurchaseInvoiceAndItemsCreateSerializer,
@@ -677,6 +677,8 @@ class SalesInvoiceViewSet(SettledInvoiceViewMixin, ModelViewSet):
                 restockOnCancel(invoice)
                 invoice.status = 'X'
                 SalesInvoice.objects.filter(pk=invoice.pk).update(status='X')
+                # A cancelled sale paid out no charges: their expenses go too.
+                sync_charge_expenses(invoice)
 
             invoice.refresh_from_db()
             return Response(SalesInvoiceSerializer(invoice).data,
@@ -711,6 +713,8 @@ class SalesInvoiceViewSet(SettledInvoiceViewMixin, ModelViewSet):
                 SalesInvoice.objects.filter(pk=invoice.pk).update(status='D')
                 invoice.recalculate_status()
                 updateInventoryOnSale(invoice)
+                # And the charge expenses come back, if it has been paid.
+                sync_charge_expenses(invoice)
 
             invoice.refresh_from_db()
             return Response(SalesInvoiceSerializer(invoice).data,

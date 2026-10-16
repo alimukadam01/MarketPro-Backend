@@ -11,7 +11,8 @@ from rest_framework.viewsets import GenericViewSet, ModelViewSet
 
 from root.models import Customer, Expense, Supplier
 from root.utils import get_active_business, whatsapp_number
-from sales.models import PurchaseReceipt, SalesReceipt
+from sales.models import PurchaseReceipt, SalesInvoice, SalesReceipt
+from sales.utils import sync_charge_expenses
 from .models import MoneyAccount, PartyOpeningBalance, Transaction
 from .payments import (
     record_party_payment, resolve_party,
@@ -348,6 +349,28 @@ class TransactionViewSet(ModelViewSet):
         )
 
     @staticmethod
+    def _charge_expense_refusal(transactions):
+        """
+        A 400 if any of these is an invoice's extra-charge expense, else None.
+
+        Those belong to the invoice, which rebuilds them from its charges and
+        payments. Deleting one here would leave the invoice charging the
+        customer for something the books no longer pay out - until the next
+        edit quietly put it back.
+        """
+        for txn in transactions:
+            expense = txn.expense if txn.expense_id else None
+            if expense is not None and expense.sales_invoice_id:
+                invoice = expense.sales_invoice
+                reference = invoice.invoice_number or invoice.id
+                return Response(
+                    {'detail': f'This is an extra charge on sales invoice '
+                               f'{reference}. Change or remove the charge on '
+                               f'the invoice instead.'},
+                    status=status.HTTP_400_BAD_REQUEST)
+        return None
+
+    @staticmethod
     def _delete_with_sources(transactions):
         """
         Deleting a source-backed transaction deletes the record that owns it.
@@ -378,6 +401,10 @@ class TransactionViewSet(ModelViewSet):
             instance = self.get_object()
             members = self._with_payment_group(
                 [instance], instance.business_id)
+
+            refusal = self._charge_expense_refusal(members)
+            if refusal:
+                return refusal
 
             with db_transaction.atomic():
                 self._delete_with_sources(members)
@@ -465,10 +492,18 @@ class TransactionViewSet(ModelViewSet):
 
             with db_transaction.atomic():
                 if instance.payment_group:
-                    updated = Transaction.objects.filter(
+                    group = Transaction.objects.filter(
                         payment_group=instance.payment_group,
                         business_id=business.id,
-                    ).update(status=new_status)
+                    )
+                    updated = group.update(status=new_status)
+                    # A bounce can change which account an invoice's extra
+                    # charges leave from. The single-transaction branch below
+                    # resyncs through its save signal; a queryset update sends
+                    # none, so the group's invoices are resynced here.
+                    for invoice in SalesInvoice.objects.filter(
+                            payment_receipts__transaction_record__in=group).distinct():
+                        sync_charge_expenses(invoice)
                 else:
                     instance.status = new_status
                     instance.save(update_fields=['status'])
@@ -509,6 +544,10 @@ class TransactionViewSet(ModelViewSet):
 
             # Selecting one leg of an allocated payment removes all of it.
             transactions = self._with_payment_group(selected, business.id)
+
+            refusal = self._charge_expense_refusal(transactions)
+            if refusal:
+                return refusal
 
             plain, receipts, purchases, expenses = [], [], [], []
             for txn in transactions:

@@ -5,7 +5,8 @@ from root.utils import generateTransactionId
 from .models import PurchaseInvoice, PurchaseInvoiceItem, SalesInvoice, SalesInvoiceItem, ReturnedItem
 from .utils import (
     getRestockField, update_inventory, spiltNewAndOldProducts, 
-    logRestockEvent, createInventoryItemFromRestock
+    logRestockEvent, createInventoryItemFromRestock,
+    deleting_with_invoice, sync_charge_expenses,
 )
 
 
@@ -20,6 +21,11 @@ def updateTotalsAfterSalesInvoiceItem(sender, instance, **kwargs):
         # item signal: recalculate_status writes with a queryset update, which
         # fires nothing, so it cannot re-enter adjust_totals above.
         instance.sales_invoice.recalculate_status()
+        # Draft and Completed differ in whether the charges are expensed, so a
+        # first or a last line changes them too. Not while the whole invoice
+        # is being deleted - see deleting_with_invoice.
+        if not deleting_with_invoice(kwargs.get('origin')):
+            sync_charge_expenses(instance.sales_invoice)
 
 
 ### automatically update inventory on purchase

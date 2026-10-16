@@ -440,3 +440,165 @@ def apply_money_details(source, money_details):
     transaction_record.save(update_fields=list(money_details.keys()))
 
     return transaction_record
+
+
+# ── Extra charges as expenses ─────────────────────────────────────────────────
+#
+# Every extra charge on a sales invoice is money the shop pays out again - the
+# rider, the labourer - so each one is mirrored as an Expense in the
+# "invoice_extra_charge" category, and through the Expense mirror as an
+# expense Transaction. The customer pays the charge as part of the invoice
+# total, which counts in revenue; the expense takes it back out, so a charge
+# nets to nothing in profit.
+#
+# The expense goes out of the account the customer's payment came into. Until
+# there is a payment there is no account to choose, so there is no expense.
+
+# Which account wins when an invoice was paid into several: cash first, then
+# bank, then a mobile wallet.
+CHARGE_ACCOUNT_PRIORITY = ['cash', 'bank', 'wallet']
+
+# The payment method a transaction on each kind of account carries.
+ACCOUNT_PAYMENT_METHOD = {
+    'cash': 'cash',
+    'bank': 'bank_transfer',
+    'wallet': 'wallet',
+}
+
+
+def deleting_with_invoice(origin):
+    """
+    True when a delete began at a sales invoice (or its whole business), so
+    the line or payment being deleted is going with it.
+
+    Django deletes an invoice's lines and payments before the invoice row, and
+    their post_delete receivers would otherwise resync the invoice: making
+    expenses that point at a row about to disappear, which PostgreSQL refuses.
+    `origin` is what Django passes post_delete: the instance or queryset whose
+    delete() started it all.
+    """
+    from root.models import Business
+
+    if origin is None:
+        return False
+    model = origin.model if isinstance(origin, QuerySet) else type(origin)
+    return model in (SalesInvoice, Business)
+
+
+def charge_account(invoice):
+    """
+    The account an invoice's extra charges are paid out of, or None if no
+    payment has come in yet.
+
+    Of the accounts the invoice's own payments went into, the first type in
+    CHARGE_ACCOUNT_PRIORITY wins. Two accounts of that type: the one that took
+    more of the money, then the one paid into first.
+
+    A bounced cheque never brought money into its account, so it is ignored. A
+    pending cheque counts: it names the account the money is going to.
+    Settlement from the khaata (credit notes, money on account) moves no money
+    into any account, so it never decides this.
+    """
+    received = {}   # account id -> [account, total received, first receipt id]
+    receipts = invoice.payment_receipts.select_related('transaction_record__account')
+    for receipt in receipts:
+        txn = getattr(receipt, 'transaction_record', None)
+        if txn is None or txn.account_id is None or txn.status == 'B':
+            continue
+        entry = received.setdefault(txn.account_id, [txn.account, 0, receipt.id])
+        entry[1] += txn.amount or 0
+        entry[2] = min(entry[2], receipt.id)
+
+    for account_type in CHARGE_ACCOUNT_PRIORITY:
+        candidates = [e for e in received.values() if e[0].type == account_type]
+        if candidates:
+            candidates.sort(key=lambda e: (-e[1], e[2]))
+            return candidates[0][0]
+    return None
+
+
+def sync_charge_expenses(invoice):
+    """
+    Make an invoice's charge expenses match its extra charges, now.
+
+    Idempotent, so every write that could change the answer calls it rather
+    than working out what changed: the charges, the lines (Draft has none), a
+    cancellation, a payment arriving or going, a cheque bouncing. When nothing
+    differs it writes nothing.
+
+    One expense per charge, dated on the invoice - the day the delivery or the
+    labour happened - and on the account charge_account() picks. None at all
+    for a draft or a cancelled invoice, or while nothing has been paid.
+
+    When anything differs the old expenses are deleted and new ones made,
+    rather than patched one by one: a charge has no identity of its own to
+    match an expense against, only a position in a JSON list.
+    """
+    # Function-level imports: accounts and root both sit above sales.
+    from root.models import Expense
+
+    invoice = SalesInvoice.objects.filter(pk=invoice.pk).first()
+    if invoice is None:
+        return
+
+    desired = []
+    account = None
+    if (invoice.status not in invoice.CANCELLED_STATUSES
+            and invoice.status not in invoice.DRAFT_STATUSES
+            and invoice.extra_charges):
+        account = charge_account(invoice)
+        if account is not None:
+            for charge in invoice.extra_charges:
+                try:
+                    label = str(charge.get('label') or '').strip()
+                    amount = round(float(charge.get('amount') or 0), 2)
+                except (AttributeError, TypeError, ValueError):
+                    continue
+                if label and amount > 0:
+                    desired.append((label, amount))
+
+    date = local_date(invoice.date_issued or invoice.created_at)
+    method = ACCOUNT_PAYMENT_METHOD.get(account.type) if account else None
+
+    existing = list(
+        Expense.objects.filter(sales_invoice=invoice)
+        .select_related('transaction_record').order_by('id'))
+
+    def unchanged():
+        if len(existing) != len(desired):
+            return False
+        for expense, (label, amount) in zip(existing, desired):
+            txn = getattr(expense, 'transaction_record', None)
+            if (expense.name != label
+                    or round(expense.amount or 0, 2) != amount
+                    or txn is None
+                    or txn.account_id != account.id
+                    or txn.date != date
+                    or txn.payment_method != method):
+                return False
+        return True
+
+    if unchanged():
+        return
+
+    with transaction.atomic():
+        for expense in existing:
+            expense.delete()   # its transaction goes with it (CASCADE)
+
+        reference = invoice.invoice_number or invoice.id
+        for label, amount in desired:
+            expense = Expense.objects.create(
+                business_id=invoice.business_id,
+                sales_invoice=invoice,
+                name=label,
+                category=Expense.INVOICE_CHARGE_CATEGORY,
+                amount=amount,
+                desc=f"Extra charge on sales invoice {reference}",
+            )
+            # The Expense mirror has just made the transaction on the default
+            # account, dated today; point it at the right account and day.
+            apply_money_details(expense, {
+                'account_id': account.id,
+                'date': date,
+                'payment_method': method,
+            })

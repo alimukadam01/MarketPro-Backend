@@ -7,8 +7,8 @@ from inventory.models import InventoryItem
 from root.models import Customer, Expense, Supplier
 from root.utils import local_date
 from sales.models import (
-    GOODS_TOTAL, PurchaseInvoice, PurchaseReceipt, SalesInvoice,
-    SalesInvoiceItem, SalesReceipt
+    PurchaseInvoice, PurchaseReceipt, SalesInvoice, SalesInvoiceItem,
+    SalesReceipt
 )
 from .models import MoneyAccount, PartyOpeningBalance, PartyPayment, Transaction
 from .settlement import settle_parties, settle_party
@@ -775,14 +775,10 @@ def profit_estimate(business_id, date_from, date_to):
     Revenue less cost of goods sold less expenses. An estimate only — it is
     exactly as accurate as the data entered (§6.11).
 
-    Revenue is net of extra charges (sales.models.GOODS_TOTAL): a delivery or
-    labour charge is collected alongside the sale rather than earned on it, and
-    there is no cost of goods behind it to set against it.
-
-    Worth knowing when reading this figure: the charge is out, but a cost
-    entered for it - a rider paid through an Expense - is still in. For a
-    charge billed at cost that is right, and for one carrying margin it
-    understates profit by the margin.
+    Extra charges are in revenue, because `total` carries them, and each one
+    is also recorded as an "invoice_extra_charge" expense (sync_charge_expenses
+    in sales/utils.py), which the expense total below picks up. The two cancel,
+    so a charge nets to nothing in profit.
     """
     revenue = (
         SalesInvoice.objects
@@ -790,7 +786,7 @@ def profit_estimate(business_id, date_from, date_to):
                 date_issued__date__gte=date_from,
                 date_issued__date__lte=date_to)
         .exclude(status__in=CANCELLED_SALES_STATUSES)
-        .aggregate(total=Sum(GOODS_TOTAL))['total'] or 0
+        .aggregate(total=Sum('total'))['total'] or 0
     )
 
     cost_map = {

@@ -2,8 +2,7 @@ from calendar import monthrange
 from datetime import datetime
 from typing import Dict, List
 from django.db import models
-from django.db.models import Avg, Sum, F, Q, Value
-from django.db.models.functions import Coalesce
+from django.db.models import Avg, Sum, F, Q
 from django.core.exceptions import ValidationError
 from django.conf import settings
 from django.utils import timezone
@@ -119,20 +118,13 @@ class SettledInvoiceMixin:
         return 'PEN'
 
 
-# An invoice total with its extra charges taken back out.
-#
-# A delivery or labour charge is money collected alongside the sale, not sales
-# value, so it is excluded from revenue, from profit and from the dashboard
-# sales figure - while the customer is still invoiced for it and still owes it,
-# which is why the ledger, the party balance and payment_status all use `total`
-# unchanged.
-#
-# Coalesce guards the aggregate, not the column: extra_charges_total is
-# non-null with a default of 0.0, but an expression over a LEFT JOIN or a
-# values() on a related model can still hand it NULL, and one NULL would make
-# the whole subtraction NULL. `total` itself stays nullable, so an itemless
-# invoice drops out of a Sum exactly as it did before.
-GOODS_TOTAL = F('total') - Coalesce(F('extra_charges_total'), Value(0.0))
+# Extra charges are part of every sales figure: `total` carries them, and
+# revenue, the dashboard sales total, the monthly trend and profit all sum
+# `total`. They used to be subtracted again from all four. That stopped when
+# each charge started being recorded as an expense (sync_charge_expenses in
+# sales/utils.py): the charge counts as revenue, the expense takes it back
+# out, and profit nets them. Subtracting the charge as well would count it
+# out twice.
 
 
 class SalesInvoiceQuerySet(BaseQuerySet):
@@ -151,12 +143,10 @@ class SalesInvoiceManager(models.Manager):
         if num_days:
             queryset = queryset.in_period(num_days)
 
-        return queryset.aggregate(total=Sum(GOODS_TOTAL))["total"] or 0
+        return queryset.aggregate(total=Sum("total"))["total"] or 0
 
     def monthly_sales_trend(self, business_id):
-        # An expression rather than a field name: monthly_trend passes whatever
-        # it is given straight to Sum(), which takes either.
-        return self.get_queryset().monthly_trend(business_id, GOODS_TOTAL)
+        return self.get_queryset().monthly_trend(business_id, 'total')
 
     def recent_sales(self, business_id):
         queryset = self.get_queryset().for_business(
@@ -184,10 +174,6 @@ class SalesInvoiceManager(models.Manager):
         # value order and drags the average down, while an invoice that really
         # totals 0.0 still counts. Returns 0 for a business with no invoices,
         # matching total_sales above.
-        #
-        # Charges are deliberately left in, unlike total_sales and revenue:
-        # this is the average bill a customer was handed, and the delivery fee
-        # was on it.
         queryset = self.get_queryset().for_business(business_id)
 
         return int(queryset.aggregate(avg=Avg("total"))["avg"] or 0)
@@ -207,8 +193,7 @@ class SalesInvoiceManager(models.Manager):
         Cancelled invoices never count. Drafts do, which matches what
         party_invoiced, profit_estimate and the Sales page already show.
 
-        Net of extra charges - see GOODS_TOTAL. A sales target is a target for
-        selling things, and a delivery fee is not a thing sold.
+        Extra charges included: see the note above SalesInvoiceQuerySet.
         """
         return (
             self.get_queryset()
@@ -220,7 +205,7 @@ class SalesInvoiceManager(models.Manager):
                 created_by_id=created_by_id,
                 status=status,
             )
-            .aggregate(value=Sum(GOODS_TOTAL))['value'] or 0
+            .aggregate(value=Sum('total'))['value'] or 0
         )
 
     def invoice_count(self, business_id, date_from, date_to,
