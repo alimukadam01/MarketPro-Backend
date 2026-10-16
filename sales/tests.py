@@ -23,7 +23,8 @@ from .models import (
     InvoiceImage, PurchaseInvoice, PurchaseInvoiceItem, SalesInvoice,
     SalesInvoiceItem, SalesInvoiceItemDeduction,
 )
-from accounts.models import MoneyAccount
+from accounts.models import MoneyAccount, PartyPayment, Transaction
+from accounts.settlement import settle_party
 from accounts.utils import party_invoiced, profit_estimate
 from .models import SalesReceipt
 from .utils import (
@@ -1948,3 +1949,267 @@ class SalesLineQuantityIncreaseTests(TestCase):
         self.assertEqual(line.quantity, 5)
         self.stock.refresh_from_db()
         self.assertEqual(self.stock.quantity, 100)
+
+
+class AutomaticRefundTests(TestCase):
+    """An Update that leaves an invoice paid for more than it bills records a
+    refund of the excess.
+
+    Removing an item, raising the discount, dropping a charge - whatever
+    takes the billed amount under the cleared payments. The khaata already
+    reads the excess as an overpayment credit; the refund is the debt that
+    uses it up, so the party's balance comes back to zero. Deleting the
+    refund leaves the excess as credit, and a later Update does not put it
+    back, because only the overpayment an Update creates is refunded.
+    """
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.user = User.objects.create_user(
+            email="refunds@example.com", password="pw-for-tests"
+        )
+        City.objects.create(name="Sukkur", postal_code="65200")
+        cls.business = Business.objects.create(
+            name="Refunded Paints", owner=cls.user,
+            phone="03001234567", is_active=True,
+        )
+        BusinessConfig.objects.create(business=cls.business, accounting=True)
+        cls.customer = Customer.objects.get(
+            business=cls.business, name=WALK_IN_CUSTOMER_NAME
+        )
+        cls.supplier = Supplier.objects.create(
+            business=cls.business, name="Refund Supply Co"
+        )
+        cls.unit = Unit.objects.create(name="Packs", abv="Pk")
+        cls.product = Product.objects.create(
+            business=cls.business, name="Putty 5Kg", unit=cls.unit
+        )
+        cls.white = ProductVariant.objects.create(
+            base=cls.product, name="white", sku="REF-1")
+        cls.grey = ProductVariant.objects.create(
+            base=cls.product, name="grey", sku="REF-2")
+        cls.cash = MoneyAccount.objects.get_default_account(cls.business.id)
+        cls.bank = MoneyAccount.objects.create(
+            business=cls.business, name="HBL", type="bank")
+
+    def setUp(self):
+        self.client = APIClient()
+        self.client.force_authenticate(self.user)
+
+    # --- sales helpers -----------------------------------------------------
+
+    def sale_body(self, number, items, discount=0):
+        return {
+            "invoice_number": number,
+            "customer": str(self.customer.id),
+            "date_issued": "2026-05-10",
+            "date_due": FAR_FUTURE,
+            "discount": {"value": discount, "type": "amount"},
+            "tax": {"value": 0, "type": "percentage"},
+            "extra_charges": [],
+            "project": None,
+            "items": items,
+        }
+
+    def create_sale(self, number):
+        response = self.client.post(
+            "/sales-invoices/create-with-items/",
+            self.sale_body(number, [
+                {"product_id": self.white.id, "quantity": 1, "unit_price": 1000},
+                {"product_id": self.grey.id, "quantity": 1, "unit_price": 500},
+            ]),
+            format="json",
+        )
+        self.assertEqual(response.status_code, 201, response.content)
+        return SalesInvoice.objects.get(
+            business=self.business, invoice_number=number)
+
+    def pay_sale(self, invoice, amount, account=None, **extra):
+        response = self.client.post(
+            f"/sales-invoices/{invoice.pk}/payments/",
+            {"amount": amount, "account": (account or self.cash).id,
+             "payment_method": extra.pop("payment_method", "cash"),
+             "date": "2026-05-10", **extra},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 201, response.content)
+
+    def update_sale(self, invoice, keep_grey=True, discount=0):
+        lines = {line.product_id: line for line in invoice.invoice_items.all()}
+        items = [{"id": lines[self.white.id].id, "product_id": self.white.id,
+                  "quantity": 1, "unit_price": 1000}]
+        if keep_grey:
+            items.append({"id": lines[self.grey.id].id,
+                          "product_id": self.grey.id,
+                          "quantity": 1, "unit_price": 500})
+        response = self.client.post(
+            f"/sales-invoices/{invoice.pk}/update-with-items/",
+            self.sale_body(invoice.invoice_number, items, discount=discount),
+            format="json",
+        )
+        self.assertEqual(response.status_code, 200, response.content)
+
+    def refunds(self, **invoice):
+        return list(PartyPayment.objects.filter(**invoice)
+                    .select_related("transaction").order_by("id"))
+
+    # --- sales -------------------------------------------------------------
+
+    def test_removing_an_item_from_a_paid_invoice_refunds_the_excess(self):
+        invoice = self.create_sale("REF-1")
+        self.pay_sale(invoice, 1500)
+
+        self.update_sale(invoice, keep_grey=False)
+
+        refunds = self.refunds(sales_invoice=invoice)
+        self.assertEqual(len(refunds), 1)
+        txn = refunds[0].transaction
+        self.assertEqual(txn.type, "sales_return_refund")
+        self.assertEqual(txn.amount, 500)
+        self.assertEqual(txn.status, "C")
+        self.assertEqual(txn.account_id, self.cash.id)
+        self.assertEqual(refunds[0].customer_id, self.customer.id)
+        # Billed 1000, paid 1500, refunded 500: the khaata is square.
+        self.assertEqual(
+            settle_party(self.business.id, "customer", self.customer.id).balance, 0)
+
+    def test_raising_the_discount_also_refunds(self):
+        invoice = self.create_sale("REF-2")
+        self.pay_sale(invoice, 1500)
+        self.update_sale(invoice, discount=300)
+        refunds = self.refunds(sales_invoice=invoice)
+        self.assertEqual([r.transaction.amount for r in refunds], [300])
+
+    def test_an_unchanged_update_records_no_refund(self):
+        invoice = self.create_sale("REF-3")
+        self.pay_sale(invoice, 1500)
+        self.update_sale(invoice)
+        self.assertEqual(self.refunds(sales_invoice=invoice), [])
+
+    def test_only_the_new_excess_is_refunded(self):
+        """A second Update that changes nothing must not refund again."""
+        invoice = self.create_sale("REF-4")
+        self.pay_sale(invoice, 1500)
+        self.update_sale(invoice, keep_grey=False)
+        invoice.refresh_from_db()
+        self.update_sale(invoice, keep_grey=False)
+        self.assertEqual(len(self.refunds(sales_invoice=invoice)), 1)
+
+    def test_a_deleted_refund_stays_deleted_and_leaves_khaata_credit(self):
+        invoice = self.create_sale("REF-5")
+        self.pay_sale(invoice, 1500)
+        self.update_sale(invoice, keep_grey=False)
+        refund = self.refunds(sales_invoice=invoice)[0].transaction
+
+        response = self.client.post(
+            f"/sales-invoices/{invoice.pk}/delete-refund/",
+            {"transaction_id": refund.id}, format="json")
+        self.assertEqual(response.status_code, 200, response.content)
+        self.assertFalse(Transaction.objects.filter(id=refund.id).exists())
+        # The 500 is now the customer's money, held on the khaata.
+        self.assertEqual(
+            settle_party(self.business.id, "customer", self.customer.id).balance, -500)
+
+        invoice.refresh_from_db()
+        self.update_sale(invoice, keep_grey=False)
+        self.assertEqual(self.refunds(sales_invoice=invoice), [])
+
+    def test_a_pending_cheque_does_not_count_as_paid(self):
+        """The khaata counts only cleared money, and so does the refund."""
+        invoice = self.create_sale("REF-6")
+        self.pay_sale(invoice, 1000)
+        self.pay_sale(invoice, 500, account=self.bank,
+                      payment_method="cheque", cheque_number="77",
+                      cheque_due_date="2026-06-01")
+        self.update_sale(invoice, keep_grey=False)
+        self.assertEqual(self.refunds(sales_invoice=invoice), [])
+
+    def test_the_refund_goes_back_through_the_payments_account(self):
+        invoice = self.create_sale("REF-7")
+        self.pay_sale(invoice, 1500, account=self.bank,
+                      payment_method="bank_transfer")
+        self.update_sale(invoice, keep_grey=False)
+        txn = self.refunds(sales_invoice=invoice)[0].transaction
+        self.assertEqual(txn.account_id, self.bank.id)
+        self.assertEqual(txn.payment_method, "bank_transfer")
+
+    def test_the_settlement_lists_the_refunds_and_the_overpayment(self):
+        invoice = self.create_sale("REF-8")
+        self.pay_sale(invoice, 1500)
+        self.update_sale(invoice, keep_grey=False)
+
+        body = self.client.get(f"/sales-invoices/{invoice.pk}/settlement/").json()
+        self.assertEqual(body["overpaid"], 500)
+        self.assertEqual([r["amount"] for r in body["refunds"]], [500])
+        self.assertEqual(body["refunds"][0]["account"]["id"], self.cash.id)
+
+    def test_a_refund_from_another_invoice_cannot_be_deleted_here(self):
+        invoice = self.create_sale("REF-9")
+        self.pay_sale(invoice, 1500)
+        self.update_sale(invoice, keep_grey=False)
+        refund = self.refunds(sales_invoice=invoice)[0].transaction
+
+        other = self.create_sale("REF-10")
+        response = self.client.post(
+            f"/sales-invoices/{other.pk}/delete-refund/",
+            {"transaction_id": refund.id}, format="json")
+        self.assertEqual(response.status_code, 404, response.content)
+        self.assertTrue(Transaction.objects.filter(id=refund.id).exists())
+
+    # --- purchase ----------------------------------------------------------
+
+    def purchase_body(self, items):
+        # "O": billed (a draft bills nothing, so it could never be overpaid
+        # by an edit) without being received, which keeps restocking out of a
+        # test about money.
+        return {
+            "invoice_number": "PREF-1",
+            "supplier": self.supplier.id,
+            "date_issued": "2026-05-10T12:00:00",
+            "date_due": FAR_FUTURE,
+            "delivery": FAR_FUTURE,
+            "status": "O",
+            "notes": "",
+            "tax": {"value": 0, "type": "percentage"},
+            "project": None,
+            "items": items,
+        }
+
+    def test_removing_an_item_from_a_paid_purchase_refunds_from_the_supplier(self):
+        response = self.client.post(
+            "/purchase-invoices/create-with-items/",
+            self.purchase_body([
+                {"product_id": self.white.id, "quantity": 1, "unit_cost": 800},
+                {"product_id": self.grey.id, "quantity": 1, "unit_cost": 200},
+            ]),
+            format="json",
+        )
+        self.assertEqual(response.status_code, 201, response.content)
+        invoice = PurchaseInvoice.objects.get(
+            business=self.business, invoice_number="PREF-1")
+
+        response = self.client.post(
+            f"/purchase-invoices/{invoice.pk}/payments/",
+            {"amount": 1000, "account": self.cash.id,
+             "payment_method": "cash", "date": "2026-05-10"},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 201, response.content)
+
+        keep = invoice.invoice_items.get(product=self.white)
+        response = self.client.post(
+            f"/purchase-invoices/{invoice.pk}/update-with-items/",
+            self.purchase_body([{"id": keep.id, "product_id": self.white.id,
+                                 "quantity": 1, "unit_cost": 800}]),
+            format="json",
+        )
+        self.assertEqual(response.status_code, 200, response.content)
+
+        refunds = self.refunds(purchase_invoice=invoice)
+        self.assertEqual(len(refunds), 1)
+        txn = refunds[0].transaction
+        self.assertEqual(txn.type, "purchase_return_refund")
+        self.assertEqual(txn.amount, 200)
+        self.assertEqual(refunds[0].supplier_id, self.supplier.id)
+        self.assertEqual(
+            settle_party(self.business.id, "supplier", self.supplier.id).balance, 0)

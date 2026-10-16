@@ -20,6 +20,8 @@ from .utils import (
     checkPurchaseInvoiceCreateFields,
     checkSalesInvoiceItemCreateFields,
     invoice_room,
+    overpaid_by,
+    refund_new_overpayment,
     sync_charge_expenses,
     updateInventoryOnSale
 )
@@ -544,6 +546,9 @@ class PurchaseInvoiceAndItemsUpdateSerializer(serializers.ModelSerializer):
         items = self.validated_data.pop('items')
         project_id = self.validated_data.pop('project', None)
         project_id = int(project_id) if project_id else project_id
+        # Measured before anything changes, so only the overpayment this
+        # Update creates is refunded (refund_new_overpayment).
+        overpaid_before = overpaid_by(self.instance)
 
         try:
             with transaction.atomic():
@@ -597,6 +602,9 @@ class PurchaseInvoiceAndItemsUpdateSerializer(serializers.ModelSerializer):
 
             self.instance.adjust_totals()
             self.instance.refresh_from_db()
+            # Paid for more than it now bills: the supplier owes the excess.
+            refund_new_overpayment(
+                self.instance, overpaid_before, self.context.get('user_id'))
 
             # Handle Projects Addition/Updation/Deletion Logic
             if not project_id:
@@ -1068,6 +1076,9 @@ class SalesInvoiceAndItemsUpdateSerializer(ExtraChargesValidationMixin,
         items = self.validated_data.pop('items')
         project_id = self.validated_data.pop('project', None)
         project_id = int(project_id) if project_id else project_id
+        # Measured before anything changes, so only the overpayment this
+        # Update creates is refunded (refund_new_overpayment).
+        overpaid_before = overpaid_by(self.instance)
 
         try:
             with transaction.atomic():
@@ -1148,6 +1159,9 @@ class SalesInvoiceAndItemsUpdateSerializer(ExtraChargesValidationMixin,
                 updateInventoryOnSale(self.instance)
                 # After the status: a draft or cancelled invoice records none.
                 sync_charge_expenses(self.instance)
+                # Paid for more than it now bills: the excess goes back.
+                refund_new_overpayment(
+                    self.instance, overpaid_before, self.context.get('user_id'))
 
                 # Handle Projects Addition/Updation/Deletion Logic
                 if not project_id:

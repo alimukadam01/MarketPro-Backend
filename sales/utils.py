@@ -485,10 +485,12 @@ def deleting_with_invoice(origin):
     return model in (SalesInvoice, Business)
 
 
-def charge_account(invoice):
+def paid_into_account(invoice):
     """
-    The account an invoice's extra charges are paid out of, or None if no
-    payment has come in yet.
+    The account an invoice's own payments came into - which its extra charges
+    are paid out of, and an automatic refund goes back through - or None if
+    no payment has come in yet. Works for a sales or a purchase invoice: both
+    keep their receipts under payment_receipts.
 
     Of the accounts the invoice's own payments went into, the first type in
     CHARGE_ACCOUNT_PRIORITY wins. Two accounts of that type: the one that took
@@ -527,7 +529,7 @@ def sync_charge_expenses(invoice):
     differs it writes nothing.
 
     One expense per charge, dated on the invoice - the day the delivery or the
-    labour happened - and on the account charge_account() picks. None at all
+    labour happened - and on the account paid_into_account() picks. None at all
     for a draft or a cancelled invoice, or while nothing has been paid.
 
     When anything differs the old expenses are deleted and new ones made,
@@ -546,7 +548,7 @@ def sync_charge_expenses(invoice):
     if (invoice.status not in invoice.CANCELLED_STATUSES
             and invoice.status not in invoice.DRAFT_STATUSES
             and invoice.extra_charges):
-        account = charge_account(invoice)
+        account = paid_into_account(invoice)
         if account is not None:
             for charge in invoice.extra_charges:
                 try:
@@ -602,3 +604,89 @@ def sync_charge_expenses(invoice):
                 'date': date,
                 'payment_method': method,
             })
+
+
+# ── Automatic refunds ─────────────────────────────────────────────────────────
+#
+# An Update that brings an invoice's billed amount under what has been paid on
+# it - an item removed, the discount raised, a charge taken off - leaves the
+# party paid for more than they were billed. The khaata already reads the
+# excess as an "overpayment" credit; the system records a refund of it, which
+# the khaata reads as a debt that uses the credit up. If the user deletes the
+# refund, the excess simply stays on the khaata as credit.
+
+# Refund types per invoice kind: money back to a customer goes out; money
+# back from a supplier comes in.
+REFUND_TYPE = {'sales': 'sales_return_refund', 'purchase': 'purchase_return_refund'}
+
+
+def overpaid_by(invoice):
+    """
+    How much more has been paid on this invoice than it bills. Never negative.
+
+    Matches the khaata (accounts/settlement.py): only cleared payments count,
+    and a draft or cancelled invoice bills nothing, so everything paid on one
+    is excess. Reads the invoice's receipts through payment_receipts.all(), so
+    pass an instance fetched after the change - a prefetched one still holds
+    the receipts from before.
+    """
+    excluded = invoice.CANCELLED_STATUSES + invoice.DRAFT_STATUSES
+    billed = 0.0 if invoice.status in excluded else float(invoice.total or 0)
+    return max(float(invoice.receipts_paid or 0) - billed, 0.0)
+
+
+def refund_new_overpayment(invoice, before, user_id=None):
+    """
+    Refund the overpayment an Update has just created, if any. Returns the
+    refund Transaction, or None.
+
+    `before` is overpaid_by() taken before the Update. Only the increase is
+    refunded: an invoice already overpaid before this edit - because a refund
+    was deleted, say - is not refunded again for that, so deleting a refund
+    stays deleted.
+
+    Whole rupees, as every transaction is. Out of (or for a supplier, into)
+    the account the invoice's payments used, by the same rule as its extra
+    charges, falling back to the default account. Dated today: the day the
+    money goes back.
+    """
+    # Function-level imports: accounts sits above sales.
+    from accounts.models import MoneyAccount, PartyPayment, Transaction
+    from django.utils import timezone
+
+    is_sales = isinstance(invoice, SalesInvoice)
+    model = SalesInvoice if is_sales else PurchaseInvoice
+    invoice = model.objects.filter(pk=invoice.pk).first()
+    if invoice is None:
+        return None
+
+    excess = round(overpaid_by(invoice) - (before or 0))
+    if excess < 1:
+        return None
+
+    account = (paid_into_account(invoice)
+               or MoneyAccount.objects.get_default_account(invoice.business_id))
+    reference = invoice.invoice_number or invoice.id
+
+    with transaction.atomic():
+        refund = Transaction.objects.create(
+            business_id=invoice.business_id,
+            account=account,
+            type=REFUND_TYPE['sales' if is_sales else 'purchase'],
+            amount=excess,
+            date=timezone.localdate(),
+            payment_method=ACCOUNT_PAYMENT_METHOD.get(account.type, 'cash'),
+            status='C',
+            notes=(f"Refund of the overpayment on "
+                   f"{'sales' if is_sales else 'purchase'} invoice {reference}"),
+            created_by_id=user_id,
+        )
+        PartyPayment.objects.create(
+            business_id=invoice.business_id,
+            customer_id=invoice.customer_id if is_sales else None,
+            supplier_id=None if is_sales else invoice.supplier_id,
+            transaction=refund,
+            sales_invoice=invoice if is_sales else None,
+            purchase_invoice=None if is_sales else invoice,
+        )
+    return refund

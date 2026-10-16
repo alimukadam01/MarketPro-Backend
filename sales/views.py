@@ -14,12 +14,12 @@ from django_filters.rest_framework import DjangoFilterBackend
 from root.serializers import CaptureCustomerSerializer
 from root.utils import get_active_business
 from inventory.models import InventoryItem
-from accounts.models import Transaction
+from accounts.models import PartyPayment, Transaction
 from accounts.settlement import attach_settlement
 from accounts.utils import month_bounds, payables
 from .filters import PurchaseInvoiceFilter, SalesInvoiceFilter
 from .models import InvoiceImage, PurchaseInvoice, PurchaseInvoiceItem, PurchaseQuotation, PurchaseQuotationItem, PurchaseReceipt, ReturnedItem, SalesInvoice, SalesInvoiceItem, SalesReceipt
-from .utils import build_whatsapp_payload, invoice_room, restockOnCancel, sync_charge_expenses, updateInventoryOnSale
+from .utils import build_whatsapp_payload, invoice_room, overpaid_by, restockOnCancel, sync_charge_expenses, updateInventoryOnSale
 from .serializers import (
     PaymentReceiptSerializer,
     PurchaseInvoiceAndItemsCreateSerializer,
@@ -103,7 +103,79 @@ class SettledInvoiceViewMixin:
                 # still_owed while a pending cheque holds part of it.
                 'room': round(invoice_room(invoice)),
                 'settled_by': invoice._settlement.settled_by(invoice.id),
+                # Paid for more than it bills (the khaata's overpayment). The
+                # dialog works out from this whether an edit it is showing
+                # would create a refund, and how much.
+                'overpaid': round(overpaid_by(invoice), 2),
+                # What the saved invoice bills: its total, or 0 for a draft or
+                # a cancelled invoice. The refund preview compares the edited
+                # total against this, as refund_new_overpayment will.
+                'billed': round(
+                    0 if invoice.status in (invoice.CANCELLED_STATUSES
+                                            + invoice.DRAFT_STATUSES)
+                    else float(invoice.total or 0), 2),
+                'refunds': self._refunds(invoice),
             }, status=status.HTTP_200_OK)
+        except Exception as error:
+            print(error)
+            return Response({'detail': 'Internal Server Error.'},
+                            status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    @staticmethod
+    def _refund_rows(invoice):
+        """The automatic refunds recorded for this invoice."""
+        field = ('sales_invoice' if isinstance(invoice, SalesInvoice)
+                 else 'purchase_invoice')
+        return (PartyPayment.objects
+                .filter(**{field: invoice})
+                .select_related('transaction__account')
+                .order_by('transaction__date', 'transaction__id'))
+
+    def _refunds(self, invoice):
+        return [
+            {
+                'id': row.transaction_id,
+                'amount': row.transaction.amount,
+                'date': row.transaction.date,
+                'status': row.transaction.status,
+                'account': ({'id': row.transaction.account_id,
+                             'name': row.transaction.account.name,
+                             'type': row.transaction.account.type}
+                            if row.transaction.account_id else None),
+            }
+            for row in self._refund_rows(invoice)
+        ]
+
+    @action(['POST'], detail=True, url_path='delete-refund', url_name='delete-refund')
+    def delete_refund(self, request, pk=None):
+        """
+        Delete one of this invoice's automatic refunds.
+
+        The excess it paid back then stays with the party, as credit on their
+        khaata. Only a refund recorded for THIS invoice can be deleted here,
+        so an id from another invoice or business is a 404.
+        """
+        business = get_active_business(request)
+        if not business:
+            return Response(
+                {'detail': 'No active business exists. Please contact admin.'},
+                status=status.HTTP_400_BAD_REQUEST)
+
+        transaction_id = request.data.get('transaction_id')
+        if not transaction_id:
+            return Response({'detail': 'Bad Request.'},
+                            status=status.HTTP_400_BAD_REQUEST)
+        try:
+            invoice = self.get_object()
+            row = self._refund_rows(invoice).filter(
+                transaction_id=transaction_id).first()
+            if row is None:
+                return Response({'detail': 'Not Found.'},
+                                status=status.HTTP_404_NOT_FOUND)
+            # The transaction owns the PartyPayment (CASCADE), so this removes
+            # both.
+            row.transaction.delete()
+            return Response({'detail': 'Success.'}, status=status.HTTP_200_OK)
         except Exception as error:
             print(error)
             return Response({'detail': 'Internal Server Error.'},
