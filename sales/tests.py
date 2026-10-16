@@ -1808,3 +1808,143 @@ class PurchaseInvoiceTotalAfterUpdateTests(TestCase):
         self.assertEqual(response.status_code, 200, response.content)
         invoice.refresh_from_db()
         self.assertEqual(invoice.total, 25000)
+
+
+class SalesLineQuantityIncreaseTests(TestCase):
+    """Adding a product already on the invoice, at the same price, grows that
+    line - and the update now saves the larger quantity.
+
+    The page merges the new quantity into the existing line rather than
+    adding a second one. The update used to ignore quantity changes on saved
+    lines, so the extra was silently lost; with autosave refreshing the lines
+    after every save, it visibly jumped back.
+    """
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.user = User.objects.create_user(
+            email="grow-line@example.com", password="pw-for-tests"
+        )
+        City.objects.create(name="Peshawar", postal_code="25000")
+        cls.business = Business.objects.create(
+            name="Grown Paints", owner=cls.user,
+            phone="03001234567", is_active=True,
+        )
+        cls.customer = Customer.objects.get(
+            business=cls.business, name=WALK_IN_CUSTOMER_NAME
+        )
+        cls.unit = Unit.objects.create(name="Buckets", abv="Bkt")
+        cls.product = Product.objects.create(
+            business=cls.business, name="Distemper 10L", unit=cls.unit
+        )
+        cls.variant = ProductVariant.objects.create(
+            base=cls.product, name="sky", sku="GROW-1"
+        )
+
+    def setUp(self):
+        self.client = APIClient()
+        self.client.force_authenticate(self.user)
+        self.stock = InventoryItem.objects.create(
+            business=self.business,
+            inventory=Inventory.objects.get(business=self.business),
+            product=self.variant, quantity=100, quantity_on_hand=100,
+            unit_cost=50,
+        )
+
+    def body(self, number, items):
+        return {
+            "invoice_number": number,
+            "customer": str(self.customer.id),
+            "date_issued": "2026-05-10",
+            "date_due": FAR_FUTURE,
+            "discount": {"value": 0, "type": "amount"},
+            "tax": {"value": 0, "type": "percentage"},
+            "project": None,
+            "items": items,
+        }
+
+    def create(self, number, quantity):
+        response = self.client.post(
+            "/sales-invoices/create-with-items/",
+            self.body(number, [{"product_id": self.variant.id,
+                                "quantity": quantity, "unit_price": 100}]),
+            format="json",
+        )
+        self.assertEqual(response.status_code, 201, response.content)
+        return SalesInvoice.objects.get(
+            business=self.business, invoice_number=number)
+
+    def send(self, invoice, line, quantity):
+        return self.client.post(
+            f"/sales-invoices/{invoice.pk}/update-with-items/",
+            self.body(invoice.invoice_number,
+                      [{"id": line.id, "product_id": self.variant.id,
+                        "quantity": quantity, "unit_price": 100}]),
+            format="json",
+        )
+
+    def test_a_larger_quantity_is_saved_and_the_extra_leaves_stock(self):
+        invoice = self.create("GROW-1", 2)
+        self.stock.refresh_from_db()
+        self.assertEqual(self.stock.quantity, 98)
+
+        line = invoice.invoice_items.get()
+        response = self.send(invoice, line, 5)
+        self.assertEqual(response.status_code, 200, response.content)
+
+        line.refresh_from_db()
+        invoice.refresh_from_db()
+        self.assertEqual(line.quantity, 5)
+        self.assertEqual(invoice.total, 500)
+        # Only the three extra units left - not the whole five again.
+        self.stock.refresh_from_db()
+        self.assertEqual(self.stock.quantity, 95)
+        self.assertTrue(line.is_deducted)
+
+        # Saving the same figure again changes nothing.
+        self.send(invoice, line, 5)
+        self.stock.refresh_from_db()
+        self.assertEqual(self.stock.quantity, 95)
+
+    def test_returned_units_are_added_back_to_the_net_figure(self):
+        """The page sends a line's net quantity, after returns."""
+        invoice = self.create("GROW-2", 4)
+        line = invoice.invoice_items.get()
+        SalesInvoiceItem.objects.filter(pk=line.pk).update(returned_quantity=1)
+
+        # Net was 3; adding 2 more makes the page send 5.
+        response = self.send(invoice, line, 5)
+        self.assertEqual(response.status_code, 200, response.content)
+        line.refresh_from_db()
+        self.assertEqual(line.quantity, 6)
+        self.assertEqual(line.returned_quantity, 1)
+
+    def test_a_smaller_quantity_is_ignored(self):
+        """A smaller figure is a return or a stale page, not an edit."""
+        invoice = self.create("GROW-3", 4)
+        line = invoice.invoice_items.get()
+        response = self.send(invoice, line, 1)
+        self.assertEqual(response.status_code, 200, response.content)
+        line.refresh_from_db()
+        self.assertEqual(line.quantity, 4)
+        self.stock.refresh_from_db()
+        self.assertEqual(self.stock.quantity, 96)
+
+    def test_a_migrated_line_grows_without_moving_stock(self):
+        """Flagged deducted with an empty ledger, so its stock never moves."""
+        invoice = SalesInvoice.objects.create(
+            business=self.business, customer=self.customer,
+            created_by=self.user, invoice_number="GROW-4",
+        )
+        line = SalesInvoiceItem.objects.create(
+            business=self.business, sales_invoice=invoice,
+            product=self.variant, quantity=2, unit_price=100,
+        )
+        SalesInvoiceItem.objects.filter(pk=line.pk).update(is_deducted=True)
+
+        response = self.send(invoice, line, 5)
+        self.assertEqual(response.status_code, 200, response.content)
+        line.refresh_from_db()
+        self.assertEqual(line.quantity, 5)
+        self.stock.refresh_from_db()
+        self.assertEqual(self.stock.quantity, 100)

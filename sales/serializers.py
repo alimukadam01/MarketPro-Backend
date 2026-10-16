@@ -1087,16 +1087,26 @@ class SalesInvoiceAndItemsUpdateSerializer(ExtraChargesValidationMixin,
                 new_items = []
                 updated_items = []
 
-                for item in items:
-                    # this block essentially does nothing as invoice items
-                    # can't be updated on the frontend currently.
-                    # attr updation commented as functionality not on frontend yet.
+                # Lines whose quantity went up. Adding a product already on
+                # the invoice at the same price merges into that line on the
+                # page (addOrMergeInvoiceItem), so a saved line can grow - and
+                # this used to ignore it, silently losing the extra quantity.
+                grown = []
 
+                for item in items:
                     if item['id'] in existing_item_ids:
                         invoice_item = existing_items_map.get(item['id'])
-                        # invoice_item.product_id = item['product_id']
-                        # invoice_item.quantity = item['quantity']
-                        # invoice_item.unit_price = item['unit_price']
+                        # The page shows and sends a line's NET quantity, after
+                        # returns, so the returned units are added back to get
+                        # the line's own quantity. Only an increase is applied:
+                        # a smaller figure is a return, which has its own flow,
+                        # or a page that has not caught up with one. Product
+                        # and price are never changed here - a different price
+                        # is a different line.
+                        wanted = int(item['quantity']) + (invoice_item.returned_quantity or 0)
+                        if wanted > invoice_item.quantity:
+                            invoice_item.quantity = wanted
+                            grown.append(invoice_item)
                         updated_items.append(invoice_item)
                     else:
                         new_items.append(SalesInvoiceItem(
@@ -1110,13 +1120,18 @@ class SalesInvoiceAndItemsUpdateSerializer(ExtraChargesValidationMixin,
                 if new_items:
                     new_items = SalesInvoiceItem.objects.bulk_create(new_items)
 
-                # Items on the frontend can't be updated,
-                # They can either be created or deleted.
-
-                # if updated_items:
-                #     SalesInvoiceItem.objects.bulk_update(updated_items, [
-                #         'product', 'quantity', 'unit_price'
-                #     ])
+                if grown:
+                    SalesInvoiceItem.objects.bulk_update(grown, ['quantity'])
+                    for line in grown:
+                        # A line the system has already taken out of stock is
+                        # re-flagged from its ledger: with the quantity up it is
+                        # no longer fully deducted, so updateInventoryOnSale
+                        # below takes out exactly the extra units. A line with
+                        # an empty ledger is left alone - in particular the
+                        # migrated lines flagged deducted so they never move
+                        # stock, which a quantity change must not start doing.
+                        if line.restocks.exists():
+                            line.update_restock_flags()
 
                 updated_ids = [item.id for item in updated_items]
                 new_ids = [item.id for item in new_items]
