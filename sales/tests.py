@@ -1694,3 +1694,117 @@ class SalesInvoiceChargeExpenseTests(TestCase):
             format="json",
         )
         self.assertEqual(response.status_code, 400, response.content)
+
+
+class PurchaseInvoiceTotalAfterUpdateTests(TestCase):
+    """Updating a purchase invoice's lines updates the total it stores.
+
+    The viewset fetches invoices with their items prefetched, and
+    adjust_totals used to read those cached items - the list from before the
+    update. A line added on the update screen showed there (the page adds up
+    in the browser), but the stored total, which the list, the khaata and
+    payables read, stayed at the old figure.
+    """
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.user = User.objects.create_user(
+            email="purchase-totals@example.com", password="pw-for-tests"
+        )
+        cls.business = Business.objects.create(
+            name="Totalled Paints", owner=cls.user,
+            phone="03001234567", is_active=True,
+        )
+        cls.supplier = Supplier.objects.create(
+            business=cls.business, name="Totals Supply Co"
+        )
+        cls.unit = Unit.objects.create(name="Tins", abv="Tin")
+        cls.product = Product.objects.create(
+            business=cls.business, name="Thinner 1L", unit=cls.unit
+        )
+        cls.variant = ProductVariant.objects.create(
+            base=cls.product, name="clear", sku="TOT-1"
+        )
+        cls.other = ProductVariant.objects.create(
+            base=cls.product, name="strong", sku="TOT-2"
+        )
+
+    def setUp(self):
+        self.client = APIClient()
+        self.client.force_authenticate(self.user)
+
+    def payload(self, items, tax=18):
+        # A draft, so receiving the goods (and the stock logic that comes
+        # with it) stays out of a test about the total.
+        return {
+            "invoice_number": "PUR-TOT-1",
+            "supplier": self.supplier.id,
+            "date_issued": "2026-05-10T12:00:00",
+            "date_due": FAR_FUTURE,
+            "delivery": FAR_FUTURE,
+            "status": "D",
+            "notes": "",
+            "tax": {"value": tax, "type": "percentage"},
+            "project": None,
+            "items": items,
+        }
+
+    def test_adding_a_line_on_update_updates_the_stored_total(self):
+        response = self.client.post(
+            "/purchase-invoices/create-with-items/",
+            self.payload([{"product_id": self.variant.id, "quantity": 5,
+                           "unit_cost": 5000}]),
+            format="json",
+        )
+        self.assertEqual(response.status_code, 201, response.content)
+        invoice = PurchaseInvoice.objects.get(
+            business=self.business, invoice_number="PUR-TOT-1")
+        self.assertEqual(invoice.total, 25000 * 1.18)
+
+        line = invoice.invoice_items.get()
+        response = self.client.post(
+            f"/purchase-invoices/{invoice.pk}/update-with-items/",
+            self.payload([
+                {"id": line.id, "product_id": self.variant.id,
+                 "quantity": 5, "unit_cost": 5000},
+                {"id": None, "product_id": self.other.id,
+                 "quantity": 10, "unit_cost": 5000},
+            ]),
+            format="json",
+        )
+        self.assertEqual(response.status_code, 200, response.content)
+
+        invoice.refresh_from_db()
+        self.assertEqual(invoice.sub_total, 75000)
+        self.assertEqual(invoice.total, 75000 * 1.18)
+
+        # And the list - what the user was looking at - says the same.
+        listed = self.client.get("/purchase-invoices/").json()
+        rows = listed["results"] if isinstance(listed, dict) else listed
+        row = next(r for r in rows if r["id"] == invoice.id)
+        self.assertEqual(row["total"], 75000 * 1.18)
+
+    def test_removing_a_line_on_update_updates_the_stored_total(self):
+        response = self.client.post(
+            "/purchase-invoices/create-with-items/",
+            self.payload([
+                {"product_id": self.variant.id, "quantity": 5, "unit_cost": 5000},
+                {"product_id": self.other.id, "quantity": 10, "unit_cost": 5000},
+            ], tax=0),
+            format="json",
+        )
+        self.assertEqual(response.status_code, 201, response.content)
+        invoice = PurchaseInvoice.objects.get(
+            business=self.business, invoice_number="PUR-TOT-1")
+        self.assertEqual(invoice.total, 75000)
+
+        keep = invoice.invoice_items.get(product=self.variant)
+        response = self.client.post(
+            f"/purchase-invoices/{invoice.pk}/update-with-items/",
+            self.payload([{"id": keep.id, "product_id": self.variant.id,
+                           "quantity": 5, "unit_cost": 5000}], tax=0),
+            format="json",
+        )
+        self.assertEqual(response.status_code, 200, response.content)
+        invoice.refresh_from_db()
+        self.assertEqual(invoice.total, 25000)

@@ -759,8 +759,23 @@ class PurchaseInvoice(SettledInvoiceMixin, models.Model):
     def __str__(self):
         return f"{self.id}-{self.invoice_number}-{self.total}-{self.status}"
 
-    def adjust_totals(self):
-        items = self.invoice_items.all()
+    def computed_totals(self):
+        """
+        (sub_total, total) as the stored lines make them. Writes nothing.
+
+        Shared by adjust_totals and the recompute_purchase_totals command, so
+        a repair can never disagree with the figure a save would produce.
+
+        Read from the database, never from self.invoice_items.all(). The
+        viewset fetches invoices with prefetch_related('invoice_items'), so on
+        an instance from get_object() .all() returns the item list cached
+        before the update - and the total was being worked out from the old
+        items and saved, while the update page (which adds up in the browser)
+        showed the right figure. A total is a write; it has to see what is
+        actually stored. The sales twin already queries, through its
+        .exclude().
+        """
+        items = PurchaseInvoiceItem.objects.filter(purchase_invoice_id=self.pk)
         subtotal = sum(item.quantity * item.unit_cost for item in items)
 
         tax = 0
@@ -774,8 +789,10 @@ class PurchaseInvoice(SettledInvoiceMixin, models.Model):
             else:
                 raise Exception("incorrect value")
 
-        self.sub_total = subtotal
-        self.total = subtotal + tax
+        return subtotal, subtotal + tax
+
+    def adjust_totals(self):
+        self.sub_total, self.total = self.computed_totals()
         self.save(update_fields=["sub_total", "total"])
 
     def is_fulfilled(self):
