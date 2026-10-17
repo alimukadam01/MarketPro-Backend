@@ -18,6 +18,12 @@ from .utils import (
     checkPurchaseInvoiceCreateFields,
     checkSalesInvoiceItemCreateFields,
     invoice_room,
+    receive_into_stock,
+    restock_held,
+    restock_purchase,
+    RECEIVED_PURCHASE_STATUSES,
+    take_back_from_stock,
+    units_in_stock,
     updateInventoryOnSale
 )
 
@@ -379,79 +385,56 @@ class PurchaseInvoiceAndItemsUpdateSerializer(serializers.ModelSerializer):
     items = serializers.ListField()
     project = serializers.IntegerField(required=False, allow_null=True)
 
+    def validate_items(self, items):
+        # A product sits on a purchase invoice once (unique_together). Caught
+        # here as a 400 rather than at the database as a 500.
+        products = [item.get('product_id') for item in items]
+        if len(products) != len(set(products)):
+            raise serializers.ValidationError(
+                "A product can only be on a purchase invoice once - change the quantity on its line instead.")
+        return items
+
     def save(self, **kwargs):
         items = self.validated_data.pop('items')
         project_id = self.validated_data.pop('project', None)
         project_id = int(project_id) if project_id else project_id
 
         try:
+            # All of it in one transaction, totals included: a failure
+            # part-way used to keep the lines and lose the rest.
             with transaction.atomic():
-                for attr, value in self.validated_data.items():
-                    setattr(self.instance, attr, value)
+                # Stock moves line by line below; the invoice's own restock
+                # pass waits until the lines are final.
+                with restock_held(self.instance.pk):
+                    for attr, value in self.validated_data.items():
+                        setattr(self.instance, attr, value)
 
-                self.instance.save()
+                    self.instance.save()
+                    receiving = self.instance.status in RECEIVED_PURCHASE_STATUSES
+                    self._apply_lines(items, receiving)
+                    self.instance.adjust_totals()
 
-                existing_items = PurchaseInvoiceItem.objects.filter(
-                    purchase_invoice_id=self.instance.id
-                )
-                existing_items_map = {
-                    item.id: item for item in existing_items
-                }
-                existing_item_ids = set(
-                    existing_items.values_list('id', flat=True))
+                self.instance.refresh_from_db()
+                # A purchase marked received in this same update stocks its
+                # lines now. Ledger-driven, so the lines handled above are not
+                # stocked twice.
+                restock_purchase(self.instance)
 
-                new_items = []
-                updated_items = []
-
-                for item in items:
-                    if item['id'] in existing_item_ids:
-                        invoice_item = existing_items_map.get(item['id'])
-                        invoice_item.product_id = item['product_id']
-                        invoice_item.quantity = item['quantity']
-                        invoice_item.unit_cost = item['unit_cost']
-                        updated_items.append(invoice_item)
-                    else:
-                        new_items.append(PurchaseInvoiceItem(
-                            business_id=self.context['business_id'],
-                            purchase_invoice=self.instance,
-                            product_id=item['product_id'],
-                            quantity=item['quantity'],
-                            unit_cost=item['unit_cost']
-                        ))
-
-                if new_items:
-                    new_items = PurchaseInvoiceItem.objects.bulk_create(
-                        new_items)
-
-                if updated_items:
-                    PurchaseInvoiceItem.objects.bulk_update(updated_items, [
-                        'product', 'quantity', 'unit_cost'
-                    ])
-
-                updated_ids = [item.id for item in updated_items]
-                new_ids = [item.id for item in new_items]
-                existing_items = existing_items.exclude(
-                    id__in=updated_ids+new_ids)
-                existing_items.delete()
-
-            self.instance.adjust_totals()
-            self.instance.refresh_from_db()
-
-            # Handle Projects Addition/Updation/Deletion Logic
-            if not project_id:
-                print(
-                    "printing from ProjectPurchaseInvoice deletion block. Project ID is: ", project_id)
-                ProjectPurchaseInvoice.objects.filter(
-                    purchase_invoice=self.instance).delete()
-            else:
-                print(
-                    "printing from ProjectPurchaseInvoice creation block. Project ID is: ", project_id)
-                ProjectPurchaseInvoice.objects.filter(
-                    purchase_invoice=self.instance).delete()
-                ProjectPurchaseInvoice.objects.get_or_create(
-                    project_id=project_id,
-                    purchase_invoice=self.instance
-                )
+                # Handle Projects Addition/Updation/Deletion Logic
+                if not project_id:
+                    print(
+                        "printing from ProjectPurchaseInvoice deletion block. Project ID is: ", project_id)
+                    ProjectPurchaseInvoice.objects.filter(
+                        purchase_invoice=self.instance).delete()
+                else:
+                    print(
+                        "printing from ProjectPurchaseInvoice creation block. Project ID is: ", project_id)
+                    ProjectPurchaseInvoice.objects.filter(
+                        purchase_invoice=self.instance).delete()
+                    ProjectPurchaseInvoice.objects.get_or_create(
+                        project_id=project_id,
+                        purchase_invoice=self.instance
+                    )
 
             return self.instance
 
@@ -460,6 +443,69 @@ class PurchaseInvoiceAndItemsUpdateSerializer(serializers.ModelSerializer):
             # failed write into a misleading 400 at the view.
             print(error)
             raise
+
+    def _apply_lines(self, items, receiving):
+        """Bring the saved lines in line with the page's, moving stock as
+        they change. Stock only comes back out as far as a line's restock
+        ledger shows it went in."""
+        saved = {
+            line.id: line for line in PurchaseInvoiceItem.objects.filter(
+                purchase_invoice_id=self.instance.id)
+        }
+        sent = {item['id']: item for item in items if item.get('id') in saved}
+
+        # Lines taken off go first - stock and all - before anything is
+        # added: a product removed and added back (at a new price, say) is a
+        # new line, and would otherwise be on the invoice twice for a moment.
+        removed = [line for line_id, line in saved.items() if line_id not in sent]
+        for line in removed:
+            take_back_from_stock(line, units_in_stock(line))
+        if removed:
+            PurchaseInvoiceItem.objects.filter(
+                id__in=[line.id for line in removed]).delete()
+
+        kept = []
+        for line_id, item in sent.items():
+            line = saved[line_id]
+            was_product, was_quantity = line.product_id, line.quantity
+            line.product_id = item['product_id']
+            line.quantity = int(item['quantity'])
+            line.unit_cost = item['unit_cost']
+            kept.append((line, was_product, was_quantity))
+        if kept:
+            PurchaseInvoiceItem.objects.bulk_update(
+                [line for line, _, _ in kept], ['product', 'quantity', 'unit_cost'])
+
+        for line, was_product, was_quantity in kept:
+            in_stock = units_in_stock(line)
+            if line.product_id != was_product:
+                # Stocked as the old product: that comes out, and the new
+                # one goes in whole.
+                take_back_from_stock(line, in_stock, product_id=was_product)
+                if receiving:
+                    receive_into_stock(line, line.quantity, self.instance)
+            elif in_stock > line.quantity:
+                take_back_from_stock(line, in_stock - line.quantity)
+            elif receiving and line.quantity > was_quantity:
+                # A line with a ledger is topped up to its quantity. One
+                # without - received before the ledger existed - only gets
+                # the increase, since its old quantity is already in stock.
+                units = line.quantity - in_stock if in_stock else line.quantity - was_quantity
+                receive_into_stock(line, units, self.instance)
+
+        new_lines = PurchaseInvoiceItem.objects.bulk_create([
+            PurchaseInvoiceItem(
+                business_id=self.context['business_id'],
+                purchase_invoice=self.instance,
+                product_id=item['product_id'],
+                quantity=item['quantity'],
+                unit_cost=item['unit_cost'],
+            )
+            for item in items if item.get('id') not in saved
+        ])
+        if receiving:
+            for line in new_lines:
+                receive_into_stock(line, line.quantity, self.instance)
 
     class Meta:
         model = PurchaseInvoice
@@ -931,6 +977,13 @@ class SalesInvoiceAndItemsUpdateSerializer(serializers.ModelSerializer):
                             unit_price=item['unit_price']
                         ))
 
+                # Lines taken off go before new ones are created: a product
+                # removed and added back at the same price is a new line, and
+                # would otherwise be on the invoice twice for a moment
+                # (unique_together on product and price).
+                existing_items.exclude(
+                    id__in=[item.id for item in updated_items]).delete()
+
                 if new_items:
                     new_items = SalesInvoiceItem.objects.bulk_create(new_items)
 
@@ -946,12 +999,6 @@ class SalesInvoiceAndItemsUpdateSerializer(serializers.ModelSerializer):
                         # stock, which a quantity change must not start doing.
                         if line.restocks.exists():
                             line.update_restock_flags()
-
-                updated_ids = [item.id for item in updated_items]
-                new_ids = [item.id for item in new_items]
-                existing_items = existing_items.exclude(
-                    id__in=updated_ids+new_ids)
-                existing_items.delete()
 
                 self.instance.refresh_from_db()
                 self.instance.adjust_totals()

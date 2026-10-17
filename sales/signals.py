@@ -4,8 +4,7 @@ from django.dispatch import receiver
 from root.utils import generateTransactionId
 from .models import PurchaseInvoice, PurchaseInvoiceItem, SalesInvoice, SalesInvoiceItem, ReturnedItem
 from .utils import (
-    getRestockField, update_inventory, spiltNewAndOldProducts, 
-    logRestockEvent, createInventoryItemFromRestock
+    restock_purchase,
 )
 
 
@@ -25,35 +24,9 @@ def updateTotalsAfterSalesInvoiceItem(sender, instance, **kwargs):
 ### automatically update inventory on purchase
 @receiver(post_save, sender=PurchaseInvoice)
 def updateInventoryOnPurchase(sender, instance: PurchaseInvoice, **kwargs):
-    if instance.is_restocked: return
-
-    if instance.status in ('R', 'PR'):
-        
-        if instance.status == 'R' and not instance.is_restocked:
-            quantity_field = getRestockField(False)
-        else:
-            quantity_field = getRestockField(True)
-
-        product_item_mapping = instance.map_to_products()
-        product_ids = set(product_item_mapping)
-        existing, _, new_ids = spiltNewAndOldProducts(product_ids, instance.business.id)
-
-        for inventory_item in existing:
-            item = product_item_mapping[inventory_item.product_id]
-            morphed_item = item.morph()
-            delta = item.compute_restock_delta()
-            if delta > 0:
-                inventory_item.apply_restock_delta(False, delta, morphed_item['last_transaction'], morphed_item['unit_cost'])
-                logRestockEvent(item, delta, instance)
-                item.update_restock_flags()
-
-        for pid in new_ids:
-            item = product_item_mapping[pid]
-            inventory_item = createInventoryItemFromRestock(item, quantity_field)
-            logRestockEvent(item, getattr(item, quantity_field), instance)
-            item.update_restock_flags()
-
-        instance.update_restock_flags()
+    # Moved to sales/utils.py, which reads the lines fresh and cannot re-enter
+    # itself - see restock_purchase.
+    restock_purchase(instance)
 
 
 ### update invoice totals

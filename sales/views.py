@@ -4,7 +4,7 @@ from datetime import datetime
 from django.db import transaction
 from django.utils import timezone
 
-from rest_framework import status
+from rest_framework import exceptions, status
 from rest_framework.viewsets import GenericViewSet, ModelViewSet, ViewSet
 from rest_framework.decorators import action
 from rest_framework.response import Response
@@ -280,6 +280,11 @@ class PurchaseInvoiceViewSet(SettledInvoiceViewMixin, ModelViewSet):
 
             res_serializer = PurchaseInvoiceSerializer(updated_purchase_invoice)
             return Response(res_serializer.data, status=status.HTTP_200_OK)
+
+        except exceptions.APIException:
+            # A validation error goes out as the 400 it is, with its reason,
+            # as the sales update does.
+            raise
 
         except Exception as error:
             print(error)

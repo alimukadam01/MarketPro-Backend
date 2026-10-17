@@ -10,6 +10,7 @@ from root.models import (
     ProductVariant, Supplier, Unit,
 )
 
+from accounts.models import MoneyAccount
 from inventory.models import Inventory, InventoryItem
 from .models import (
     PurchaseInvoice, PurchaseInvoiceItem, SalesInvoice, SalesInvoiceItem,
@@ -1026,3 +1027,297 @@ class SalesLineQuantityIncreaseTests(TestCase):
         self.assertEqual(line.quantity, 5)
         self.stock.refresh_from_db()
         self.assertEqual(self.stock.quantity, 100)
+
+
+class PurchaseLineStockOnUpdateTests(TestCase):
+    """Changing the lines of a received purchase moves stock with them.
+
+    Two failures from the update screen started this. Removing a product and
+    adding it back at a new price was a UNIQUE error: the new line was
+    created before the old one was deleted. And after any removal, the restock
+    receiver still read the lines prefetched before the update - it stocked
+    the deleted line again, then failed writing its ledger (FOREIGN KEY) after
+    the lines had committed, so the page's held payments were never sent.
+    """
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.user = User.objects.create_user(
+            email="purchase-stock@example.com", password="pw-for-tests"
+        )
+        cls.business = Business.objects.create(
+            name="Stocked Paints", owner=cls.user,
+            phone="03001234567", is_active=True,
+        )
+        cls.supplier = Supplier.objects.create(
+            business=cls.business, name="Stock Supply Co"
+        )
+        cls.unit = Unit.objects.create(name="Drums", abv="Dr")
+        cls.product = Product.objects.create(
+            business=cls.business, name="Primer 20L", unit=cls.unit
+        )
+        cls.red, cls.blue, cls.green = [
+            ProductVariant.objects.create(
+                base=cls.product, name=name, sku=f"PST-{name}")
+            for name in ("red", "blue", "green")
+        ]
+        cls.cash = MoneyAccount.objects.get_default_account(cls.business.id)
+        cls.bank = MoneyAccount.objects.create(
+            business=cls.business, name="Meezan", type="bank")
+
+    def setUp(self):
+        self.client = APIClient()
+        self.client.force_authenticate(self.user)
+
+    def body(self, items, status="R"):
+        return {
+            "invoice_number": "PST-1",
+            "supplier": self.supplier.id,
+            "date_issued": "2026-05-10T12:00:00",
+            "date_due": FAR_FUTURE,
+            "delivery": FAR_FUTURE,
+            "status": status,
+            "notes": "",
+            "tax": {"value": 0, "type": "percentage"},
+            "project": None,
+            "items": items,
+        }
+
+    def create(self, items, status="R"):
+        response = self.client.post(
+            "/purchase-invoices/create-with-items/",
+            self.body(items, status), format="json")
+        self.assertEqual(response.status_code, 201, response.content)
+        return PurchaseInvoice.objects.get(
+            business=self.business, invoice_number="PST-1")
+
+    def update(self, invoice, items, status="R", expect=200):
+        response = self.client.post(
+            f"/purchase-invoices/{invoice.pk}/update-with-items/",
+            self.body(items, status), format="json")
+        self.assertEqual(response.status_code, expect, response.content)
+        return response
+
+    def line(self, invoice, variant):
+        return invoice.invoice_items.get(product=variant)
+
+    def stock(self, variant):
+        row = InventoryItem.objects.filter(
+            business=self.business, product=variant).first()
+        return row.quantity if row else 0
+
+    def received_red_and_blue(self):
+        return self.create([
+            {"product_id": self.red.id, "quantity": 50, "unit_cost": 250},
+            {"product_id": self.blue.id, "quantity": 100, "unit_cost": 200},
+        ])
+
+    def test_receiving_two_products_new_to_stock_creates_both(self):
+        # The receiver re-entered itself through its own flag writes and
+        # created the second product's stock row twice.
+        self.received_red_and_blue()
+        self.assertEqual(self.stock(self.red), 50)
+        self.assertEqual(self.stock(self.blue), 100)
+
+    def test_removing_and_adding_back_at_a_new_price(self):
+        invoice = self.received_red_and_blue()
+        red = self.line(invoice, self.red)
+
+        self.update(invoice, [
+            {"id": red.id, "product_id": self.red.id, "quantity": 50, "unit_cost": 250},
+            {"id": -1.5, "product_id": self.blue.id, "quantity": 100, "unit_cost": 300},
+        ])
+
+        blue = self.line(invoice, self.blue)
+        self.assertEqual(blue.unit_cost, 300)
+        # Out with the old line and in with the new: the same 100 in stock.
+        self.assertEqual(self.stock(self.blue), 100)
+        self.assertEqual(sum(r.quantity for r in blue.restocks.all()), 100)
+        invoice.refresh_from_db()
+        self.assertEqual(invoice.total, 50 * 250 + 100 * 300)
+
+    def test_removing_a_line_takes_its_stock_back_out(self):
+        invoice = self.received_red_and_blue()
+        red = self.line(invoice, self.red)
+
+        self.update(invoice, [
+            {"id": red.id, "product_id": self.red.id, "quantity": 50, "unit_cost": 250},
+        ])
+
+        self.assertEqual(self.stock(self.red), 50)
+        self.assertEqual(self.stock(self.blue), 0)
+
+    def test_adding_a_line_puts_it_into_stock(self):
+        invoice = self.received_red_and_blue()
+        red, blue = self.line(invoice, self.red), self.line(invoice, self.blue)
+
+        self.update(invoice, [
+            {"id": red.id, "product_id": self.red.id, "quantity": 50, "unit_cost": 250},
+            {"id": blue.id, "product_id": self.blue.id, "quantity": 100, "unit_cost": 200},
+            {"id": -2.5, "product_id": self.green.id, "quantity": 10, "unit_cost": 100},
+        ])
+
+        self.assertEqual(self.stock(self.green), 10)
+        self.assertEqual(self.stock(self.red), 50)
+        self.assertEqual(self.stock(self.blue), 100)
+
+    def test_a_line_added_to_an_invoice_flagged_restocked_is_stocked(self):
+        # Older received invoices carry is_restocked, which makes the
+        # receiver skip them; their new lines never reached stock.
+        invoice = self.received_red_and_blue()
+        PurchaseInvoice.objects.filter(pk=invoice.pk).update(is_restocked=True)
+        red, blue = self.line(invoice, self.red), self.line(invoice, self.blue)
+
+        self.update(invoice, [
+            {"id": red.id, "product_id": self.red.id, "quantity": 50, "unit_cost": 250},
+            {"id": blue.id, "product_id": self.blue.id, "quantity": 100, "unit_cost": 200},
+            {"id": -3.5, "product_id": self.green.id, "quantity": 7, "unit_cost": 100},
+        ])
+
+        self.assertEqual(self.stock(self.green), 7)
+
+    def test_changing_a_quantity_moves_the_difference(self):
+        invoice = self.received_red_and_blue()
+        red, blue = self.line(invoice, self.red), self.line(invoice, self.blue)
+
+        self.update(invoice, [
+            {"id": red.id, "product_id": self.red.id, "quantity": 30, "unit_cost": 250},
+            {"id": blue.id, "product_id": self.blue.id, "quantity": 120, "unit_cost": 200},
+        ])
+
+        self.assertEqual(self.stock(self.red), 30)
+        self.assertEqual(self.stock(self.blue), 120)
+
+    def test_receiving_in_the_same_update_stocks_every_line_once(self):
+        invoice = self.create([
+            {"product_id": self.red.id, "quantity": 50, "unit_cost": 250},
+        ], status="O")
+        self.assertEqual(self.stock(self.red), 0)
+        red = self.line(invoice, self.red)
+
+        self.update(invoice, [
+            {"id": red.id, "product_id": self.red.id, "quantity": 60, "unit_cost": 250},
+            {"id": -4.5, "product_id": self.blue.id, "quantity": 5, "unit_cost": 200},
+        ])
+
+        self.assertEqual(self.stock(self.red), 60)
+        self.assertEqual(self.stock(self.blue), 5)
+
+    def test_a_line_with_no_ledger_is_removed_without_touching_stock(self):
+        # Lines received before the ledger existed have no record of what
+        # they put in, so removing one cannot safely take anything out.
+        invoice = self.received_red_and_blue()
+        blue = self.line(invoice, self.blue)
+        blue.restocks.all().delete()
+        red = self.line(invoice, self.red)
+
+        self.update(invoice, [
+            {"id": red.id, "product_id": self.red.id, "quantity": 50, "unit_cost": 250},
+        ])
+
+        self.assertEqual(self.stock(self.blue), 100)
+
+    def test_the_same_product_twice_is_a_400(self):
+        invoice = self.received_red_and_blue()
+        red = self.line(invoice, self.red)
+
+        self.update(invoice, [
+            {"id": red.id, "product_id": self.red.id, "quantity": 50, "unit_cost": 250},
+            {"id": -5.5, "product_id": self.red.id, "quantity": 5, "unit_cost": 260},
+        ], expect=400)
+
+        self.assertEqual(invoice.invoice_items.count(), 2)
+        self.assertEqual(self.stock(self.red), 50)
+
+    def test_payments_go_through_after_an_update_that_adds_a_line(self):
+        # The page sends its held payments only once the update succeeds.
+        invoice = self.received_red_and_blue()
+        red, blue = self.line(invoice, self.red), self.line(invoice, self.blue)
+        self.update(invoice, [
+            {"id": red.id, "product_id": self.red.id, "quantity": 50, "unit_cost": 250},
+            {"id": blue.id, "product_id": self.blue.id, "quantity": 100, "unit_cost": 200},
+            {"id": -6.5, "product_id": self.green.id, "quantity": 10, "unit_cost": 100},
+        ])
+
+        for account, method in ((self.cash, "cash"), (self.bank, "bank_transfer")):
+            response = self.client.post(
+                f"/purchase-invoices/{invoice.pk}/payments/",
+                {"amount": 1000, "account": account.id,
+                 "payment_method": method, "date": "2026-05-10"},
+                format="json",
+            )
+            self.assertEqual(response.status_code, 201, response.content)
+
+
+class SalesLineReAddedOnUpdateTests(TestCase):
+    """A sales line removed and added back at the same price on one Update
+    is a new line with the old one's product and price - it used to be
+    created before the old one was deleted, a UNIQUE error."""
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.user = User.objects.create_user(
+            email="sales-readd@example.com", password="pw-for-tests"
+        )
+        City.objects.create(name="Sukkur", postal_code="65200")
+        cls.business = Business.objects.create(
+            name="Re-added Paints", owner=cls.user,
+            phone="03001234567", is_active=True,
+        )
+        cls.customer = Customer.objects.get(
+            business=cls.business, name=WALK_IN_CUSTOMER_NAME
+        )
+        cls.unit = Unit.objects.create(name="Tins", abv="Tin")
+        cls.product = Product.objects.create(
+            business=cls.business, name="Enamel 1L", unit=cls.unit
+        )
+        cls.white = ProductVariant.objects.create(
+            base=cls.product, name="white", sku="RA-1")
+        cls.black = ProductVariant.objects.create(
+            base=cls.product, name="black", sku="RA-2")
+
+    def setUp(self):
+        self.client = APIClient()
+        self.client.force_authenticate(self.user)
+
+    def body(self, items):
+        return {
+            "invoice_number": "RA-1",
+            "customer": str(self.customer.id),
+            "date_issued": "2026-05-10",
+            "date_due": FAR_FUTURE,
+            "discount": {"value": 0, "type": "amount"},
+            "tax": {"value": 0, "type": "percentage"},
+            "extra_charges": [],
+            "project": None,
+            "items": items,
+        }
+
+    def test_removing_and_adding_back_at_the_same_price(self):
+        response = self.client.post(
+            "/sales-invoices/create-with-items/",
+            self.body([
+                {"product_id": self.white.id, "quantity": 1, "unit_price": 1000},
+                {"product_id": self.black.id, "quantity": 2, "unit_price": 500},
+            ]),
+            format="json",
+        )
+        self.assertEqual(response.status_code, 201, response.content)
+        invoice = SalesInvoice.objects.get(
+            business=self.business, invoice_number="RA-1")
+        white = invoice.invoice_items.get(product=self.white)
+
+        response = self.client.post(
+            f"/sales-invoices/{invoice.pk}/update-with-items/",
+            self.body([
+                {"id": white.id, "product_id": self.white.id, "quantity": 1, "unit_price": 1000},
+                {"id": -1.5, "product_id": self.black.id, "quantity": 3, "unit_price": 500},
+            ]),
+            format="json",
+        )
+        self.assertEqual(response.status_code, 200, response.content)
+
+        black = invoice.invoice_items.get(product=self.black)
+        self.assertEqual(black.quantity, 3)
+        invoice.refresh_from_db()
+        self.assertEqual(invoice.total, 1000 + 3 * 500)

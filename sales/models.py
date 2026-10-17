@@ -749,11 +749,13 @@ class PurchaseInvoice(SettledInvoiceMixin, models.Model):
         self.status = 'R'
 
     def map_to_products(self) -> Dict[int, 'PurchaseInvoiceItem']:
-        return {item.product_id: item for item in self.invoice_items.all()}
+        # Fresh, not self.invoice_items.all(): see computed_totals.
+        lines = PurchaseInvoiceItem.objects.filter(purchase_invoice_id=self.pk)
+        return {item.product_id: item for item in lines}
 
     def update_restock_flags(self):
 
-        items = self.invoice_items.all()
+        items = list(PurchaseInvoiceItem.objects.filter(purchase_invoice_id=self.pk))
         if len(items) == 0:
             return
 
