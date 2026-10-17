@@ -354,6 +354,11 @@ class PurchaseInvoiceViewSet(SettledInvoiceViewMixin, ModelViewSet):
             res_serializer = PurchaseInvoiceSerializer(updated_purchase_invoice)
             return Response(res_serializer.data, status=status.HTTP_200_OK)
 
+        except exceptions.APIException:
+            # A validation error goes out as the 400 it is, with its reason,
+            # as the sales update does.
+            raise
+
         except Exception as error:
             print(error)
             return Response({

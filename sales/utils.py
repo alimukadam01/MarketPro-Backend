@@ -1,3 +1,5 @@
+import threading
+from contextlib import contextmanager
 from urllib.parse import quote
 
 from django.db import transaction
@@ -294,6 +296,127 @@ def restockOnCancel(instance: SalesInvoice):
 
     instance.is_deducted = False
     instance.save(update_fields=['is_deducted'])
+
+
+# ── Purchase stock ────────────────────────────────────────────────────────────
+# A received purchase puts its lines into stock, and each line's restock ledger
+# (PurchaseInvoiceItemRestock) records how many units it put there. The ledger
+# is the only proof a line moved stock: most lines received before it existed
+# have none, so nothing here takes stock back that the ledger does not show.
+
+RECEIVED_PURCHASE_STATUSES = ('R', 'PR')
+
+_restock_held = threading.local()
+
+
+@contextmanager
+def restock_held(invoice_id):
+    """Keep restock_purchase off this invoice for the duration.
+
+    It runs from the invoice's post_save, and its own writes save the invoice
+    again (a line's flags -> the line signal -> adjust_totals). Run re-entrant,
+    the outer pass went on with a product list the inner pass had already
+    stocked, and created a second inventory row for it. The update serializer
+    holds it too, since it moves stock line by line itself.
+    """
+    held = getattr(_restock_held, 'ids', None)
+    if held is None:
+        held = _restock_held.ids = set()
+    if invoice_id in held:
+        yield
+        return
+    held.add(invoice_id)
+    try:
+        yield
+    finally:
+        held.discard(invoice_id)
+
+
+def restock_is_held(invoice_id):
+    return invoice_id in getattr(_restock_held, 'ids', ())
+
+
+def units_in_stock(line):
+    """What this purchase line has put into stock, by its ledger."""
+    return line.restocks.aggregate(total=Sum('quantity'))['total'] or 0
+
+
+def receive_into_stock(line, units, invoice):
+    """Put `units` of this line's product into stock and log them against it."""
+    if units <= 0:
+        return
+    data = line.morph()
+    stock = InventoryItem.objects.filter(
+        business_id=line.business_id, product_id=line.product_id).first()
+    if stock:
+        stock.apply_restock_delta(
+            False, units, data['last_transaction'], data['unit_cost'])
+    else:
+        InventoryItem.objects.create(
+            business_id=data['business_id'],
+            inventory_id=data['inventory_id'],
+            location_id=data['location_id'],
+            product_id=data['product_id'],
+            quantity=units,
+            quantity_on_hand=units,
+            track_code=data.get('track_code'),
+            notes=data.get('notes'),
+            unit_cost=data.get('unit_cost'),
+            last_transaction=data['last_transaction'],
+        )
+    logRestockEvent(line, units, invoice)
+    line.update_restock_flags()
+
+
+def take_back_from_stock(line, units, product_id=None):
+    """Take `units` this line put into stock back out, and off its ledger.
+
+    Capped at what the ledger shows. `product_id` names the product the units
+    went in as, when the line has since been changed to another.
+    """
+    units = min(units, units_in_stock(line))
+    if units <= 0:
+        return
+    stock = InventoryItem.objects.filter(
+        business_id=line.business_id,
+        product_id=product_id or line.product_id).first()
+    if stock:
+        stock.apply_restock_delta(True, units, generateTransactionId(line))
+
+    # Newest entries first, so the ledger still reads as the line's history.
+    left = units
+    for entry in line.restocks.order_by('-id'):
+        if left <= 0:
+            break
+        if entry.quantity <= left:
+            left -= entry.quantity
+            entry.delete()
+        else:
+            entry.quantity -= left
+            entry.save(update_fields=['quantity'])
+            left = 0
+
+
+def restock_purchase(invoice):
+    """Stock whatever a received purchase's lines have not put in yet.
+
+    Driven by each line's ledger, so it can run any number of times. The lines
+    are read fresh: the viewsets prefetch them, and a prefetched list taken
+    before an update still holds lines the update deleted - it stocked them a
+    second time and then failed writing their ledger (FOREIGN KEY), after the
+    update itself had committed.
+    """
+    if invoice.is_restocked or invoice.status not in RECEIVED_PURCHASE_STATUSES:
+        return
+    if restock_is_held(invoice.pk):
+        return
+
+    with restock_held(invoice.pk):
+        lines = PurchaseInvoiceItem.objects.filter(
+            purchase_invoice_id=invoice.pk).select_related('product')
+        for line in lines:
+            receive_into_stock(line, line.compute_restock_delta(), invoice)
+        invoice.update_restock_flags()
 
 
 def build_whatsapp_payload(invoice):
