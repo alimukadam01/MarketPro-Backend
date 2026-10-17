@@ -774,6 +774,11 @@ def profit_estimate(business_id, date_from, date_to):
     """
     Revenue less cost of goods sold less expenses. An estimate only — it is
     exactly as accurate as the data entered (§6.11).
+
+    Extra charges are in revenue, because `total` carries them, and each one
+    is also recorded as an "invoice_extra_charge" expense (sync_charge_expenses
+    in sales/utils.py), which the expense total below picks up. The two cancel,
+    so a charge nets to nothing in profit.
     """
     revenue = (
         SalesInvoice.objects

@@ -445,9 +445,12 @@ class TransactionCreateSerializer(BaseTransactionWriteSerializer):
     expense_name = serializers.CharField(
         max_length=256, required=False, allow_null=True,
         allow_blank=True, write_only=True)
+    # Every category but the invoice-extra-charge one, which only the invoice
+    # records (sales.utils.sync_charge_expenses).
     expense_category = serializers.ChoiceField(
-        choices=Expense.CATEGORY_CHOICES, required=False,
-        allow_null=True, allow_blank=True, write_only=True)
+        choices=[choice for choice in Expense.CATEGORY_CHOICES
+                 if choice[0] != Expense.INVOICE_CHARGE_CATEGORY],
+        required=False, allow_null=True, allow_blank=True, write_only=True)
 
     # Which type is backed by which source. The party types are absent on
     # purpose: they are on-account money with no invoice behind them.

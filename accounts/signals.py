@@ -1,9 +1,10 @@
-from django.db.models.signals import post_save
+from django.db.models.signals import post_delete, post_save
 from django.dispatch import receiver
 
 from root.models import Business, Expense
 from root.utils import local_date
 from sales.models import PurchaseReceipt, SalesReceipt
+from sales.utils import deleting_with_invoice, sync_charge_expenses
 from .models import MoneyAccount, Transaction
 
 
@@ -90,6 +91,31 @@ def createTransactionForExpense(sender, instance: Expense, **kwargs):
     if not created:
         transaction.amount = round(instance.amount or 0)
         transaction.save(update_fields=['amount'])
+
+
+### a sales payment decides which account the invoice's extra charges leave
+@receiver(post_save, sender=Transaction)
+def syncChargesAfterSalePaymentSaved(sender, instance: Transaction, **kwargs):
+    # Covers a payment arriving (the mirror above creates its transaction, and
+    # apply_money_details then sets the account), and a single cheque clearing
+    # or bouncing. A grouped cheque changes status through a queryset update,
+    # which sends no signal; the mark-cleared / mark-bounced action syncs
+    # those itself.
+    #
+    # The expense transactions sync_charge_expenses makes carry no
+    # sales_receipt, so they return here at once and nothing loops.
+    if not instance.sales_receipt_id:
+        return
+    sync_charge_expenses(instance.sales_receipt.sales_invoice)
+
+
+@receiver(post_delete, sender=SalesReceipt)
+def syncChargesAfterSalePaymentDeleted(sender, instance: SalesReceipt, **kwargs):
+    # The payment that decided the account may be the one going. Not when the
+    # whole invoice is being deleted: see deleting_with_invoice.
+    if deleting_with_invoice(kwargs.get('origin')):
+        return
+    sync_charge_expenses(instance.sales_invoice)
 
 
 # payment_status is now a derived property on both invoice models — no

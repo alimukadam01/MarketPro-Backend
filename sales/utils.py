@@ -1,3 +1,5 @@
+import threading
+from contextlib import contextmanager
 from urllib.parse import quote
 
 from django.db import transaction
@@ -193,31 +195,228 @@ def reserveSalesInvoiceItem(item):
     pass
 
 def updateInventoryOnSale(instance: SalesInvoice):
-    if instance.is_deducted: return
+    """
+    Move the sold goods out of stock.
 
-    if instance.status in ('C', 'PC'):
+    Gated on the invoice being COMPLETED, which is now derived from it having
+    lines rather than chosen by hand - so completing an invoice deducts, and
+    nothing else does. It used to run for 'C' or 'PC', and 'PC' was itself
+    written by the deduction code, which made the rule circular.
 
-        if instance.status == 'C' and not instance.is_deducted:
-            quantity_field = getRestockField(False)
+    A cancelled invoice never deducts; restockOnCancel below puts back
+    anything it already had.
+
+    Guarded per line, not per invoice. A line added to an invoice that is
+    already deducted leaves the invoice flag True, so an early return on it
+    would mean the new line never left stock - Bug #001 again, one level up.
+    """
+    if instance.status in instance.CANCELLED_STATUSES:
+        return
+    if instance.stored_status != 'C':
+        return
+
+    invoice_items_dict = instance.items_by_product()
+    if not invoice_items_dict:
+        return
+
+    # The old `quantity_field = getRestockField(...)` branch stood here. It was
+    # the only thing that read the 'C' / 'PC' distinction, and nothing ever
+    # read the value it computed - the delta always came from
+    # compute_restock_delta(). Removed with the status overload.
+    product_ids = set(invoice_items_dict)
+    existing, _, new_ids = spiltNewAndOldProducts(product_ids, instance.business.id)
+
+    for inventory_item in existing:
+        # One product can be on several lines at different prices, and every
+        # line's quantity has to leave stock.
+        for item in invoice_items_dict[inventory_item.product_id]:
+            # The flag, not the delta. Most migrated lines carry is_deducted
+            # with an empty deduction ledger - deliberately, so importing them
+            # moved no stock - and for those the delta is the full quantity.
+            # Trusting the delta alone would deduct every one of them the
+            # first time its invoice was edited.
+            if item.is_deducted:
+                continue
+            delta = item.compute_restock_delta()
+            if delta > 0:
+                inventory_item.apply_restock_delta(True, delta, generateTransactionId(instance))
+                logRestockEvent(item, delta, instance)
+                item.update_restock_flags()
+
+    instance.update_deduction_flags()
+    # Narrowed from a bare save(): this instance may predate adjust_totals, so
+    # writing every column could put a stale total back.
+    instance.save(update_fields=['is_deducted'])
+
+
+def restockOnCancel(instance: SalesInvoice):
+    """
+    Cancelling an invoice returns its goods to stock.
+
+    The deduction rows are deleted rather than offset with a counter-entry,
+    because compute_restock_delta() measures what is left to deduct as
+    quantity minus the logged deductions. Clearing them makes the line look
+    undeducted again, so un-cancelling deducts it exactly once more and stock
+    cannot drift either way.
+
+    Nothing to undo for an invoice that never deducted - in particular the
+    migrated invoices, which carry is_deducted with an empty ledger precisely
+    so that their stock is never touched.
+    """
+    items_by_product = instance.items_by_product()
+    if not items_by_product:
+        return
+
+    stock_rows = InventoryItem.objects.filter(
+        business_id=instance.business_id,
+        product_id__in=set(items_by_product),
+    )
+
+    for inventory_item in stock_rows:
+        returned = 0
+        for item in items_by_product[inventory_item.product_id]:
+            deducted = item.restocks.aggregate(
+                total=Sum('quantity'))['total'] or 0
+            if not deducted:
+                continue
+            returned += deducted
+            item.restocks.all().delete()
+            item.is_deducted = False
+            item.save(update_fields=['is_deducted'])
+
+        if returned:
+            # Added directly rather than through apply_restock_delta(False, ...),
+            # which also overwrites unit_cost - a cancellation says nothing
+            # about what the stock cost.
+            inventory_item.quantity += returned
+            inventory_item.quantity_on_hand += returned
+            inventory_item.last_transaction = generateTransactionId(instance)
+            inventory_item.save(update_fields=[
+                'quantity', 'quantity_on_hand', 'last_transaction'])
+
+    instance.is_deducted = False
+    instance.save(update_fields=['is_deducted'])
+
+
+# ── Purchase stock ────────────────────────────────────────────────────────────
+# A received purchase puts its lines into stock, and each line's restock ledger
+# (PurchaseInvoiceItemRestock) records how many units it put there. The ledger
+# is the only proof a line moved stock: most lines received before it existed
+# have none, so nothing here takes stock back that the ledger does not show.
+
+RECEIVED_PURCHASE_STATUSES = ('R', 'PR')
+
+_restock_held = threading.local()
+
+
+@contextmanager
+def restock_held(invoice_id):
+    """Keep restock_purchase off this invoice for the duration.
+
+    It runs from the invoice's post_save, and its own writes save the invoice
+    again (a line's flags -> the line signal -> adjust_totals). Run re-entrant,
+    the outer pass went on with a product list the inner pass had already
+    stocked, and created a second inventory row for it. The update serializer
+    holds it too, since it moves stock line by line itself.
+    """
+    held = getattr(_restock_held, 'ids', None)
+    if held is None:
+        held = _restock_held.ids = set()
+    if invoice_id in held:
+        yield
+        return
+    held.add(invoice_id)
+    try:
+        yield
+    finally:
+        held.discard(invoice_id)
+
+
+def restock_is_held(invoice_id):
+    return invoice_id in getattr(_restock_held, 'ids', ())
+
+
+def units_in_stock(line):
+    """What this purchase line has put into stock, by its ledger."""
+    return line.restocks.aggregate(total=Sum('quantity'))['total'] or 0
+
+
+def receive_into_stock(line, units, invoice):
+    """Put `units` of this line's product into stock and log them against it."""
+    if units <= 0:
+        return
+    data = line.morph()
+    stock = InventoryItem.objects.filter(
+        business_id=line.business_id, product_id=line.product_id).first()
+    if stock:
+        stock.apply_restock_delta(
+            False, units, data['last_transaction'], data['unit_cost'])
+    else:
+        InventoryItem.objects.create(
+            business_id=data['business_id'],
+            inventory_id=data['inventory_id'],
+            location_id=data['location_id'],
+            product_id=data['product_id'],
+            quantity=units,
+            quantity_on_hand=units,
+            track_code=data.get('track_code'),
+            notes=data.get('notes'),
+            unit_cost=data.get('unit_cost'),
+            last_transaction=data['last_transaction'],
+        )
+    logRestockEvent(line, units, invoice)
+    line.update_restock_flags()
+
+
+def take_back_from_stock(line, units, product_id=None):
+    """Take `units` this line put into stock back out, and off its ledger.
+
+    Capped at what the ledger shows. `product_id` names the product the units
+    went in as, when the line has since been changed to another.
+    """
+    units = min(units, units_in_stock(line))
+    if units <= 0:
+        return
+    stock = InventoryItem.objects.filter(
+        business_id=line.business_id,
+        product_id=product_id or line.product_id).first()
+    if stock:
+        stock.apply_restock_delta(True, units, generateTransactionId(line))
+
+    # Newest entries first, so the ledger still reads as the line's history.
+    left = units
+    for entry in line.restocks.order_by('-id'):
+        if left <= 0:
+            break
+        if entry.quantity <= left:
+            left -= entry.quantity
+            entry.delete()
         else:
-            quantity_field = getRestockField(True)
+            entry.quantity -= left
+            entry.save(update_fields=['quantity'])
+            left = 0
 
-        invoice_items_dict = instance.items_by_product()
-        product_ids = set(invoice_items_dict)
-        existing, _, new_ids = spiltNewAndOldProducts(product_ids, instance.business.id)
 
-        for inventory_item in existing:
-            # See the same loop in signals.py: one product can be on several
-            # lines, and every line's quantity has to leave stock.
-            for item in invoice_items_dict[inventory_item.product_id]:
-                delta = item.compute_restock_delta()
-                if delta > 0:
-                    inventory_item.apply_restock_delta(True, delta, generateTransactionId(instance))
-                    logRestockEvent(item, delta, instance)
-                    item.update_restock_flags()
+def restock_purchase(invoice):
+    """Stock whatever a received purchase's lines have not put in yet.
 
-        instance.update_deduction_flags()
-        instance.save()
+    Driven by each line's ledger, so it can run any number of times. The lines
+    are read fresh: the viewsets prefetch them, and a prefetched list taken
+    before an update still holds lines the update deleted - it stocked them a
+    second time and then failed writing their ledger (FOREIGN KEY), after the
+    update itself had committed.
+    """
+    if invoice.is_restocked or invoice.status not in RECEIVED_PURCHASE_STATUSES:
+        return
+    if restock_is_held(invoice.pk):
+        return
+
+    with restock_held(invoice.pk):
+        lines = PurchaseInvoiceItem.objects.filter(
+            purchase_invoice_id=invoice.pk).select_related('product')
+        for line in lines:
+            receive_into_stock(line, line.compute_restock_delta(), invoice)
+        invoice.update_restock_flags()
 
 
 def build_whatsapp_payload(invoice):
@@ -248,8 +447,20 @@ def build_whatsapp_payload(invoice):
             f"Date: {issued.strftime('%d/%m/%Y')}",
             "",
             f"Items: {invoice.invoice_items.count()}",
-            f"Total: PKR {total:,}",
         ]
+
+        # Itemised above the total, not folded into it. A customer who is being
+        # asked for a delivery fee should be able to see that is what it is.
+        for charge in (invoice.extra_charges or []):
+            try:
+                label = str(charge.get('label') or '').strip()
+                amount = round(float(charge.get('amount') or 0))
+            except (AttributeError, TypeError, ValueError):
+                continue
+            if label and amount:
+                lines.append(f"{label}: PKR {amount:,}")
+
+        lines.append(f"Total: PKR {total:,}")
 
         # A customer who has cleared the bill should not be shown a balance
         # line at all - it reads like a demand.
@@ -352,3 +563,253 @@ def apply_money_details(source, money_details):
     transaction_record.save(update_fields=list(money_details.keys()))
 
     return transaction_record
+
+
+# ── Extra charges as expenses ─────────────────────────────────────────────────
+#
+# Every extra charge on a sales invoice is money the shop pays out again - the
+# rider, the labourer - so each one is mirrored as an Expense in the
+# "invoice_extra_charge" category, and through the Expense mirror as an
+# expense Transaction. The customer pays the charge as part of the invoice
+# total, which counts in revenue; the expense takes it back out, so a charge
+# nets to nothing in profit.
+#
+# The expense goes out of the account the customer's payment came into. Until
+# there is a payment there is no account to choose, so there is no expense.
+
+# Which account wins when an invoice was paid into several: cash first, then
+# bank, then a mobile wallet.
+CHARGE_ACCOUNT_PRIORITY = ['cash', 'bank', 'wallet']
+
+# The payment method a transaction on each kind of account carries.
+ACCOUNT_PAYMENT_METHOD = {
+    'cash': 'cash',
+    'bank': 'bank_transfer',
+    'wallet': 'wallet',
+}
+
+
+def deleting_with_invoice(origin):
+    """
+    True when a delete began at a sales invoice (or its whole business), so
+    the line or payment being deleted is going with it.
+
+    Django deletes an invoice's lines and payments before the invoice row, and
+    their post_delete receivers would otherwise resync the invoice: making
+    expenses that point at a row about to disappear, which PostgreSQL refuses.
+    `origin` is what Django passes post_delete: the instance or queryset whose
+    delete() started it all.
+    """
+    from root.models import Business
+
+    if origin is None:
+        return False
+    model = origin.model if isinstance(origin, QuerySet) else type(origin)
+    return model in (SalesInvoice, Business)
+
+
+def paid_into_account(invoice):
+    """
+    The account an invoice's own payments came into - which its extra charges
+    are paid out of, and an automatic refund goes back through - or None if
+    no payment has come in yet. Works for a sales or a purchase invoice: both
+    keep their receipts under payment_receipts.
+
+    Of the accounts the invoice's own payments went into, the first type in
+    CHARGE_ACCOUNT_PRIORITY wins. Two accounts of that type: the one that took
+    more of the money, then the one paid into first.
+
+    A bounced cheque never brought money into its account, so it is ignored. A
+    pending cheque counts: it names the account the money is going to.
+    Settlement from the khaata (credit notes, money on account) moves no money
+    into any account, so it never decides this.
+    """
+    received = {}   # account id -> [account, total received, first receipt id]
+    receipts = invoice.payment_receipts.select_related('transaction_record__account')
+    for receipt in receipts:
+        txn = getattr(receipt, 'transaction_record', None)
+        if txn is None or txn.account_id is None or txn.status == 'B':
+            continue
+        entry = received.setdefault(txn.account_id, [txn.account, 0, receipt.id])
+        entry[1] += txn.amount or 0
+        entry[2] = min(entry[2], receipt.id)
+
+    for account_type in CHARGE_ACCOUNT_PRIORITY:
+        candidates = [e for e in received.values() if e[0].type == account_type]
+        if candidates:
+            candidates.sort(key=lambda e: (-e[1], e[2]))
+            return candidates[0][0]
+    return None
+
+
+def sync_charge_expenses(invoice):
+    """
+    Make an invoice's charge expenses match its extra charges, now.
+
+    Idempotent, so every write that could change the answer calls it rather
+    than working out what changed: the charges, the lines (Draft has none), a
+    cancellation, a payment arriving or going, a cheque bouncing. When nothing
+    differs it writes nothing.
+
+    One expense per charge, dated on the invoice - the day the delivery or the
+    labour happened - and on the account paid_into_account() picks. None at all
+    for a draft or a cancelled invoice, or while nothing has been paid.
+
+    When anything differs the old expenses are deleted and new ones made,
+    rather than patched one by one: a charge has no identity of its own to
+    match an expense against, only a position in a JSON list.
+    """
+    # Function-level imports: accounts and root both sit above sales.
+    from root.models import Expense
+
+    invoice = SalesInvoice.objects.filter(pk=invoice.pk).first()
+    if invoice is None:
+        return
+
+    desired = []
+    account = None
+    if (invoice.status not in invoice.CANCELLED_STATUSES
+            and invoice.status not in invoice.DRAFT_STATUSES
+            and invoice.extra_charges):
+        account = paid_into_account(invoice)
+        if account is not None:
+            for charge in invoice.extra_charges:
+                try:
+                    label = str(charge.get('label') or '').strip()
+                    amount = round(float(charge.get('amount') or 0), 2)
+                except (AttributeError, TypeError, ValueError):
+                    continue
+                if label and amount > 0:
+                    desired.append((label, amount))
+
+    date = local_date(invoice.date_issued or invoice.created_at)
+    method = ACCOUNT_PAYMENT_METHOD.get(account.type) if account else None
+
+    existing = list(
+        Expense.objects.filter(sales_invoice=invoice)
+        .select_related('transaction_record').order_by('id'))
+
+    def unchanged():
+        if len(existing) != len(desired):
+            return False
+        for expense, (label, amount) in zip(existing, desired):
+            txn = getattr(expense, 'transaction_record', None)
+            if (expense.name != label
+                    or round(expense.amount or 0, 2) != amount
+                    or txn is None
+                    or txn.account_id != account.id
+                    or txn.date != date
+                    or txn.payment_method != method):
+                return False
+        return True
+
+    if unchanged():
+        return
+
+    with transaction.atomic():
+        for expense in existing:
+            expense.delete()   # its transaction goes with it (CASCADE)
+
+        reference = invoice.invoice_number or invoice.id
+        for label, amount in desired:
+            expense = Expense.objects.create(
+                business_id=invoice.business_id,
+                sales_invoice=invoice,
+                name=label,
+                category=Expense.INVOICE_CHARGE_CATEGORY,
+                amount=amount,
+                desc=f"Extra charge on sales invoice {reference}",
+            )
+            # The Expense mirror has just made the transaction on the default
+            # account, dated today; point it at the right account and day.
+            apply_money_details(expense, {
+                'account_id': account.id,
+                'date': date,
+                'payment_method': method,
+            })
+
+
+# ── Automatic refunds ─────────────────────────────────────────────────────────
+#
+# An Update that brings an invoice's billed amount under what has been paid on
+# it - an item removed, the discount raised, a charge taken off - leaves the
+# party paid for more than they were billed. The khaata already reads the
+# excess as an "overpayment" credit; the system records a refund of it, which
+# the khaata reads as a debt that uses the credit up. If the user deletes the
+# refund, the excess simply stays on the khaata as credit.
+
+# Refund types per invoice kind: money back to a customer goes out; money
+# back from a supplier comes in.
+REFUND_TYPE = {'sales': 'sales_return_refund', 'purchase': 'purchase_return_refund'}
+
+
+def overpaid_by(invoice):
+    """
+    How much more has been paid on this invoice than it bills. Never negative.
+
+    Matches the khaata (accounts/settlement.py): only cleared payments count,
+    and a draft or cancelled invoice bills nothing, so everything paid on one
+    is excess. Reads the invoice's receipts through payment_receipts.all(), so
+    pass an instance fetched after the change - a prefetched one still holds
+    the receipts from before.
+    """
+    excluded = invoice.CANCELLED_STATUSES + invoice.DRAFT_STATUSES
+    billed = 0.0 if invoice.status in excluded else float(invoice.total or 0)
+    return max(float(invoice.receipts_paid or 0) - billed, 0.0)
+
+
+def refund_new_overpayment(invoice, before, user_id=None):
+    """
+    Refund the overpayment an Update has just created, if any. Returns the
+    refund Transaction, or None.
+
+    `before` is overpaid_by() taken before the Update. Only the increase is
+    refunded: an invoice already overpaid before this edit - because a refund
+    was deleted, say - is not refunded again for that, so deleting a refund
+    stays deleted.
+
+    Whole rupees, as every transaction is. Out of (or for a supplier, into)
+    the account the invoice's payments used, by the same rule as its extra
+    charges, falling back to the default account. Dated today: the day the
+    money goes back.
+    """
+    # Function-level imports: accounts sits above sales.
+    from accounts.models import MoneyAccount, PartyPayment, Transaction
+    from django.utils import timezone
+
+    is_sales = isinstance(invoice, SalesInvoice)
+    model = SalesInvoice if is_sales else PurchaseInvoice
+    invoice = model.objects.filter(pk=invoice.pk).first()
+    if invoice is None:
+        return None
+
+    excess = round(overpaid_by(invoice) - (before or 0))
+    if excess < 1:
+        return None
+
+    account = (paid_into_account(invoice)
+               or MoneyAccount.objects.get_default_account(invoice.business_id))
+    reference = invoice.invoice_number or invoice.id
+
+    with transaction.atomic():
+        refund = Transaction.objects.create(
+            business_id=invoice.business_id,
+            account=account,
+            type=REFUND_TYPE['sales' if is_sales else 'purchase'],
+            amount=excess,
+            date=timezone.localdate(),
+            payment_method=ACCOUNT_PAYMENT_METHOD.get(account.type, 'cash'),
+            status='C',
+            notes=(f"Refund of the overpayment on "
+                   f"{'sales' if is_sales else 'purchase'} invoice {reference}"),
+            created_by_id=user_id,
+        )
+        PartyPayment.objects.create(
+            business_id=invoice.business_id,
+            customer_id=invoice.customer_id if is_sales else None,
+            supplier_id=None if is_sales else invoice.supplier_id,
+            transaction=refund,
+            sales_invoice=invoice if is_sales else None,
+            purchase_invoice=None if is_sales else invoice,
+        )
+    return refund

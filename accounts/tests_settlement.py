@@ -264,11 +264,11 @@ class CustomerMirrorTests(KhaataFixtures, TestCase):
         first = SalesInvoice.objects.create(
             business=self.business, customer=self.customer,
             created_by=self.user, invoice_number='SAL-1', total=79000,
-            status='S', date_issued=noon(2026, 5, 16))
+            status='C', date_issued=noon(2026, 5, 16))
         second = SalesInvoice.objects.create(
             business=self.business, customer=self.customer,
             created_by=self.user, invoice_number='SAL-2', total=128000,
-            status='S', date_issued=noon(2026, 5, 17))
+            status='C', date_issued=noon(2026, 5, 17))
         self.party_txn('customer_receipt', 100000, (2026, 6, 1),
                        party=self.customer)
         self.party_txn('customer_credit_note', 7000, (2026, 6, 2),

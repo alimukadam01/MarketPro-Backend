@@ -249,10 +249,14 @@ def _choice_dimensions():
             # Sales statuses by default. A purchase data point overrides this
             # in catalogue_payload() below, because the two sets differ and 'C'
             # means opposite things in each.
+            # OVERDUE is left out with CANCELLED, for a different reason: it
+            # is derived on read and never stored, so a target filtered to it
+            # would match no rows in SQL and report zero without an error.
             'choices': [
                 (code, label)
                 for code, label in SalesInvoice.SALES_INVOICE_STATUS_CHOICES
-                if code not in SalesInvoice.CANCELLED_STATUSES
+                if code not in (SalesInvoice.CANCELLED_STATUSES
+                                + SalesInvoice.DERIVED_ONLY_STATUSES)
             ],
         },
         'payment_method': {

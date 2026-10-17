@@ -1,3 +1,5 @@
+import math
+
 from django.db import transaction
 from django.db.models import Q, Sum
 from rest_framework import serializers
@@ -11,15 +13,154 @@ from root.serializers import (
     SupplierSerializer, BaseItemSerializer
 )
 from inventory.models import InventoryItem
-from .models import PurchaseInvoice, PurchaseInvoiceItem, PurchaseQuotation, PurchaseQuotationItem, PurchaseReceipt, SalesInvoice, SalesInvoiceItem, ReturnedItem, SalesReceipt
+from .models import InvoiceImage, PurchaseInvoice, PurchaseInvoiceItem, PurchaseQuotation, PurchaseQuotationItem, PurchaseReceipt, SalesInvoice, SalesInvoiceItem, ReturnedItem, SalesReceipt
 from .utils import (
     apply_money_details,
     checkPurchaseInvoiceItemFields,
     checkPurchaseInvoiceCreateFields,
     checkSalesInvoiceItemCreateFields,
     invoice_room,
+    overpaid_by,
+    receive_into_stock,
+    refund_new_overpayment,
+    restock_held,
+    restock_purchase,
+    RECEIVED_PURCHASE_STATUSES,
+    sync_charge_expenses,
+    take_back_from_stock,
+    units_in_stock,
     updateInventoryOnSale
 )
+
+
+MAX_EXTRA_CHARGES = 20
+MAX_EXTRA_CHARGE_LABEL = 64
+
+
+class ExtraChargesValidationMixin:
+    """
+    Validates the `extra_charges` list a sales invoice carries.
+
+    The column is a JSONField, which accepts any shape at all, and
+    SalesInvoice.extra_charges_sum() is deliberately forgiving because it runs
+    from a signal where raising would fail an already-accepted write. So this
+    is the only place a bad charge can be refused while there is still someone
+    to tell about it.
+
+    What it refuses, and why each one matters:
+
+    - an unknown key. A typo'd "ammount" would otherwise print as a charge on
+      the invoice and count as zero in the total, which is the worst possible
+      outcome: a figure that is wrong and looks deliberate.
+    - a negative amount. That is a discount, and because charges are subtracted
+      from revenue a negative one would add to it - money appearing in the
+      sales figures that nobody was billed.
+    - a blank label, a very long one (the PDF column is narrow), or a
+      non-finite amount, which no arithmetic survives.
+
+    Duplicate labels are allowed: two separate deliveries on one invoice is an
+    ordinary thing. Zero-amount rows are dropped rather than refused, since an
+    empty row left behind on the form is a slip, not an error.
+    """
+
+    def validate_extra_charges(self, value):
+        if value in (None, ''):
+            return []
+
+        if not isinstance(value, list):
+            raise serializers.ValidationError(
+                'Extra charges must be a list of {"label": ..., "amount": ...} '
+                'objects.'
+            )
+
+        if len(value) > MAX_EXTRA_CHARGES:
+            raise serializers.ValidationError(
+                f'An invoice can carry at most {MAX_EXTRA_CHARGES} extra '
+                f'charges.'
+            )
+
+        cleaned = []
+        for position, charge in enumerate(value, start=1):
+            if not isinstance(charge, dict):
+                raise serializers.ValidationError(
+                    f'Extra charge {position} must be an object with a label '
+                    f'and an amount.'
+                )
+
+            unknown = sorted(set(charge) - {'label', 'amount'})
+            if unknown:
+                raise serializers.ValidationError(
+                    f'Extra charge {position} has unexpected '
+                    f'{"keys" if len(unknown) > 1 else "key"} '
+                    f'{", ".join(unknown)}. Only label and amount are allowed.'
+                )
+
+            label = str(charge.get('label') or '').strip()
+            if not label:
+                raise serializers.ValidationError(
+                    f'Extra charge {position} needs a label.'
+                )
+            if len(label) > MAX_EXTRA_CHARGE_LABEL:
+                raise serializers.ValidationError(
+                    f'The label on extra charge {position} is longer than '
+                    f'{MAX_EXTRA_CHARGE_LABEL} characters.'
+                )
+
+            try:
+                amount = float(charge.get('amount'))
+            except (TypeError, ValueError):
+                raise serializers.ValidationError(
+                    f'The amount on extra charge {position} is not a number.'
+                )
+            if not math.isfinite(amount):
+                raise serializers.ValidationError(
+                    f'The amount on extra charge {position} is not a finite '
+                    f'number.'
+                )
+            if amount < 0:
+                raise serializers.ValidationError(
+                    f'The amount on extra charge {position} cannot be '
+                    f'negative. Use the discount field instead.'
+                )
+
+            amount = round(amount, 2)
+            if amount == 0:
+                continue
+
+            cleaned.append({'label': label, 'amount': amount})
+
+        return cleaned
+
+
+class InvoiceImageSerializer(serializers.ModelSerializer):
+    """
+    One photo on an invoice, for reading and for uploading.
+
+    `image` is left as the ModelSerializer's own ImageField rather than a
+    method field, so DRF builds an absolute URL from the request in the
+    context - which is why the viewset puts it there. A presigned S3 link is
+    already absolute and comes through unchanged.
+
+    Which invoice it belongs to comes from the URL, not the payload: these are
+    nested routes under an invoice the viewset has already scoped to the
+    active business, so accepting an invoice id in the body would be a way to
+    attach a photo to someone else's invoice.
+    """
+
+    uploaded_by = SimpleUserSerializer(read_only=True)
+
+    class Meta:
+        model = InvoiceImage
+        fields = ['id', 'image', 'caption', 'uploaded_by', 'uploaded_at']
+        read_only_fields = ['id', 'uploaded_by', 'uploaded_at']
+
+
+class SimpleInvoiceImageSerializer(serializers.ModelSerializer):
+    """The same photo, as it is listed inline on an invoice."""
+
+    class Meta:
+        model = InvoiceImage
+        fields = ['id', 'image', 'caption', 'uploaded_at']
 
 
 class PaymentReceiptSerializer(serializers.Serializer):
@@ -30,8 +171,46 @@ class PaymentReceiptSerializer(serializers.Serializer):
     account = serializers.SerializerMethodField()
     payment_method = serializers.SerializerMethodField()
     status = serializers.SerializerMethodField()
+    date = serializers.SerializerMethodField()
+    image = serializers.SerializerMethodField()
     created_at = serializers.DateTimeField(read_only=True)
     updated_at = serializers.DateTimeField(read_only=True)
+
+    def get_date(self, receipt):
+        """
+        The day the money moved, which is what the payments dialog shows.
+
+        created_at is the day the row was typed, and backdating is
+        unrestricted, so the two differ whenever a payment is entered late.
+        The date itself lives on the mirrored transaction, like the account
+        and the method below.
+
+        Imported inside the method on purpose: accounts imports sales at load
+        time, so a module-level import here would be a cycle. Same convention
+        as SalesInvoice.pool_applied.
+        """
+        from accounts.utils import receipt_date
+        return receipt_date(receipt)
+
+    def get_image(self, receipt):
+        """
+        The photo of the slip, cheque or receipt, on the mirrored transaction
+        like everything else about the money.
+
+        Absolute, because the page that shows it is served from another
+        origin. A presigned S3 URL is already absolute and comes back
+        unchanged; a local one is a bare /media/... path that only works once
+        the host is on the front. Without `request` in the serializer context
+        there is no host to add, which is why both receipt viewsets put it
+        there - the same omission broke every transaction image once.
+        """
+        transaction = getattr(receipt, 'transaction_record', None)
+        image = getattr(transaction, 'image', None) if transaction else None
+        if not image:
+            return None
+
+        request = self.context.get('request')
+        return request.build_absolute_uri(image.url) if request else image.url
 
     def get_account(self, receipt):
         """
@@ -70,9 +249,14 @@ class PaymentReceiptCreateSerializer(PaymentReceiptSerializer):
     cheque_number = serializers.CharField(
         required=False, allow_null=True, allow_blank=True)
     cheque_due_date = serializers.DateField(required=False, allow_null=True)
+    # Declared writable here, where the read serializer has it as a method
+    # field: a payment carries at most one photo, and it is stored on the
+    # transaction the receipt is mirrored into, so this needs no new column.
+    image = serializers.ImageField(required=False, allow_null=True)
 
     MONEY_FIELDS = [
-        'account', 'payment_method', 'date', 'cheque_number', 'cheque_due_date'
+        'account', 'payment_method', 'date', 'cheque_number',
+        'cheque_due_date', 'image'
     ]
 
     def pop_money_details(self):
@@ -182,6 +366,7 @@ class PurchaseInvoiceSerializer(serializers.ModelSerializer):
     created_by = SimpleUserSerializer(read_only=True)
     projects = ProjectPurchaseInvoiceLinker(many=True)
     payment_receipts = PaymentReceiptSerializer(many=True, read_only=True)
+    images = SimpleInvoiceImageSerializer(many=True, read_only=True)
 
     class Meta:
         model = PurchaseInvoice
@@ -189,7 +374,8 @@ class PurchaseInvoiceSerializer(serializers.ModelSerializer):
             'id', 'invoice_number', 'business', 'supplier',
             'date_issued', 'created_at', 'updated_at', 'date_due', 'status', 'payment_status',
             'sub_total', 'tax',  'amount_paid', 'total', 'delivery', 'created_by',
-            'notes', 'invoice_items', 'is_restocked', 'is_partially_restocked', 'projects', 'payment_receipts'
+            'notes', 'invoice_items', 'is_restocked', 'is_partially_restocked',
+            'projects', 'payment_receipts', 'images'
         ]
 
 
@@ -362,79 +548,63 @@ class PurchaseInvoiceAndItemsUpdateSerializer(serializers.ModelSerializer):
     items = serializers.ListField()
     project = serializers.IntegerField(required=False, allow_null=True)
 
+    def validate_items(self, items):
+        # A product sits on a purchase invoice once (unique_together). Caught
+        # here as a 400 rather than at the database as a 500.
+        products = [item.get('product_id') for item in items]
+        if len(products) != len(set(products)):
+            raise serializers.ValidationError(
+                "A product can only be on a purchase invoice once - change the quantity on its line instead.")
+        return items
+
     def save(self, **kwargs):
         items = self.validated_data.pop('items')
         project_id = self.validated_data.pop('project', None)
         project_id = int(project_id) if project_id else project_id
+        # Measured before anything changes, so only the overpayment this
+        # Update creates is refunded (refund_new_overpayment).
+        overpaid_before = overpaid_by(self.instance)
 
         try:
+            # All of it in one transaction, totals and refund included: a
+            # failure part-way used to keep the lines and lose the rest, and
+            # the page, told the update failed, never sent its held payments.
             with transaction.atomic():
-                for attr, value in self.validated_data.items():
-                    setattr(self.instance, attr, value)
+                # Stock moves line by line below; the invoice's own restock
+                # pass waits until the lines are final.
+                with restock_held(self.instance.pk):
+                    for attr, value in self.validated_data.items():
+                        setattr(self.instance, attr, value)
 
-                self.instance.save()
+                    self.instance.save()
+                    receiving = self.instance.status in RECEIVED_PURCHASE_STATUSES
+                    self._apply_lines(items, receiving)
+                    self.instance.adjust_totals()
 
-                existing_items = PurchaseInvoiceItem.objects.filter(
-                    purchase_invoice_id=self.instance.id
-                )
-                existing_items_map = {
-                    item.id: item for item in existing_items
-                }
-                existing_item_ids = set(
-                    existing_items.values_list('id', flat=True))
+                self.instance.refresh_from_db()
+                # A purchase marked received in this same update stocks its
+                # lines now. Ledger-driven, so the lines handled above are not
+                # stocked twice.
+                restock_purchase(self.instance)
+                # Paid for more than it now bills: the supplier owes the excess.
+                refund_new_overpayment(
+                    self.instance, overpaid_before, self.context.get('user_id'))
 
-                new_items = []
-                updated_items = []
-
-                for item in items:
-                    if item['id'] in existing_item_ids:
-                        invoice_item = existing_items_map.get(item['id'])
-                        invoice_item.product_id = item['product_id']
-                        invoice_item.quantity = item['quantity']
-                        invoice_item.unit_cost = item['unit_cost']
-                        updated_items.append(invoice_item)
-                    else:
-                        new_items.append(PurchaseInvoiceItem(
-                            business_id=self.context['business_id'],
-                            purchase_invoice=self.instance,
-                            product_id=item['product_id'],
-                            quantity=item['quantity'],
-                            unit_cost=item['unit_cost']
-                        ))
-
-                if new_items:
-                    new_items = PurchaseInvoiceItem.objects.bulk_create(
-                        new_items)
-
-                if updated_items:
-                    PurchaseInvoiceItem.objects.bulk_update(updated_items, [
-                        'product', 'quantity', 'unit_cost'
-                    ])
-
-                updated_ids = [item.id for item in updated_items]
-                new_ids = [item.id for item in new_items]
-                existing_items = existing_items.exclude(
-                    id__in=updated_ids+new_ids)
-                existing_items.delete()
-
-            self.instance.adjust_totals()
-            self.instance.refresh_from_db()
-
-            # Handle Projects Addition/Updation/Deletion Logic
-            if not project_id:
-                print(
-                    "printing from ProjectPurchaseInvoice deletion block. Project ID is: ", project_id)
-                ProjectPurchaseInvoice.objects.filter(
-                    purchase_invoice=self.instance).delete()
-            else:
-                print(
-                    "printing from ProjectPurchaseInvoice creation block. Project ID is: ", project_id)
-                ProjectPurchaseInvoice.objects.filter(
-                    purchase_invoice=self.instance).delete()
-                ProjectPurchaseInvoice.objects.get_or_create(
-                    project_id=project_id,
-                    purchase_invoice=self.instance
-                )
+                # Handle Projects Addition/Updation/Deletion Logic
+                if not project_id:
+                    print(
+                        "printing from ProjectPurchaseInvoice deletion block. Project ID is: ", project_id)
+                    ProjectPurchaseInvoice.objects.filter(
+                        purchase_invoice=self.instance).delete()
+                else:
+                    print(
+                        "printing from ProjectPurchaseInvoice creation block. Project ID is: ", project_id)
+                    ProjectPurchaseInvoice.objects.filter(
+                        purchase_invoice=self.instance).delete()
+                    ProjectPurchaseInvoice.objects.get_or_create(
+                        project_id=project_id,
+                        purchase_invoice=self.instance
+                    )
 
             return self.instance
 
@@ -443,6 +613,69 @@ class PurchaseInvoiceAndItemsUpdateSerializer(serializers.ModelSerializer):
             # failed write into a misleading 400 at the view.
             print(error)
             raise
+
+    def _apply_lines(self, items, receiving):
+        """Bring the saved lines in line with the page's, moving stock as
+        they change. Stock only comes back out as far as a line's restock
+        ledger shows it went in."""
+        saved = {
+            line.id: line for line in PurchaseInvoiceItem.objects.filter(
+                purchase_invoice_id=self.instance.id)
+        }
+        sent = {item['id']: item for item in items if item.get('id') in saved}
+
+        # Lines taken off go first - stock and all - before anything is
+        # added: a product removed and added back (at a new price, say) is a
+        # new line, and would otherwise be on the invoice twice for a moment.
+        removed = [line for line_id, line in saved.items() if line_id not in sent]
+        for line in removed:
+            take_back_from_stock(line, units_in_stock(line))
+        if removed:
+            PurchaseInvoiceItem.objects.filter(
+                id__in=[line.id for line in removed]).delete()
+
+        kept = []
+        for line_id, item in sent.items():
+            line = saved[line_id]
+            was_product, was_quantity = line.product_id, line.quantity
+            line.product_id = item['product_id']
+            line.quantity = int(item['quantity'])
+            line.unit_cost = item['unit_cost']
+            kept.append((line, was_product, was_quantity))
+        if kept:
+            PurchaseInvoiceItem.objects.bulk_update(
+                [line for line, _, _ in kept], ['product', 'quantity', 'unit_cost'])
+
+        for line, was_product, was_quantity in kept:
+            in_stock = units_in_stock(line)
+            if line.product_id != was_product:
+                # Stocked as the old product: that comes out, and the new
+                # one goes in whole.
+                take_back_from_stock(line, in_stock, product_id=was_product)
+                if receiving:
+                    receive_into_stock(line, line.quantity, self.instance)
+            elif in_stock > line.quantity:
+                take_back_from_stock(line, in_stock - line.quantity)
+            elif receiving and line.quantity > was_quantity:
+                # A line with a ledger is topped up to its quantity. One
+                # without - received before the ledger existed - only gets
+                # the increase, since its old quantity is already in stock.
+                units = line.quantity - in_stock if in_stock else line.quantity - was_quantity
+                receive_into_stock(line, units, self.instance)
+
+        new_lines = PurchaseInvoiceItem.objects.bulk_create([
+            PurchaseInvoiceItem(
+                business_id=self.context['business_id'],
+                purchase_invoice=self.instance,
+                product_id=item['product_id'],
+                quantity=item['quantity'],
+                unit_cost=item['unit_cost'],
+            )
+            for item in items if item.get('id') not in saved
+        ])
+        if receiving:
+            for line in new_lines:
+                receive_into_stock(line, line.quantity, self.instance)
 
     class Meta:
         model = PurchaseInvoice
@@ -509,7 +742,7 @@ class SalesInvoiceItemSerializer(serializers.ModelSerializer):
         model = SalesInvoiceItem
         fields = [
             'id', 'sales_invoice', 'product', 'unit_price', 'quantity', 'returned_quantity', 'net_quantity',
-            'track_code', 'notes', 'quantity_received', 'is_deducted', 'is_partially_deducted', 'is_returned'
+            'track_code', 'notes', 'quantity_received', 'is_deducted', 'is_returned'
         ]
 
     def update(self, instance, validated_data):
@@ -529,7 +762,7 @@ class SimpleSalesInvoiceItemSerializer(serializers.ModelSerializer):
         model = SalesInvoiceItem
         fields = [
             'id', 'sales_invoice', 'product', 'unit_price', 'quantity', 'returned_quantity', 'net_quantity',
-            'quantity_received', 'discount', 'is_deducted', 'is_partially_deducted', 'is_returned'
+            'quantity_received', 'discount', 'is_deducted', 'is_returned'
         ]
 
 
@@ -589,14 +822,29 @@ class SalesInvoiceSerializer(serializers.ModelSerializer):
     customer = SimpleCustomerSerializer(read_only=True)
     projects = ProjectSalesInvoiceLinker(many=True)
     payment_receipts = PaymentReceiptSerializer(many=True)
+    images = SimpleInvoiceImageSerializer(many=True, read_only=True)
+    # The column holds Draft, Completed or Cancelled; Overdue is worked out
+    # here, because whether an invoice is overdue depends on what the khaata
+    # has settled onto it and on today's date, neither of which writes to the
+    # invoice. display_status is the one definition of the rule.
+    status = serializers.SerializerMethodField()
+
+    def get_status(self, obj):
+        return obj.display_status
 
     class Meta:
         model = SalesInvoice
         fields = [
             'id', 'invoice_number', 'business', 'customer', 'date_issued', 'date_due', 'payment_status',
-            'status', 'sub_total', 'tax', 'discount', 'total', 'amount_paid' ,'created_by', 'created_at',
-            'notes', 'is_deducted', 'is_partially_deducted', 'invoice_items', 'projects', 'payment_receipts'
+            'status', 'sub_total', 'tax', 'discount', 'extra_charges',
+            'extra_charges_total', 'total', 'amount_paid' ,'created_by', 'created_at',
+            'notes', 'is_deducted', 'invoice_items', 'projects',
+            'payment_receipts', 'images'
         ]
+        # Derived from extra_charges by adjust_totals. A client-sent value is
+        # ignored rather than trusted - it is the figure every revenue and
+        # profit aggregate subtracts.
+        read_only_fields = ['extra_charges_total']
 
 
 class SimpleSalesInvoiceSerializer(serializers.ModelSerializer):
@@ -605,6 +853,7 @@ class SimpleSalesInvoiceSerializer(serializers.ModelSerializer):
     total_items = serializers.SerializerMethodField()
     amount_paid = serializers.SerializerMethodField()
     projects = ProjectSalesInvoiceLinker(many=True)
+    status = serializers.SerializerMethodField()
 
     def get_total_items(self, obj):
         """
@@ -638,16 +887,26 @@ class SimpleSalesInvoiceSerializer(serializers.ModelSerializer):
             return obj.sales_invoice.amount_paid
         return obj.amount_paid
 
+    def get_status(self, obj):
+        # Overdue is derived, not stored - see SalesInvoiceSerializer above.
+        # The list view attaches the settlement and prefetches the items, so
+        # this costs no extra queries per row.
+        invoice = obj.sales_invoice if type(obj) == ProjectSalesInvoice else obj
+        return invoice.display_status
+
     class Meta:
         model = SalesInvoice
         fields = [
             'id', 'invoice_number', 'customer', 'date_issued', 'date_due',
-            'payment_status', 'status', 'sub_total', 'tax', 'discount', 'total',
+            'payment_status', 'status', 'sub_total', 'tax', 'discount',
+            'extra_charges', 'extra_charges_total', 'total',
             'amount_paid', 'total_items', 'projects'
         ]
+        read_only_fields = ['extra_charges_total']
 
 
-class SalesInvoiceCreateSerializer(serializers.ModelSerializer):
+class SalesInvoiceCreateSerializer(ExtraChargesValidationMixin,
+                                   serializers.ModelSerializer):
 
     business = SimpleBusinessSerializer(read_only=True)
 
@@ -655,27 +914,33 @@ class SalesInvoiceCreateSerializer(serializers.ModelSerializer):
         model = SalesInvoice
         fields = [
             'id', 'invoice_number', 'business', 'customer', 'date_issued', 'date_due',
-            'payment_status', 'status', 'tax', 'discount', 'notes'
+            'payment_status', 'tax', 'discount', 'extra_charges', 'notes'
         ]
 
     def validate(self, attrs):
         super().validate(attrs)
 
     def save(self, **kwargs):
-        return SalesInvoice.objects.create(
+        invoice = SalesInvoice.objects.create(
             business_id=self.context['business_id'],
             created_by_id=self.context['user_id'],
             **self.validated_data
         )
+        # A bare invoice has no lines, so it is a draft and this records no
+        # expense; called anyway so no write path is the one that forgot.
+        sync_charge_expenses(invoice)
+        return invoice
 
 
-class SalesInvoiceUpdateSerializer(serializers.ModelSerializer):
+class SalesInvoiceUpdateSerializer(ExtraChargesValidationMixin,
+                                   serializers.ModelSerializer):
 
     class Meta:
         model = SalesInvoice
         fields = [
             'id', 'invoice_number', 'customer', 'date_issued', 'date_due',
-            'payment_status', 'status', 'sub_total', 'tax', 'discount', 'total', 'notes'
+            'payment_status', 'sub_total', 'tax', 'discount', 'extra_charges',
+            'total', 'notes'
         ]
 
     def save(self, **kwargs):
@@ -684,6 +949,8 @@ class SalesInvoiceUpdateSerializer(serializers.ModelSerializer):
             setattr(self.instance, attr, value)
 
         self.instance.save()
+        # The charges or the invoice date may have changed.
+        sync_charge_expenses(self.instance)
         return self.instance
 
 
@@ -760,7 +1027,8 @@ class RestockSerializer(serializers.Serializer):
         return True
 
 
-class SalesInvoiceAndItemsCreateSerializer(serializers.ModelSerializer):
+class SalesInvoiceAndItemsCreateSerializer(ExtraChargesValidationMixin,
+                                           serializers.ModelSerializer):
 
     items = serializers.ListField()
     project = serializers.IntegerField(required=False, allow_null=True)
@@ -798,8 +1066,14 @@ class SalesInvoiceAndItemsCreateSerializer(serializers.ModelSerializer):
 
             sales_invoice.refresh_from_db()
             sales_invoice.adjust_totals()
-            # No need to call this, it's called in adjust_totals.
+            # Status before stock: it is derived from the lines, and
+            # updateInventoryOnSale only deducts for a COMPLETED invoice.
+            sales_invoice.recalculate_status()
             updateInventoryOnSale(sales_invoice)
+            # Usually a no-op here: with no payment yet there is no account to
+            # pay the charges out of. The payment signal syncs again once one
+            # arrives.
+            sync_charge_expenses(sales_invoice)
 
             # Money received at the time of sale becomes a payment record;
             # the accounts signal mirrors it into a transaction and
@@ -831,15 +1105,16 @@ class SalesInvoiceAndItemsCreateSerializer(serializers.ModelSerializer):
             'date_due',
             'discount',
             'tax',
+            'extra_charges',
             'payment_status',
-            'status',
             'items',
             'project',
             'amount_paid'
         ]
 
 
-class SalesInvoiceAndItemsUpdateSerializer(serializers.ModelSerializer):
+class SalesInvoiceAndItemsUpdateSerializer(ExtraChargesValidationMixin,
+                                           serializers.ModelSerializer):
 
     items = serializers.ListField()
     project = serializers.IntegerField(required=False, allow_null=True)
@@ -848,6 +1123,9 @@ class SalesInvoiceAndItemsUpdateSerializer(serializers.ModelSerializer):
         items = self.validated_data.pop('items')
         project_id = self.validated_data.pop('project', None)
         project_id = int(project_id) if project_id else project_id
+        # Measured before anything changes, so only the overpayment this
+        # Update creates is refunded (refund_new_overpayment).
+        overpaid_before = overpaid_by(self.instance)
 
         try:
             with transaction.atomic():
@@ -867,16 +1145,26 @@ class SalesInvoiceAndItemsUpdateSerializer(serializers.ModelSerializer):
                 new_items = []
                 updated_items = []
 
-                for item in items:
-                    # this block essentially does nothing as invoice items
-                    # can't be updated on the frontend currently.
-                    # attr updation commented as functionality not on frontend yet.
+                # Lines whose quantity went up. Adding a product already on
+                # the invoice at the same price merges into that line on the
+                # page (addOrMergeInvoiceItem), so a saved line can grow - and
+                # this used to ignore it, silently losing the extra quantity.
+                grown = []
 
+                for item in items:
                     if item['id'] in existing_item_ids:
                         invoice_item = existing_items_map.get(item['id'])
-                        # invoice_item.product_id = item['product_id']
-                        # invoice_item.quantity = item['quantity']
-                        # invoice_item.unit_price = item['unit_price']
+                        # The page shows and sends a line's NET quantity, after
+                        # returns, so the returned units are added back to get
+                        # the line's own quantity. Only an increase is applied:
+                        # a smaller figure is a return, which has its own flow,
+                        # or a page that has not caught up with one. Product
+                        # and price are never changed here - a different price
+                        # is a different line.
+                        wanted = int(item['quantity']) + (invoice_item.returned_quantity or 0)
+                        if wanted > invoice_item.quantity:
+                            invoice_item.quantity = wanted
+                            grown.append(invoice_item)
                         updated_items.append(invoice_item)
                     else:
                         new_items.append(SalesInvoiceItem(
@@ -887,26 +1175,41 @@ class SalesInvoiceAndItemsUpdateSerializer(serializers.ModelSerializer):
                             unit_price=item['unit_price']
                         ))
 
+                # Lines taken off go before new ones are created: a product
+                # removed and added back at the same price is a new line, and
+                # would otherwise be on the invoice twice for a moment
+                # (unique_together on product and price).
+                existing_items.exclude(
+                    id__in=[item.id for item in updated_items]).delete()
+
                 if new_items:
                     new_items = SalesInvoiceItem.objects.bulk_create(new_items)
 
-                # Items on the frontend can't be updated,
-                # They can either be created or deleted.
-
-                # if updated_items:
-                #     SalesInvoiceItem.objects.bulk_update(updated_items, [
-                #         'product', 'quantity', 'unit_price'
-                #     ])
-
-                updated_ids = [item.id for item in updated_items]
-                new_ids = [item.id for item in new_items]
-                existing_items = existing_items.exclude(
-                    id__in=updated_ids+new_ids)
-                existing_items.delete()
+                if grown:
+                    SalesInvoiceItem.objects.bulk_update(grown, ['quantity'])
+                    for line in grown:
+                        # A line the system has already taken out of stock is
+                        # re-flagged from its ledger: with the quantity up it is
+                        # no longer fully deducted, so updateInventoryOnSale
+                        # below takes out exactly the extra units. A line with
+                        # an empty ledger is left alone - in particular the
+                        # migrated lines flagged deducted so they never move
+                        # stock, which a quantity change must not start doing.
+                        if line.restocks.exists():
+                            line.update_restock_flags()
 
                 self.instance.refresh_from_db()
                 self.instance.adjust_totals()
+                # Deliberately here and not beside the invoice save above: the
+                # lines are only final once the new ones are created and the
+                # removed ones deleted, and the status is derived from them.
+                self.instance.recalculate_status()
                 updateInventoryOnSale(self.instance)
+                # After the status: a draft or cancelled invoice records none.
+                sync_charge_expenses(self.instance)
+                # Paid for more than it now bills: the excess goes back.
+                refund_new_overpayment(
+                    self.instance, overpaid_before, self.context.get('user_id'))
 
                 # Handle Projects Addition/Updation/Deletion Logic
                 if not project_id:
@@ -942,8 +1245,8 @@ class SalesInvoiceAndItemsUpdateSerializer(serializers.ModelSerializer):
             'date_due',
             'discount',
             'tax',
+            'extra_charges',
             'payment_status',
-            'status',
             'items',
             'project'
         ]
@@ -1059,7 +1362,7 @@ class GenerateInvoiceSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'created_at', 'date_issued', 'business', 'customer',
             'invoice_number', 'invoice_items', 'discount', 'tax', 'sub_total',
-            'total', 'amount_paid'
+            'extra_charges', 'extra_charges_total', 'total', 'amount_paid'
         ]
 
 

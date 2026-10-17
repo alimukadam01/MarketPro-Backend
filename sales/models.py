@@ -118,6 +118,15 @@ class SettledInvoiceMixin:
         return 'PEN'
 
 
+# Extra charges are part of every sales figure: `total` carries them, and
+# revenue, the dashboard sales total, the monthly trend and profit all sum
+# `total`. They used to be subtracted again from all four. That stopped when
+# each charge started being recorded as an expense (sync_charge_expenses in
+# sales/utils.py): the charge counts as revenue, the expense takes it back
+# out, and profit nets them. Subtracting the charge as well would count it
+# out twice.
+
+
 class SalesInvoiceQuerySet(BaseQuerySet):
 
     pass
@@ -135,9 +144,6 @@ class SalesInvoiceManager(models.Manager):
             queryset = queryset.in_period(num_days)
 
         return queryset.aggregate(total=Sum("total"))["total"] or 0
-
-    def total_invoices(self, business_id, num_days=None):
-        return self.get_queryset().for_business(business_id).in_period(num_days).count() 
 
     def monthly_sales_trend(self, business_id):
         return self.get_queryset().monthly_trend(business_id, 'total')
@@ -186,6 +192,8 @@ class SalesInvoiceManager(models.Manager):
 
         Cancelled invoices never count. Drafts do, which matches what
         party_invoiced, profit_estimate and the Sales page already show.
+
+        Extra charges included: see the note above SalesInvoiceQuerySet.
         """
         return (
             self.get_queryset()
@@ -219,13 +227,20 @@ class SalesInvoiceManager(models.Manager):
 
 class SalesInvoice(SettledInvoiceMixin, models.Model):
 
+    # Status is derived, not chosen. An invoice is a Draft until it carries a
+    # line, Completed once it does, and Overdue while it is unpaid past its due
+    # date. Cancelling is the one transition a person makes, and it sticks.
+    #
+    #   ("S",  "SENT")                 removed - no client used it
+    #   ("PC", "PARTIALLY_COMPLETED")  removed - it was never a document state,
+    #                                  only a copy of how much stock had moved,
+    #                                  and writing it over the user's choice is
+    #                                  what made an edited invoice unfixable.
     SALES_INVOICE_STATUS_CHOICES = [
         ("D", "DRAFT"),
-        ("S", "SENT"),
         ("O", "OVERDUE"),
         ("X", "CANCELLED"),
         ("C", "COMPLETED"),
-        ("PC", "PARTIALLY_COMPLETED")
     ]
 
     # Which states mean the sale never happened. Kept here rather than imported
@@ -234,6 +249,14 @@ class SalesInvoice(SettledInvoiceMixin, models.Model):
     CANCELLED_STATUSES = ["X"]
     # Not confirmed yet, so not a debt: left out of the khaata with cancelled.
     DRAFT_STATUSES = ["D"]
+    # Set by a person and never recalculated away.
+    MANUAL_STATUSES = ["X"]
+    # Worked out on every read and never stored: whether an invoice is overdue
+    # depends on what it has been paid, and the khaata settles that on read
+    # (accounts/settlement.py stores nothing). It also changes when the date
+    # rolls over, with no write to the invoice at all, so a stored value would
+    # be wrong by construction and there is no scheduler here to refresh it.
+    DERIVED_ONLY_STATUSES = ["O"]
 
     PAYMENT_STATUS_CHOICES = [
         ("P", "PAID"),
@@ -250,8 +273,12 @@ class SalesInvoice(SettledInvoiceMixin, models.Model):
     # Editable, so a sale entered a day late can carry the day it happened.
     date_issued = models.DateTimeField(default=timezone.now)
     date_due = models.DateField(null=True, blank=True)
+    # 'D' as a plain string. This read SALES_INVOICE_STATUS_CHOICES[2], which
+    # is the whole ("O", "OVERDUE") tuple rather than a code - and once SENT
+    # and PARTIALLY_COMPLETED were removed, index 2 became CANCELLED, which
+    # would have quietly dropped every defaulted invoice out of the khaata.
     status = models.CharField(
-        max_length=256, choices=SALES_INVOICE_STATUS_CHOICES, default=SALES_INVOICE_STATUS_CHOICES[2])
+        max_length=256, choices=SALES_INVOICE_STATUS_CHOICES, default='D')
     sub_total = models.FloatField(null=True, blank=True)
     tax = models.JSONField(
         null=True,
@@ -265,6 +292,21 @@ class SalesInvoice(SettledInvoiceMixin, models.Model):
         default=dict,
         help_text='e.g., {"value": 10.0, "type": "percentage" or "amount"}'
     )
+    # Named charges added after tax - delivery, labour, a cutting fee. A list
+    # rather than a column per charge, because which ones a shop adds is its
+    # own business and they differ per invoice.
+    extra_charges = models.JSONField(
+        null=True,
+        blank=True,
+        default=list,
+        help_text='e.g., [{"label": "Delivery", "amount": 500.0}]'
+    )
+    # Denormalised from extra_charges by adjust_totals, and written nowhere
+    # else. It is what keeps "revenue excluding charges" a plain subtraction in
+    # SQL: summing inside a JSON column is not portable between the SQLite used
+    # in development and the PostgreSQL used in production. sub_total is
+    # already exactly this kind of stored derivation.
+    extra_charges_total = models.FloatField(default=0.0)
     total = models.FloatField(null=True, blank=True)
     created_by = models.ForeignKey(
         settings.AUTH_USER_MODEL, models.CASCADE, 'created_sales_invoices'
@@ -272,35 +314,104 @@ class SalesInvoice(SettledInvoiceMixin, models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     notes = models.TextField(null=True, blank=True)
     is_deducted = models.BooleanField(default=False)
-    is_partially_deducted = models.BooleanField(default=False)
 
     objects = SalesInvoiceManager()
 
     def update_deduction_flags(self):
+        """
+        Whether every line has left stock. A stock fact only - it no longer
+        touches `status`, which is what made an invoice stick on PARTIALLY
+        COMPLETED for ever once a line was added during an update.
+        """
         items = self.invoice_items.all()
-        deducted = 0
+        self.is_deducted = bool(items) and all(
+            item.is_deducted for item in items)
 
-        for obj in items:
-            if obj.is_partially_deducted:
-                self.is_partially_deducted = True
-                self.is_deducted = False
-                self.status = 'PC'
-                return
+    @property
+    def amount_due(self):
+        """
+        What is still owed: the total less its own receipts AND whatever the
+        party's khaata settles onto it. Never negative-by-rounding.
+        """
+        return round(float(self.total or 0) - float(self.amount_paid or 0), 2)
 
-            if obj.is_deducted:
-                deducted += 1
+    @property
+    def is_overdue(self):
+        # The same epsilon accounts/settlement.py uses, so a rounding tail
+        # cannot make a settled invoice look overdue.
+        return bool(
+            self.date_due
+            and self.date_due < timezone.localdate()
+            and self.amount_due > 0.005
+        )
 
-        if deducted == len(items):
-            self.is_partially_deducted = False
-            self.is_deducted = True
-            self.status = 'C'
+    @property
+    def display_status(self):
+        """
+        The status a person should see. The single definition of the rule:
+        the serializers, the list filter and recalculate_status all read it,
+        so they cannot drift apart.
+        """
+        if self.status in self.MANUAL_STATUSES:
+            return self.status
+        # len() rather than .exists(): the list view prefetches invoice_items,
+        # and len() reuses that cache while .exists() costs a query per row.
+        if not len(self.invoice_items.all()):
+            return 'D'
+        if self.is_overdue:
+            return 'O'
+        return 'C'
+
+    @property
+    def stored_status(self):
+        """display_status with Overdue folded back into Completed."""
+        derived = self.display_status
+        return 'C' if derived in self.DERIVED_ONLY_STATUSES else derived
+
+    def recalculate_status(self):
+        """
+        Bring the stored status back in line with the invoice's contents.
+
+        Written with a queryset update rather than self.save(): that fires no
+        signals, so a status write can never re-enter the item/invoice save
+        cycle that adjust_totals already runs inside. The in-memory value is
+        set too, so the response serialises the new status without a refetch.
+        """
+        new_status = self.stored_status
+        if new_status == self.status:
+            return False
+        self.status = new_status
+        SalesInvoice.objects.filter(pk=self.pk).update(status=new_status)
+        return True
 
     def __str__(self):
         return f"{self.id}-{self.invoice_number}-{self.total}-{self.status}"
 
+    def extra_charges_sum(self):
+        """
+        This invoice's named charges, totalled.
+
+        Tolerant of a malformed row rather than raising: adjust_totals runs
+        from a signal on every item save, and an exception there would fail a
+        write the serializer has already accepted. The serializer is what
+        rejects a bad charge, at the point a person can still be told about it.
+        """
+        total = 0.0
+        for charge in (self.extra_charges or []):
+            try:
+                total += float(charge.get('amount') or 0)
+            except (AttributeError, TypeError, ValueError):
+                continue
+        return round(total, 2)
+
     def adjust_totals(self):
         items = self.invoice_items.exclude(returned_quantity = F("quantity"))
         if not items:
+            # An invoice with no lines keeps a NULL total, which
+            # average_order_value relies on to drop it from the average rather
+            # than counting it as an order worth nothing. Its charges are left
+            # on the record but are not a total on their own: a delivery fee
+            # with nothing being delivered is an invoice still being written.
             return
 
         subtotal = sum(item.net_quantity * item.unit_price for item in items)
@@ -343,19 +454,25 @@ class SalesInvoice(SettledInvoiceMixin, models.Model):
             else:
                 raise Exception("incorrect value")
 
+        # Charges are added after tax and are not part of sub_total.
+        #
+        # Both matter. Invoice.jsx recomputes a percentage tax and discount
+        # from sub_total to print them, so folding the charges in would have it
+        # charge tax on the delivery fee; and adding them before tax would
+        # charge real tax on it here. A charge is a pass-through, so it is
+        # taxed by neither.
+        charges = self.extra_charges_sum()
+
         self.sub_total = subtotal
-        self.total = subtotal + tax - discount
-        self.save(update_fields=["sub_total", "total"])
+        self.extra_charges_total = charges
+        self.total = subtotal + tax - discount + charges
+        self.save(update_fields=["sub_total", "total", "extra_charges_total"])
 
-    def is_fulfilled(self):
-        for item in self.invoice_items.all():
-            if not item.is_restocked:
-                self.is_restocked = False
-                return
-
-        self.is_restocked = True
-        self.is_partially_restocked = False
-        self.status = 'C'
+    # is_fulfilled() stood here and was dead: nothing called it, and it
+    # assigned self.is_restocked / self.is_partially_restocked, which are
+    # PurchaseInvoice fields that SalesInvoice does not have - so it would
+    # have raised had anything ever reached it. It also set status = 'C',
+    # which is now derived. Removed with the rest of the status overload.
 
     def items_by_product(self) -> Dict[int, List['SalesInvoiceItem']]:
         """
@@ -440,7 +557,6 @@ class SalesInvoiceItem(BaseItem):
     quantity_received = models.IntegerField(default=0)
     returned_quantity = models.PositiveIntegerField(default=0)
     is_deducted = models.BooleanField(default=False)
-    is_partially_deducted = models.BooleanField(default=False)
 
     objects = SalesInvoiceItemManager()
 
@@ -466,13 +582,23 @@ class SalesInvoiceItem(BaseItem):
 
     def update_restock_flags(self):
         """
-        Exactly one of is_restocked / is_partially_restocked should be True.
-        """
+        Whether this line has fully left stock.
 
-        full = (self.quantity_received >= self.quantity)
-        self.is_deducted = full
-        self.is_partially_deducted = not full
-        self.save(update_fields=['is_deducted', 'is_partially_deducted'])
+        Read from the deduction ledger, not from quantity_received. The two
+        disagree: compute_restock_delta() above measures what is left to
+        deduct as quantity minus the logged deductions, while this used to
+        compare quantity_received - a field the sales update path never set.
+        So a line could be fully deducted in the ledger and still be flagged
+        partial for ever, which is exactly what pinned an edited invoice to
+        PARTIALLY COMPLETED.
+
+        Only ever called right after a deduction is logged, so the ledger is
+        current when it runs.
+        """
+        deducted = self.restocks.aggregate(
+            total=models.Sum('quantity'))['total'] or 0
+        self.is_deducted = deducted >= self.quantity
+        self.save(update_fields=['is_deducted'])
     
     def __str__(self):
         return f'{self.id}_{self.product.base.name} ({self.product.name})_{self.sales_invoice.id}_{self.sales_invoice.invoice_number}'
@@ -508,9 +634,6 @@ class PurchaseInvoiceManager(models.Manager):
             queryset = queryset.in_period(num_days)
 
         return queryset.aggregate(total=Sum("total"))["total"] or 0
-
-    def total_invoices(self, business_id, num_days=None):
-        return self.get_queryset().for_business(business_id).in_period(num_days).count() 
 
     def purchase_value(self, business_id, date_from, date_to,
                        supplier_id=None, created_by_id=None, status=None):
@@ -636,8 +759,23 @@ class PurchaseInvoice(SettledInvoiceMixin, models.Model):
     def __str__(self):
         return f"{self.id}-{self.invoice_number}-{self.total}-{self.status}"
 
-    def adjust_totals(self):
-        items = self.invoice_items.all()
+    def computed_totals(self):
+        """
+        (sub_total, total) as the stored lines make them. Writes nothing.
+
+        Shared by adjust_totals and the recompute_purchase_totals command, so
+        a repair can never disagree with the figure a save would produce.
+
+        Read from the database, never from self.invoice_items.all(). The
+        viewset fetches invoices with prefetch_related('invoice_items'), so on
+        an instance from get_object() .all() returns the item list cached
+        before the update - and the total was being worked out from the old
+        items and saved, while the update page (which adds up in the browser)
+        showed the right figure. A total is a write; it has to see what is
+        actually stored. The sales twin already queries, through its
+        .exclude().
+        """
+        items = PurchaseInvoiceItem.objects.filter(purchase_invoice_id=self.pk)
         subtotal = sum(item.quantity * item.unit_cost for item in items)
 
         tax = 0
@@ -651,8 +789,10 @@ class PurchaseInvoice(SettledInvoiceMixin, models.Model):
             else:
                 raise Exception("incorrect value")
 
-        self.sub_total = subtotal
-        self.total = subtotal + tax
+        return subtotal, subtotal + tax
+
+    def adjust_totals(self):
+        self.sub_total, self.total = self.computed_totals()
         self.save(update_fields=["sub_total", "total"])
 
     def is_fulfilled(self):
@@ -667,11 +807,13 @@ class PurchaseInvoice(SettledInvoiceMixin, models.Model):
         self.status = 'R'
 
     def map_to_products(self) -> Dict[int, 'PurchaseInvoiceItem']:
-        return {item.product_id: item for item in self.invoice_items.all()}
+        # Fresh, not self.invoice_items.all(): see computed_totals.
+        lines = PurchaseInvoiceItem.objects.filter(purchase_invoice_id=self.pk)
+        return {item.product_id: item for item in lines}
 
     def update_restock_flags(self):
 
-        items = self.invoice_items.all()
+        items = list(PurchaseInvoiceItem.objects.filter(purchase_invoice_id=self.pk))
         if len(items) == 0:
             return
 
@@ -829,6 +971,14 @@ class SalesInvoiceItemDeduction(BaseRestock):
         return f"{self.sales_invoice.id}: {self.sales_invoice_item.product.base.name} ({self.sales_invoice_item.product.name}) x {self.quantity}"
 
 
+# Dead. Nothing creates a SalesReservation anywhere, and nothing reads one:
+# it was meant to hold stock for an invoice that had not completed yet, which
+# the derived status made unnecessary - an invoice with lines is complete and
+# its stock has left. The table is kept rather than dropped because a migration
+# to remove it would have to be reversed by hand if reserving is ever wanted,
+# and an empty table costs nothing. The `deductions` accessors it defines are
+# the confusing part: the real deduction ledger is SalesInvoiceItemDeduction,
+# reached through `restocks`.
 class SalesReservation(BaseRestock):
     sales_invoice = models.ForeignKey(
         SalesInvoice, models.CASCADE, related_name='deductions')
@@ -940,3 +1090,75 @@ class ReturnedItem(models.Model):
     def __str__(self):
         return f"Return for {self.invoice_item.product.base.name} ({self.invoice_item.product.name}) from Invoice {self.invoice_item.sales_invoice.invoice_number} on {local_date(self.created_at)}"
 
+
+
+class InvoiceImage(models.Model):
+    """
+    A photo attached to a sales or a purchase invoice. Several per invoice: a
+    shop photographs the signed delivery note, the goods as they arrived and
+    the supplier's own bill, and all three belong to the same invoice.
+
+    Two nullable foreign keys rather than one generic relation. It is how
+    "one of these two" is already modelled here - PartyPayment and the source
+    links on Transaction both do it - and it keeps the database able to say
+    what an image belongs to: a generic key is an opaque (type, id) pair that
+    no join and no `on_delete` understands.
+
+    Exactly one of the two is set, which `clean` and the CheckConstraint below
+    both insist on. A payment image is a different thing and is not stored
+    here: a payment carries at most one, on the transaction it is mirrored
+    into, which needs no table of its own.
+    """
+
+    sales_invoice = models.ForeignKey(
+        SalesInvoice, models.CASCADE, related_name='images',
+        null=True, blank=True)
+    purchase_invoice = models.ForeignKey(
+        PurchaseInvoice, models.CASCADE, related_name='images',
+        null=True, blank=True)
+    image = models.ImageField(upload_to='invoices')
+    caption = models.CharField(max_length=256, null=True, blank=True)
+    uploaded_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, models.SET_NULL,
+        related_name='uploaded_invoice_images', null=True, blank=True)
+    uploaded_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        # Newest first: the last photo taken is the one being looked for.
+        ordering = ['-uploaded_at', '-id']
+        constraints = [
+            models.CheckConstraint(
+                check=(
+                    Q(sales_invoice__isnull=False,
+                      purchase_invoice__isnull=True)
+                    | Q(sales_invoice__isnull=True,
+                        purchase_invoice__isnull=False)
+                ),
+                name='invoice_image_belongs_to_exactly_one_invoice',
+            ),
+        ]
+
+    def clean(self):
+        # The constraint is the guarantee; this is what turns a violation into
+        # a readable error in the admin instead of an IntegrityError.
+        if bool(self.sales_invoice_id) == bool(self.purchase_invoice_id):
+            raise ValidationError(
+                'An invoice image belongs to exactly one invoice - either a '
+                'sales invoice or a purchase invoice, not both and not '
+                'neither.'
+            )
+
+    @property
+    def invoice(self):
+        """Whichever invoice this image is attached to."""
+        return self.sales_invoice or self.purchase_invoice
+
+    def __str__(self):
+        return f"Image for invoice {self.invoice_id_label} ({self.image.name})"
+
+    @property
+    def invoice_id_label(self):
+        invoice = self.invoice
+        if not invoice:
+            return 'unattached'
+        return invoice.invoice_number or invoice.id

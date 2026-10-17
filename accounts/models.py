@@ -730,6 +730,17 @@ class PartyPayment(models.Model):
     )
     transaction = models.OneToOneField(
         Transaction, on_delete=models.CASCADE, related_name='party_payment')
+    # Set only on an automatic refund: the invoice whose edit left it paid for
+    # more than it came to (sales.utils.refund_new_overpayment). It is how the
+    # invoice's payments dialog finds the refund to list and delete. SET_NULL,
+    # not CASCADE: the refund is money that moved, and deleting the invoice
+    # must not take it with it - it stays on the party's khaata.
+    sales_invoice = models.ForeignKey(
+        'sales.SalesInvoice', on_delete=models.SET_NULL,
+        null=True, blank=True, related_name='refunds')
+    purchase_invoice = models.ForeignKey(
+        'sales.PurchaseInvoice', on_delete=models.SET_NULL,
+        null=True, blank=True, related_name='refunds')
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
