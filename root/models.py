@@ -49,6 +49,11 @@ class BaseQuerySet(models.QuerySet):
         })
 
     def monthly_trend(self, business_id, field):
+        """
+        A value per day for the current month, zero on the days with none.
+
+        `field` is anything Sum() takes - a column name, or an expression.
+        """
         today = timezone.localdate()
         year = today.year
         month = today.month
@@ -480,6 +485,7 @@ class Expense(models.Model):
         ("tankhwa", "Salaries (Tankhwa)"),
         ("transport", "Transport"),
         ("mutafarriq", "Miscellaneous (Mutafarriq)"),
+        ("invoice_extra_charge", "Invoice Extra Charge"),
     ]
 
     # Salaries are recorded as an expense in this category rather than as their
@@ -487,6 +493,11 @@ class Expense(models.Model):
     # own line (BRD 6.9). Named here so the reporting code does not carry a
     # bare string.
     SALARY_CATEGORY = "tankhwa"
+
+    # Made by the system, one per extra charge on a sales invoice, and kept in
+    # step with it by sales.utils.sync_charge_expenses. Never offered in the
+    # expense form, and never edited or deleted on its own: the invoice owns it.
+    INVOICE_CHARGE_CATEGORY = "invoice_extra_charge"
 
     business = models.ForeignKey(
         Business, on_delete=models.CASCADE, related_name='expenses')
@@ -496,5 +507,16 @@ class Expense(models.Model):
     desc = models.TextField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     amount = models.FloatField(default=0)
+    # Set only on an invoice-extra-charge expense: the sales invoice whose
+    # charge it pays out. A string reference, because sales imports root.
+    # CASCADE, so deleting the invoice takes its charge expenses with it.
+    sales_invoice = models.ForeignKey(
+        'sales.SalesInvoice', on_delete=models.CASCADE,
+        null=True, blank=True, related_name='charge_expenses')
 
     objects = ExpenseManager()
+
+    @property
+    def is_invoice_charge(self):
+        """True when an invoice owns this expense and keeps it in sync."""
+        return bool(self.sales_invoice_id)

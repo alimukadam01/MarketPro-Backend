@@ -4,7 +4,7 @@ from datetime import datetime
 from django.db import transaction
 from django.utils import timezone
 
-from rest_framework import status
+from rest_framework import exceptions, status
 from rest_framework.viewsets import GenericViewSet, ModelViewSet, ViewSet
 from rest_framework.decorators import action
 from rest_framework.response import Response
@@ -14,12 +14,12 @@ from django_filters.rest_framework import DjangoFilterBackend
 from root.serializers import CaptureCustomerSerializer
 from root.utils import get_active_business
 from inventory.models import InventoryItem
-from accounts.models import Transaction
+from accounts.models import PartyPayment, Transaction
 from accounts.settlement import attach_settlement
 from accounts.utils import month_bounds, payables
 from .filters import PurchaseInvoiceFilter, SalesInvoiceFilter
-from .models import PurchaseInvoice, PurchaseInvoiceItem, PurchaseQuotation, PurchaseQuotationItem, PurchaseReceipt, ReturnedItem, SalesInvoice, SalesInvoiceItem, SalesReceipt
-from .utils import build_whatsapp_payload, invoice_room
+from .models import InvoiceImage, PurchaseInvoice, PurchaseInvoiceItem, PurchaseQuotation, PurchaseQuotationItem, PurchaseReceipt, ReturnedItem, SalesInvoice, SalesInvoiceItem, SalesReceipt
+from .utils import build_whatsapp_payload, invoice_room, overpaid_by, restockOnCancel, sync_charge_expenses, updateInventoryOnSale
 from .serializers import (
     PaymentReceiptSerializer,
     PurchaseInvoiceAndItemsCreateSerializer,
@@ -54,7 +54,8 @@ from .serializers import (
     SimplePurchaseQuotationItemSerializer,
     SimpleSalesInvoiceItemSerializer,
     SimpleSalesInvoiceSerializer,
-    GenerateInvoiceSerializer
+    GenerateInvoiceSerializer,
+    InvoiceImageSerializer
 )
 
 # Create your views here.
@@ -102,7 +103,79 @@ class SettledInvoiceViewMixin:
                 # still_owed while a pending cheque holds part of it.
                 'room': round(invoice_room(invoice)),
                 'settled_by': invoice._settlement.settled_by(invoice.id),
+                # Paid for more than it bills (the khaata's overpayment). The
+                # dialog works out from this whether an edit it is showing
+                # would create a refund, and how much.
+                'overpaid': round(overpaid_by(invoice), 2),
+                # What the saved invoice bills: its total, or 0 for a draft or
+                # a cancelled invoice. The refund preview compares the edited
+                # total against this, as refund_new_overpayment will.
+                'billed': round(
+                    0 if invoice.status in (invoice.CANCELLED_STATUSES
+                                            + invoice.DRAFT_STATUSES)
+                    else float(invoice.total or 0), 2),
+                'refunds': self._refunds(invoice),
             }, status=status.HTTP_200_OK)
+        except Exception as error:
+            print(error)
+            return Response({'detail': 'Internal Server Error.'},
+                            status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    @staticmethod
+    def _refund_rows(invoice):
+        """The automatic refunds recorded for this invoice."""
+        field = ('sales_invoice' if isinstance(invoice, SalesInvoice)
+                 else 'purchase_invoice')
+        return (PartyPayment.objects
+                .filter(**{field: invoice})
+                .select_related('transaction__account')
+                .order_by('transaction__date', 'transaction__id'))
+
+    def _refunds(self, invoice):
+        return [
+            {
+                'id': row.transaction_id,
+                'amount': row.transaction.amount,
+                'date': row.transaction.date,
+                'status': row.transaction.status,
+                'account': ({'id': row.transaction.account_id,
+                             'name': row.transaction.account.name,
+                             'type': row.transaction.account.type}
+                            if row.transaction.account_id else None),
+            }
+            for row in self._refund_rows(invoice)
+        ]
+
+    @action(['POST'], detail=True, url_path='delete-refund', url_name='delete-refund')
+    def delete_refund(self, request, pk=None):
+        """
+        Delete one of this invoice's automatic refunds.
+
+        The excess it paid back then stays with the party, as credit on their
+        khaata. Only a refund recorded for THIS invoice can be deleted here,
+        so an id from another invoice or business is a 404.
+        """
+        business = get_active_business(request)
+        if not business:
+            return Response(
+                {'detail': 'No active business exists. Please contact admin.'},
+                status=status.HTTP_400_BAD_REQUEST)
+
+        transaction_id = request.data.get('transaction_id')
+        if not transaction_id:
+            return Response({'detail': 'Bad Request.'},
+                            status=status.HTTP_400_BAD_REQUEST)
+        try:
+            invoice = self.get_object()
+            row = self._refund_rows(invoice).filter(
+                transaction_id=transaction_id).first()
+            if row is None:
+                return Response({'detail': 'Not Found.'},
+                                status=status.HTTP_404_NOT_FOUND)
+            # The transaction owns the PartyPayment (CASCADE), so this removes
+            # both.
+            row.transaction.delete()
+            return Response({'detail': 'Success.'}, status=status.HTTP_200_OK)
         except Exception as error:
             print(error)
             return Response({'detail': 'Internal Server Error.'},
@@ -281,6 +354,11 @@ class PurchaseInvoiceViewSet(SettledInvoiceViewMixin, ModelViewSet):
             res_serializer = PurchaseInvoiceSerializer(updated_purchase_invoice)
             return Response(res_serializer.data, status=status.HTTP_200_OK)
 
+        except exceptions.APIException:
+            # A validation error goes out as the 400 it is, with its reason,
+            # as the sales update does.
+            raise
+
         except Exception as error:
             print(error)
             return Response({
@@ -343,6 +421,10 @@ class PurchaseReceiptsViewSet(ModelViewSet):
     
     def get_serializer_context(self):
         return {
+            # request is what turns a payment's image into an absolute URL.
+            # A context without it replaces DRF's default, which is how every
+            # transaction image once came back as a bare /media/... path.
+            'request': self.request,
             "purchase_invoice_id": self.kwargs['purchase_invoice_pk']
         }
 
@@ -476,8 +558,12 @@ class SalesInvoiceViewSet(SettledInvoiceViewMixin, ModelViewSet):
     # DjangoFilterBackend to match and the parameter used to be ignored.
     # The column-backed fields are unchanged, declared in its Meta.
     filterset_class = SalesInvoiceFilter
+    # 'status' is deliberately absent. Search is an icontains across every
+    # field at once, and the column holds one-letter codes - so searching for
+    # anything with a "c" in it matched every completed invoice, and a search
+    # for a customer called Dawood matched every draft.
     search_fields = [
-        'id', 'invoice_number', 'customer__name', 'status', 'sub_total', 'total', 'discount', 'tax', 'notes', 'created_by__email'
+        'id', 'invoice_number', 'customer__name', 'sub_total', 'total', 'discount', 'tax', 'notes', 'created_by__email'
     ]
 
     def get_queryset(self):
@@ -541,6 +627,13 @@ class SalesInvoiceViewSet(SettledInvoiceViewMixin, ModelViewSet):
                 res_serializer = SalesInvoiceSerializer(sales_invoice)
                 return Response(res_serializer.data, status=status.HTTP_201_CREATED)
 
+            except exceptions.APIException:
+                # Let a validation error through. is_valid(raise_exception=True)
+                # raises one, and the blanket handler below was turning it into
+                # a 500 with no message - so every reason a payload was
+                # rejected, down to which extra charge was wrong, was lost.
+                raise
+
             except Exception as error:
                 print(error)
                 return Response({
@@ -598,6 +691,13 @@ class SalesInvoiceViewSet(SettledInvoiceViewMixin, ModelViewSet):
                 res_serializer = SalesInvoiceSerializer(sales_invoice)
                 return Response(res_serializer.data, status=status.HTTP_200_OK)
 
+            except exceptions.APIException:
+                # Let a validation error through. is_valid(raise_exception=True)
+                # raises one, and the blanket handler below was turning it into
+                # a 500 with no message - so every reason a payload was
+                # rejected, down to which extra charge was wrong, was lost.
+                raise
+
             except Exception as error:
                 print(error)
                 return Response({
@@ -626,6 +726,81 @@ class SalesInvoiceViewSet(SettledInvoiceViewMixin, ModelViewSet):
         return Response(payload, status=status.HTTP_200_OK)
 
     ### a counter sale gets a name when it is printed
+    @action(['POST'], detail=True, url_path='cancel', url_name='cancel')
+    def cancel(self, request, pk=None):
+        """
+        Cancel an invoice and return its goods to stock.
+
+        The one status transition a person makes: every other value is derived
+        from the invoice's contents, so cancelling is an action rather than a
+        field. A cancelled invoice is not a debt, so it also leaves the party's
+        khaata.
+        """
+        business = get_active_business(request)
+        if not business:
+            return Response(
+                {'detail': 'No active business exists. Please contact admin.'},
+                status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            invoice = self.get_object()
+            if invoice.status in SalesInvoice.CANCELLED_STATUSES:
+                return Response({'detail': 'This invoice is already cancelled.'},
+                                status=status.HTTP_400_BAD_REQUEST)
+
+            with transaction.atomic():
+                # Stock first: restockOnCancel reads the deduction ledger, and
+                # it is cleared here so un-cancelling deducts exactly once more.
+                restockOnCancel(invoice)
+                invoice.status = 'X'
+                SalesInvoice.objects.filter(pk=invoice.pk).update(status='X')
+                # A cancelled sale paid out no charges: their expenses go too.
+                sync_charge_expenses(invoice)
+
+            invoice.refresh_from_db()
+            return Response(SalesInvoiceSerializer(invoice).data,
+                            status=status.HTTP_200_OK)
+        except Exception as error:
+            print(error)
+            return Response({'detail': 'Internal Server Error.'},
+                            status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    @action(['POST'], detail=True, url_path='uncancel', url_name='uncancel')
+    def uncancel(self, request, pk=None):
+        """
+        Reinstate a cancelled invoice: the status goes back to being derived
+        from its lines, and the goods leave stock again.
+        """
+        business = get_active_business(request)
+        if not business:
+            return Response(
+                {'detail': 'No active business exists. Please contact admin.'},
+                status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            invoice = self.get_object()
+            if invoice.status not in SalesInvoice.CANCELLED_STATUSES:
+                return Response({'detail': 'This invoice is not cancelled.'},
+                                status=status.HTTP_400_BAD_REQUEST)
+
+            with transaction.atomic():
+                # Out of the manual state first, so recalculate_status stops
+                # treating it as sticky and can derive from the lines again.
+                invoice.status = 'D'
+                SalesInvoice.objects.filter(pk=invoice.pk).update(status='D')
+                invoice.recalculate_status()
+                updateInventoryOnSale(invoice)
+                # And the charge expenses come back, if it has been paid.
+                sync_charge_expenses(invoice)
+
+            invoice.refresh_from_db()
+            return Response(SalesInvoiceSerializer(invoice).data,
+                            status=status.HTTP_200_OK)
+        except Exception as error:
+            print(error)
+            return Response({'detail': 'Internal Server Error.'},
+                            status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
     @action(['POST'], detail=True, url_path='capture-customer', url_name='capture-customer')
     def capture_customer(self, request, pk=None):
         """
@@ -651,9 +826,10 @@ class SalesInvoiceViewSet(SettledInvoiceViewMixin, ModelViewSet):
         try:
             with transaction.atomic():
                 customer = serializer.save()
-                # .update() rather than invoice.save(): moving the buyer must
-                # not fire updateInventoryOnSale, which would take a stock
-                # deduction pass as a side effect of a name change.
+                # .update() rather than invoice.save(): a one-column write, and
+                # nothing else should be touched by a change of buyer. It used
+                # to be here to dodge a post_save receiver that ran a stock
+                # deduction pass on any invoice save; that receiver is gone.
                 SalesInvoice.objects.filter(pk=invoice.pk).update(customer=customer)
 
             invoice.refresh_from_db()
@@ -676,7 +852,7 @@ class SalesInvoiceItemViewSet(ModelViewSet):
 
     filter_backends = [SearchFilter, DjangoFilterBackend]
     filterset_fields = [
-        'sales_invoice__id', 'sales_invoice__invoice_number', 'is_deducted', 'is_partially_deducted',
+        'sales_invoice__id', 'sales_invoice__invoice_number', 'is_deducted',
         'product__name', 'product__base__name', 'track_code', 'unit_price', 'quantity_received'
     ]
     search_fields = [
@@ -765,6 +941,9 @@ class SalesReceiptsViewSet(ModelViewSet):
     
     def get_serializer_context(self):
         return {
+            # See PurchaseReceiptsViewSet: without request, a payment's image
+            # is a host-less path the frontend cannot load.
+            'request': self.request,
             "sales_invoice_id": self.kwargs['sales_invoice_pk']
         }
 
@@ -806,8 +985,16 @@ class SalesKPIViewSet(GenericViewSet):
                     'detail': 'No active business exists. Please contact admin.'
                 }, status=status.HTTP_400_BAD_REQUEST)
 
-            total_invoices = SalesInvoice.objects.total_invoices(
-                business.id, 1)
+            # Dated on the invoice, not on created_at. total_invoices() went
+            # through BaseQuerySet.in_period, which filters created_at over a
+            # rolling 24 hours, so an invoice backdated to yesterday was
+            # counted today and a late-entered one was counted on the wrong
+            # day. invoice_count() filters date_issued and drops cancelled
+            # invoices - the same fix daily-total-items and
+            # monthly-total-purchase-invoices already carry.
+            today = timezone.localdate()
+            total_invoices = SalesInvoice.objects.invoice_count(
+                business.id, today, today)
             return Response({
                 "total_invoices": total_invoices
             }, status=status.HTTP_200_OK)
@@ -1194,7 +1381,7 @@ class PurchaseQuotationItemViewSet(ModelViewSet):
     filter_backends = [SearchFilter, DjangoFilterBackend]
     '''
     filterset_fields = [
-        'sales_invoice__id', 'sales_invoice__invoice_number', 'is_deducted', 'is_partially_deducted',
+        'sales_invoice__id', 'sales_invoice__invoice_number', 'is_deducted',
         'product__name', 'product__base__name', 'track_code', 'unit_price', 'quantity_received'
     ]
     search_fields = [
@@ -1242,3 +1429,87 @@ class PurchaseQuotationItemViewSet(ModelViewSet):
             return Response({
                 "detail": "Internal Server Error"
             }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+class InvoiceImageViewSet(ModelViewSet):
+    """
+    The photos on one invoice: list them, upload one, delete one.
+
+    Base class for the two nested routes below. Which invoice is read from the
+    URL and scoped to the active business - not taken from the payload - so a
+    photo cannot be attached to another business's invoice by sending its id.
+
+    DRF's default parsers already accept multipart, so no parser_classes are
+    needed for the upload.
+    """
+
+    serializer_class = InvoiceImageSerializer
+
+    # Set by the two subclasses: the FK column on InvoiceImage, and the URL
+    # kwarg the nested router supplies.
+    invoice_field = None
+    url_kwarg = None
+    invoice_model = None
+
+    def get_invoice(self):
+        """The parent invoice, or None if it is not this business's."""
+        business = get_active_business(self.request)
+        if not business:
+            return None
+        return self.invoice_model.objects.filter(
+            id=self.kwargs[self.url_kwarg], business_id=business.id
+        ).first()
+
+    def get_queryset(self):
+        invoice = self.get_invoice()
+        if not invoice:
+            return InvoiceImage.objects.none()
+        return InvoiceImage.objects.filter(**{self.invoice_field: invoice.id})
+
+    def get_serializer_context(self):
+        # request is what turns the stored path into an absolute URL. A context
+        # without it replaces DRF's default and every image comes back as a
+        # bare /media/... path the frontend cannot load.
+        return {'request': self.request}
+
+    def create(self, request, *args, **kwargs):
+        invoice = self.get_invoice()
+        if not invoice:
+            return Response({'detail': 'Not Found.'},
+                            status=status.HTTP_404_NOT_FOUND)
+
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            serializer.save(**{
+                self.invoice_field: invoice,
+                'uploaded_by': request.user,
+            })
+            return Response(serializer.data, status=status.HTTP_201_CREATED)
+        except Exception as error:
+            print(error)
+            return Response({'detail': 'Internal Server Error.'},
+                            status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    def perform_destroy(self, instance):
+        # The file goes with the row. Django stopped deleting files on
+        # delete() in 1.3, so an untouched default leaves the storage filling
+        # up with photos no invoice references any more.
+        stored = instance.image
+        instance.delete()
+        if stored:
+            stored.delete(save=False)
+
+
+class SalesInvoiceImageViewSet(InvoiceImageViewSet):
+
+    invoice_field = 'sales_invoice'
+    url_kwarg = 'sales_invoice_pk'
+    invoice_model = SalesInvoice
+
+
+class PurchaseInvoiceImageViewSet(InvoiceImageViewSet):
+
+    invoice_field = 'purchase_invoice'
+    url_kwarg = 'purchase_invoice_pk'
+    invoice_model = PurchaseInvoice

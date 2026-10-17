@@ -1,5 +1,6 @@
 from rest_framework_nested.routers import NestedDefaultRouter, DefaultRouter
 from .views import (
+    PurchaseInvoiceImageViewSet,
     PurchaseInvoiceItemViewSet, 
     PurchaseInvoiceViewSet,
     PurchaseQuotationItemViewSet,
@@ -7,6 +8,7 @@ from .views import (
     PurchaseReceiptsViewSet,
     PurchasesKPIViewSet,
     ReturnedItemsKPIViewSet, 
+    SalesInvoiceImageViewSet,
     SalesInvoiceItemViewSet, 
     SalesInvoiceViewSet,
     ReturnedItemsViewSet,
@@ -27,10 +29,12 @@ router.register('returned-items-kpis', ReturnedItemsKPIViewSet, basename='return
 purchase_invoice_router = NestedDefaultRouter(router, 'purchase-invoices', lookup='purchase_invoice')
 purchase_invoice_router.register('items', PurchaseInvoiceItemViewSet, basename='purchase_invoice_items')
 purchase_invoice_router.register('payments', PurchaseReceiptsViewSet, basename='payment_receipts')
+purchase_invoice_router.register('images', PurchaseInvoiceImageViewSet, basename='purchase_invoice_images')
 
 sales_invoice_router = NestedDefaultRouter(router, 'sales-invoices', lookup='sales_invoice')
 sales_invoice_router.register('items', SalesInvoiceItemViewSet, basename='sales_invoice_items')
 sales_invoice_router.register('payments', SalesReceiptsViewSet, basename='payment_reciepts')
+sales_invoice_router.register('images', SalesInvoiceImageViewSet, basename='sales_invoice_images')
 
 quotations_router = NestedDefaultRouter(router, 'purchase-quotations', lookup='purchase_quotation')
 quotations_router.register('items', PurchaseQuotationItemViewSet, basename='purchase_quotation_items')

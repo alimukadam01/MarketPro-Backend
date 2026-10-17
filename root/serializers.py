@@ -499,6 +499,26 @@ class ExpenseSerializer(serializers.ModelSerializer):
     # so the detail response carried neither and the form fell back to blank.
     paid_from = serializers.SerializerMethodField()
     paid_on = serializers.SerializerMethodField()
+    # So a screen can lock an expense the invoice owns, and say which invoice.
+    is_invoice_charge = serializers.BooleanField(read_only=True)
+    sales_invoice = serializers.PrimaryKeyRelatedField(read_only=True)
+
+    def validate_category(self, value):
+        # Made by the system for invoice extra charges, and kept in step with
+        # the invoice; one typed in by hand would be neither.
+        if value == Expense.INVOICE_CHARGE_CATEGORY:
+            raise serializers.ValidationError(
+                'Invoice extra charge expenses are recorded from the invoice. '
+                'Pick another category.')
+        return value
+
+    def validate(self, attrs):
+        if self.instance is not None and self.instance.is_invoice_charge:
+            raise serializers.ValidationError({
+                'detail': 'This expense is an extra charge on a sales invoice. '
+                          'Change the charge on the invoice instead.'
+            })
+        return super().validate(attrs)
 
     def _transaction(self, expense):
         return getattr(expense, 'transaction_record', None)
@@ -516,7 +536,7 @@ class ExpenseSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'business', 'name', 'category', 'desc',
             'amount', 'created_at', 'account', 'date',
-            'paid_from', 'paid_on',
+            'paid_from', 'paid_on', 'is_invoice_charge', 'sales_invoice',
         ]
 
     def create(self, validated_data):
