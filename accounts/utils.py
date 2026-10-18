@@ -732,44 +732,6 @@ def daily_summary(business_id, day):
 
 # ── Munafa ────────────────────────────────────────────────────────────────────
 
-def revenue_net_of_notes(business_id, date_from, date_to, customer_id=None,
-                         created_by_id=None, status=None):
-    """
-    Invoiced sales revenue, less customer credit notes and plus customer debit
-    notes in the window (credit-debit-notes plan, 5.5). The targets catalogue
-    resolves sales_revenue here.
-
-    Lives in accounts because it spans two apps: sales cannot import accounts.
-    Filtering by invoice status leaves notes out - a note has no invoice
-    status. Filtering by who entered it applies to notes too.
-    """
-    value = SalesInvoice.objects.revenue(
-        business_id, date_from, date_to, customer_id=customer_id,
-        created_by_id=created_by_id, status=status)
-    if status is not None:
-        return value
-    return value + Transaction.objects.note_adjustment(
-        business_id, 'customer', date_from, date_to,
-        party_id=customer_id, created_by_id=created_by_id)
-
-
-def purchase_value_net_of_notes(business_id, date_from, date_to,
-                                supplier_id=None, created_by_id=None,
-                                status=None):
-    """
-    Invoiced purchase value, less supplier credit notes and plus supplier
-    debit notes in the window. The supplier-side twin of revenue_net_of_notes.
-    """
-    value = PurchaseInvoice.objects.purchase_value(
-        business_id, date_from, date_to, supplier_id=supplier_id,
-        created_by_id=created_by_id, status=status)
-    if status is not None:
-        return value
-    return value + Transaction.objects.note_adjustment(
-        business_id, 'supplier', date_from, date_to,
-        party_id=supplier_id, created_by_id=created_by_id)
-
-
 def profit_estimate(business_id, date_from, date_to):
     """
     Revenue less cost of goods sold less expenses. An estimate only — it is

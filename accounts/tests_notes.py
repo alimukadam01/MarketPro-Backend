@@ -15,10 +15,11 @@ from .models import (
 )
 from .settlement import settle_parties
 from .tests_settlement import noon
+from targets.catalogue import get_spec
+
 from .utils import (
     customer_balance, daily_summary, day_book, payables, profit_estimate,
-    purchase_value_net_of_notes, receivables, revenue_net_of_notes,
-    supplier_balance,
+    receivables, supplier_balance,
 )
 
 User = get_user_model()
@@ -332,17 +333,23 @@ class NotesAPITests(TestCase):
         self.assertEqual(after['supplier_credits'], 9000)
         self.assertEqual(after['profit'] - before['profit'], 6000)
 
-    def test_target_figures_net_off_notes_unless_filtered_by_status(self):
+    def test_target_figures_count_invoices_only(self):
+        # A note is not attached to an invoice, so counting it would put it
+        # in the period it was written rather than the purchase's.
         start, end = datetime.date(2026, 4, 1), datetime.date(2026, 4, 30)
         self.purchase('INV-1', 50000, (2026, 4, 2))
         self.create_note(amount=8000)
-        self.assertEqual(purchase_value_net_of_notes(
-            self.business.id, start, end), 42000)
-        self.assertEqual(purchase_value_net_of_notes(
-            self.business.id, start, end, supplier_id=self.jotun.id), 42000)
-        self.assertEqual(purchase_value_net_of_notes(
-            self.business.id, start, end, status='R'), 50000)
-        self.assertEqual(revenue_net_of_notes(self.business.id, start, end), 0)
+        self.create_note(type='supplier_debit_note', amount=1000)
+        self.client.post('/transactions/', {
+            'type': 'customer_credit_note', 'amount': 3000,
+            'date': '2026-04-15', 'customer': self.amir.id}, format='json')
+
+        purchase_value = get_spec('purchase_value').resolver
+        sales_revenue = get_spec('sales_revenue').resolver
+        self.assertEqual(purchase_value(self.business.id, start, end), 50000)
+        self.assertEqual(purchase_value(
+            self.business.id, start, end, supplier_id=self.jotun.id), 50000)
+        self.assertEqual(sales_revenue(self.business.id, start, end), 0)
 
     def test_pending_invoice_count_follows_the_khaata(self):
         self.purchase('P-1', 10000, (2026, 1, 1))

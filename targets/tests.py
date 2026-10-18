@@ -260,9 +260,8 @@ class ProgressTests(TestCase):
         self.assertEqual(row['period_label'], 'Q3 2026')
         self.assertEqual(row['scope_label'], 'Whole business')
         self.assertEqual(row['date_basis_label'], 'Invoice date')
-        # Purchase value is no longer gross: supplier notes net it down
-        # (credit-debit-notes plan, 5.5), and the label says so.
-        self.assertIn('supplier credit notes', row['returns_treatment'])
+        # Purchase value counts invoices only, and the label says so.
+        self.assertIn('notes are not counted', row['returns_treatment'])
         self.assertEqual(row['unit'], 'amount')
 
 
