@@ -45,27 +45,22 @@ def _catalogue():
         PurchaseInvoice, PurchaseInvoiceItem, SalesInvoice, SalesInvoiceItem,
     )
     from accounts.models import Transaction
-    # Revenue and purchase value include credit and debit notes, which live in
-    # accounts; sales cannot import accounts, so the combined figure is owned
-    # there.
-    from accounts.utils import (
-        purchase_value_net_of_notes, revenue_net_of_notes,
-    )
 
     specs = (
         DataPointSpec(
             code='sales_revenue',
             label='Sales revenue',
             unit='amount',
-            resolver=revenue_net_of_notes,
+            resolver=SalesInvoice.objects.revenue,
             allowed_filters=('customer', 'entered_by', 'invoice_status'),
             allowed_subjects=('customer', 'employee'),
             date_basis_label='Invoice date',
+            # Invoices only. Credit and debit notes are not attached to an
+            # invoice, so they could only be counted on their own date - a
+            # note for September's sale would move October's figure.
             returns_treatment='Cancelled invoices are always excluded. Drafts '
                               'are counted, as they are on the Sales page. '
-                              'Customer credit notes are subtracted and debit '
-                              "notes added, on the note's date - except when "
-                              'filtered by invoice status.',
+                              'Credit and debit notes are not counted.',
         ),
         DataPointSpec(
             code='sales_invoice_count',
@@ -94,15 +89,14 @@ def _catalogue():
             code='purchase_value',
             label='Purchase value',
             unit='amount',
-            resolver=purchase_value_net_of_notes,
+            resolver=PurchaseInvoice.objects.purchase_value,
             allowed_filters=('supplier', 'entered_by', 'invoice_status'),
             allowed_subjects=('supplier', 'employee'),
             date_basis_label='Invoice date',
+            # Invoices only, as for sales_revenue above.
             returns_treatment='Cancelled invoices are always excluded. '
-                              'Purchase invoices cannot record a discount; '
-                              'supplier credit notes are subtracted and debit '
-                              "notes added, on the note's date - except when "
-                              'filtered by invoice status.',
+                              'Purchase invoices cannot record a discount. '
+                              'Credit and debit notes are not counted.',
         ),
         DataPointSpec(
             code='purchase_invoice_count',
