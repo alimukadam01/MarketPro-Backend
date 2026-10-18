@@ -27,7 +27,12 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 SECRET_KEY = 'django-insecure-n)ih+0wkoxbkcx4#s+ni9@hu9_ojy(rt+f%624^0ulcmi%gf28'
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = False
+# Read from the environment, never committed per branch: a value committed on
+# dev was merged into production once and took the live site onto SQLite.
+# Off unless .env sets DJANGO_DEBUG=true, so a server without the line runs
+# as production. DEBUG also picks the database below - a machine whose .env
+# holds the RDS credentials must set DJANGO_DEBUG=true to stay on SQLite.
+DEBUG = os.getenv('DJANGO_DEBUG', 'false').strip().lower() == 'true'
 
 ALLOWED_HOSTS = [
     'localhost', 
