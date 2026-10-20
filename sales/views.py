@@ -2,6 +2,7 @@ from calendar import monthrange
 from datetime import datetime
 
 from django.db import transaction
+from django.db.models import Avg, Count, F, Sum
 from django.utils import timezone
 
 from rest_framework import exceptions, status
@@ -12,6 +13,10 @@ from rest_framework.filters import SearchFilter
 from django_filters.rest_framework import DjangoFilterBackend
 
 from root.serializers import CaptureCustomerSerializer
+from root.periods import (
+    TREND_PERIODS, PeriodFilterMixin, daily_trend, hourly_trend,
+    in_period, is_filtered, period_from_params, period_payload,
+)
 from root.utils import get_active_business
 from inventory.models import InventoryItem
 from accounts.models import PartyPayment, Transaction
@@ -182,7 +187,7 @@ class SettledInvoiceViewMixin:
                             status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
-class PurchaseInvoiceViewSet(SettledInvoiceViewMixin, ModelViewSet):
+class PurchaseInvoiceViewSet(PeriodFilterMixin, SettledInvoiceViewMixin, ModelViewSet):
 
     filter_backends = [SearchFilter, DjangoFilterBackend]
     # A FilterSet rather than filterset_fields, so payment_status can be
@@ -205,6 +210,51 @@ class PurchaseInvoiceViewSet(SettledInvoiceViewMixin, ModelViewSet):
         ).prefetch_related(
             'payment_receipts__transaction_record', 'invoice_items'
         ).order_by('-created_at')
+
+    # The page's period switch narrows the table on the invoice date.
+    period_lookup = 'date_issued__date'
+
+    @action(['GET'], detail=False, url_path='summary', url_name='summary')
+    def summary(self, request):
+        """
+        The Purchases cards, worked out from the rows the table shows: its
+        search, its filters and the period. The dashboard calls it with a
+        period alone.
+        """
+        business = get_active_business(request)
+        if not business:
+            return Response({
+                'detail': 'No active business exists. Please contact admin.'
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        period, start, end = period_from_params(request.query_params)
+        live = self.filter_queryset(self.get_queryset()).exclude(
+            status__in=PurchaseInvoice.CANCELLED_STATUSES)
+        figures = live.aggregate(invoiced=Sum('total'), count=Count('id'))
+
+        return Response({
+            'purchases_invoiced': round(figures['invoiced'] or 0),
+            'invoices_raised': figures['count'],
+            'payments_made': round(self._money_paid(request, business, start, end)),
+            'filtered': is_filtered(request),
+            'period': period_payload(period, start, end),
+        }, status=status.HTTP_200_OK)
+
+    def _money_paid(self, request, business, start, end):
+        # Unfiltered, this is all money paid for purchases in the period, on
+        # account included - the figure the old card showed. A search or a
+        # filter selects invoices, and money paid on account names none, so
+        # then only payments against the matching invoices can count.
+        if not is_filtered(request):
+            return Transaction.objects.money_for_types(
+                business.id, Transaction.PURCHASE_MONEY_TYPES, start, end)
+        matched = self.filter_queryset_without_period(self.get_queryset())
+        money = Transaction.objects.filter(
+            business_id=business.id,
+            purchase_receipt__purchase_invoice__in=matched,
+        ).cleared()
+        return in_period(money, 'date', start, end).aggregate(
+            total=Sum('amount'))['total'] or 0
 
     def get_serializer_class(self):
         method = self.request.method
@@ -550,7 +600,7 @@ class PurchasesKPIViewSet(GenericViewSet):
         }, status=status.HTTP_405_METHOD_NOT_ALLOWED)
 
 
-class SalesInvoiceViewSet(SettledInvoiceViewMixin, ModelViewSet):
+class SalesInvoiceViewSet(PeriodFilterMixin, SettledInvoiceViewMixin, ModelViewSet):
 
     filter_backends = [SearchFilter, DjangoFilterBackend]
     # A FilterSet rather than filterset_fields, so payment_status can be
@@ -576,6 +626,62 @@ class SalesInvoiceViewSet(SettledInvoiceViewMixin, ModelViewSet):
         ).prefetch_related(
             'payment_receipts__transaction_record', 'invoice_items'
         ).order_by("-created_at")
+
+    # The page's period switch narrows the table on the invoice date.
+    period_lookup = 'date_issued__date'
+
+    @action(['GET'], detail=False, url_path='summary', url_name='summary')
+    def summary(self, request):
+        """
+        The Sales cards, worked out from the rows the table shows: its search,
+        its filters and the period. The dashboard calls it with a period
+        alone.
+
+        Sales invoiced is what was billed; payments received is the money that
+        came in. They differ by everything sold on credit and every old debt
+        paid off, which is why they are two cards.
+        """
+        business = get_active_business(request)
+        if not business:
+            return Response({
+                'detail': 'No active business exists. Please contact admin.'
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        period, start, end = period_from_params(request.query_params)
+        live = self.filter_queryset(self.get_queryset()).exclude(
+            status__in=SalesInvoice.CANCELLED_STATUSES)
+        # Avg drops the NULL totals of invoices with no lines, so an empty
+        # draft is not counted as an order worth nothing.
+        figures = live.aggregate(
+            invoiced=Sum('total'), average=Avg('total'), count=Count('id'))
+        items = SalesInvoiceItem.objects.filter(sales_invoice__in=live).aggregate(
+            sold=Sum(F('quantity') - F('returned_quantity')))['sold']
+
+        return Response({
+            'sales_invoiced': round(figures['invoiced'] or 0),
+            'invoices_raised': figures['count'],
+            'items_sold': items or 0,
+            'average_order_value': round(figures['average'] or 0),
+            'payments_received': round(self._money_received(request, business, start, end)),
+            'filtered': is_filtered(request),
+            'period': period_payload(period, start, end),
+        }, status=status.HTTP_200_OK)
+
+    def _money_received(self, request, business, start, end):
+        # Unfiltered, this is all money received for sales in the period,
+        # khaata receipts included - the figure the old card showed. A search
+        # or a filter selects invoices, and a khaata receipt names none, so
+        # then only payments against the matching invoices can count.
+        if not is_filtered(request):
+            return Transaction.objects.money_for_types(
+                business.id, Transaction.SALES_MONEY_TYPES, start, end)
+        matched = self.filter_queryset_without_period(self.get_queryset())
+        money = Transaction.objects.filter(
+            business_id=business.id,
+            sales_receipt__sales_invoice__in=matched,
+        ).cleared()
+        return in_period(money, 'date', start, end).aggregate(
+            total=Sum('amount'))['total'] or 0
 
     def get_serializer_class(self):
         method = self.request.method
@@ -1094,6 +1200,39 @@ class SalesKPIViewSet(GenericViewSet):
             "detail": "Method not allowed"
         }, status=status.HTTP_405_METHOD_NOT_ALLOWED)
 
+    @action(['GET'], detail=False, url_name='sales-trend', url_path='sales-trend')
+    def sales_trend(self, request):
+        """
+        Sales money over the dashboard chart's period: by hour today, by day
+        for a week or a month, by week for a quarter, by month for a year.
+
+        Transaction.date carries no time, so today's hours go by when each
+        payment was entered.
+        """
+        business = get_active_business(request)
+        if not business:
+            return Response({
+                'detail': 'No active business exists. Please contact admin.'
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        period, start, end = period_from_params(
+            request.query_params, default='month', allowed=TREND_PERIODS)
+        money = in_period(
+            Transaction.objects.filter(
+                business_id=business.id,
+                type__in=Transaction.SALES_MONEY_TYPES,
+            ).cleared(),
+            'date', start, end)
+
+        if period == 'today':
+            trend = hourly_trend(money.values_list('created_at', 'amount'))
+        else:
+            trend = daily_trend(money.values_list('date', 'amount'), period, start, end)
+        return Response({
+            'trend': trend,
+            'period': period_payload(period, start, end),
+        }, status=status.HTTP_200_OK)
+
     # YEARLY METRICS
 
     # ALL TIME METRICS
@@ -1119,7 +1258,7 @@ class SalesKPIViewSet(GenericViewSet):
         }, status=status.HTTP_405_METHOD_NOT_ALLOWED)
 
 
-class ReturnedItemsViewSet(ModelViewSet):
+class ReturnedItemsViewSet(PeriodFilterMixin, ModelViewSet):
 
     filter_backends = [SearchFilter, DjangoFilterBackend]
     filterset_fields = [
@@ -1135,6 +1274,28 @@ class ReturnedItemsViewSet(ModelViewSet):
             return []
 
         return ReturnedItem.objects.filter(business_id=business.id).order_by('-created_at')
+
+    # A return has no date of its own, so the period goes by when it was
+    # recorded.
+    period_lookup = 'created_at__date'
+
+    @action(['GET'], detail=False, url_path='summary', url_name='summary')
+    def summary(self, request):
+        business = get_active_business(request)
+        if not business:
+            return Response({
+                'detail': 'No active business exists. Please contact admin.'
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        period, start, end = period_from_params(request.query_params)
+        figures = self.filter_queryset(self.get_queryset()).aggregate(
+            count=Count('id'), quantity=Sum('quantity'))
+        return Response({
+            'returned_items': figures['count'],
+            'returned_quantity': figures['quantity'] or 0,
+            'filtered': is_filtered(request),
+            'period': period_payload(period, start, end),
+        }, status=status.HTTP_200_OK)
 
     def get_serializer_class(self):
         if self.request.method in ('POST', 'PUT', 'PATCH'):

@@ -1,5 +1,5 @@
 from datetime import datetime
-from django.db.models import Exists, OuterRef, QuerySet
+from django.db.models import Count, Exists, OuterRef, QuerySet, Sum
 from django.utils import timezone
 from rest_framework import status
 from rest_framework.views import APIView
@@ -16,6 +16,10 @@ from core.utils import send_marketpro_email
 # root -> inventory, the same direction sales/ already uses. inventory.models
 # imports root.models, not root.views, so there is no cycle.
 from inventory.models import InventoryItem
+from .periods import (
+    TREND_PERIODS, PeriodFilterMixin, daily_trend, hourly_trend, in_period,
+    is_filtered, period_from_params, period_payload,
+)
 from .utils import get_active_business, whatsapp_number
 from .serializers import (
     BusinessCreateSerializer, CategorySerializer, CitySerializer, CustomerSerializer, EmployeeAndUserCreateSerializer, ExpenseSerializer, LocationSerializer,
@@ -407,11 +411,14 @@ class SupplierViewSet(ModelViewSet):
                 'detail': 'Not Found'
             }, status=status.HTTP_404_NOT_FOUND)
 
+        # Total Business follows the card's period; the balance never does.
+        period, start, end = period_from_params(request.query_params)
         try:
             return Response({
                 'balance': supplier_balance(supplier, business.id),
-                'total_business': round(
-                    party_invoiced(business.id, supplier=supplier)),
+                'total_business': round(party_invoiced(
+                    business.id, supplier=supplier, date_from=start, date_to=end)),
+                'period': period_payload(period, start, end),
                 # Reminders go out from this page too, and they must work
                 # without accounting access, so the wa.me number rides along.
                 'whatsapp': whatsapp_number(supplier.phone),
@@ -588,11 +595,14 @@ class CustomerViewSet(ModelViewSet):
                 'detail': 'Not Found'
             }, status=status.HTTP_404_NOT_FOUND)
 
+        # Total Business follows the card's period; the balance never does.
+        period, start, end = period_from_params(request.query_params)
         try:
             return Response({
                 'balance': customer_balance(customer, business.id),
-                'total_business': round(
-                    party_invoiced(business.id, customer=customer)),
+                'total_business': round(party_invoiced(
+                    business.id, customer=customer, date_from=start, date_to=end)),
+                'period': period_payload(period, start, end),
                 # Reminders go out from this page too, and they must work
                 # without accounting access, so the wa.me number rides along.
                 'whatsapp': whatsapp_number(customer.phone),
@@ -629,7 +639,7 @@ class CustomerKPIViewSet(GenericViewSet):
         }, status=status.HTTP_405_METHOD_NOT_ALLOWED)
 
 
-class ExpenseViewSet(ModelViewSet):
+class ExpenseViewSet(PeriodFilterMixin, ModelViewSet):
     serializer_class = ExpenseSerializer
     filter_backends = [SearchFilter, DjangoFilterBackend]
     filterset_fields = ['name', 'category', 'desc', 'amount']
@@ -643,6 +653,29 @@ class ExpenseViewSet(ModelViewSet):
             return []
 
         return Expense.objects.filter(business_id=business.id).order_by('-created_at')
+
+    # Expense has no date of its own (see expense_amount_in_range), so the
+    # period goes by when it was recorded.
+    period_lookup = 'created_at__date'
+
+    @action(['GET'], detail=False, url_path='summary', url_name='summary')
+    def summary(self, request):
+        """The Expenses cards, from the rows the table shows."""
+        business = get_active_business(request)
+        if not business:
+            return Response({
+                'detail': 'No active business exists. Please contact admin.'
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        period, start, end = period_from_params(request.query_params)
+        figures = self.filter_queryset(self.get_queryset()).aggregate(
+            count=Count('id'), amount=Sum('amount'))
+        return Response({
+            'expense_count': figures['count'],
+            'expense_amount': round(figures['amount'] or 0),
+            'filtered': is_filtered(request),
+            'period': period_payload(period, start, end),
+        }, status=status.HTTP_200_OK)
 
     def get_serializer_context(self):
         business = get_active_business(self.request)
@@ -707,7 +740,13 @@ class ExpenseKPIViewSet(GenericViewSet):
                     'detail': 'No active business exists. Please contact admin.'
                 }, status=status.HTTP_400_BAD_REQUEST)
 
-            monthly_total_expenses = Expense.objects.total_expenses(business.id)
+            # The calendar month, as the card says. This counted every
+            # expense the business had ever recorded.
+            start, end = month_bounds()
+            monthly_total_expenses = Expense.objects.filter(
+                business_id=business.id,
+                created_at__date__gte=start, created_at__date__lte=end,
+            ).count()
             return Response({
                 "monthly_total_expenses": monthly_total_expenses
             }, status=status.HTTP_200_OK)
@@ -767,6 +806,35 @@ class ExpenseKPIViewSet(GenericViewSet):
         return Response({
             "detail": "Method not allowed"
         }, status=status.HTTP_405_METHOD_NOT_ALLOWED)
+
+    @action(['GET'], detail=False, url_name='expenses-trend', url_path='expenses-trend')
+    def expenses_trend(self, request):
+        """
+        Expenses over the dashboard chart's period: by hour today, by day for
+        a week or a month, by week for a quarter, by month for a year. Dated
+        by when each expense was recorded, the only date an Expense has.
+        """
+        business = get_active_business(request)
+        if not business:
+            return Response({
+                'detail': 'No active business exists. Please contact admin.'
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        period, start, end = period_from_params(
+            request.query_params, default='month', allowed=TREND_PERIODS)
+        expenses = in_period(
+            Expense.objects.filter(business_id=business.id),
+            'created_at__date', start, end,
+        ).values_list('created_at', 'amount')
+
+        if period == 'today':
+            trend = hourly_trend(expenses)
+        else:
+            trend = daily_trend(expenses, period, start, end)
+        return Response({
+            'trend': trend,
+            'period': period_payload(period, start, end),
+        }, status=status.HTTP_200_OK)
 
 
 class MultiModelSearchView(APIView):

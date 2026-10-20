@@ -166,26 +166,34 @@ def previous_month_bounds(day=None):
 
 # ── Party balances ────────────────────────────────────────────────────────────
 
-def party_invoiced(business_id, customer=None, supplier=None):
+def party_invoiced(business_id, customer=None, supplier=None,
+                   date_from=None, date_to=None):
     """
     Everything billed to a party that is a debt: cancelled invoices never
     happened and drafts are not confirmed yet, so neither counts. The figure
     every balance starts from.
+
+    date_from / date_to bound it on the invoice date, for the Total Business
+    card's period. Balances never pass them: a balance is everything, ever.
     """
     if customer:
-        return (
+        invoices = (
             SalesInvoice.objects
             .filter(business_id=business_id, customer_id=customer.id)
             .exclude(status__in=NOT_A_DEBT_SALES_STATUSES)
-            .aggregate(total=Sum('total'))['total'] or 0
+        )
+    else:
+        invoices = (
+            PurchaseInvoice.objects
+            .filter(business_id=business_id, supplier_id=supplier.id)
+            .exclude(status__in=NOT_A_DEBT_PURCHASE_STATUSES)
         )
 
-    return (
-        PurchaseInvoice.objects
-        .filter(business_id=business_id, supplier_id=supplier.id)
-        .exclude(status__in=NOT_A_DEBT_PURCHASE_STATUSES)
-        .aggregate(total=Sum('total'))['total'] or 0
-    )
+    if date_from:
+        invoices = invoices.filter(date_issued__date__gte=date_from)
+    if date_to:
+        invoices = invoices.filter(date_issued__date__lte=date_to)
+    return invoices.aggregate(total=Sum('total'))['total'] or 0
 
 
 def _party_balance(business_id, kind, party, receipts):
@@ -578,13 +586,17 @@ def party_ledger(business_id, customer=None, supplier=None,
 
 # ── Roznamcha ─────────────────────────────────────────────────────────────────
 
-def day_book(business_id, day):
+def day_book(business_id, day, date_to=None):
     """
     The roznamcha: one day, grouped by account, with opening and closing
     balances and totals (§6.7).
+
+    With date_to it covers day..date_to - the Book of Business - opening on
+    the balance the night before `day` and closing on the one at date_to.
     """
+    date_to = date_to or day
     previous_day = day - timedelta(days=1)
-    transactions = Transaction.objects.day_book(business_id, day)
+    transactions = Transaction.objects.day_book(business_id, day, date_to)
 
     accounts = MoneyAccount.objects.for_business(business_id).active()
     sections = []
@@ -621,6 +633,7 @@ def day_book(business_id, day):
 
             rows.append({
                 'id': txn.id,
+                'date': txn.date.isoformat() if txn.date else None,
                 'type': txn.type,
                 'amount': txn.amount,
                 'payment_method': txn.payment_method,
@@ -648,25 +661,32 @@ def day_book(business_id, day):
 
     return {
         'date': day.isoformat(),
+        'date_from': day.isoformat(),
+        'date_to': date_to.isoformat(),
         'accounts': sections,
         'total_money_in': total_in,
         'total_money_out': total_out,
     }
 
 
-def daily_summary(business_id, day):
+def daily_summary(business_id, day, date_to=None):
     """
     The end-of-day picture (§6.9) — what came in, what went out, what is left,
     and what is owed.
+
+    With date_to it summarises day..date_to (the Book of Business). Receivable
+    and payable stay as they stand today: they are balances, not flows.
     """
-    book = day_book(business_id, day)
-    totals = Transaction.objects.totals_by_type(business_id, day, day)
+    date_to = date_to or day
+    book = day_book(business_id, day, date_to)
+    totals = Transaction.objects.totals_by_type(business_id, day, date_to)
     salary_expenses = Transaction.objects.salary_expense_total(
-        business_id, day, day)
+        business_id, day, date_to)
 
     credit_extended = (
         SalesInvoice.objects
-        .filter(business_id=business_id, date_issued__date=day)
+        .filter(business_id=business_id,
+                date_issued__date__gte=day, date_issued__date__lte=date_to)
         # A draft extends no credit yet (plan D11).
         .exclude(status__in=NOT_A_DEBT_SALES_STATUSES)
         .aggregate(total=Sum('total'))['total'] or 0
@@ -683,11 +703,13 @@ def daily_summary(business_id, day):
             'type': txn.type,
         }
         for txn in Transaction.objects.pending_cheques(business_id)
-        .filter(cheque_due_date__lte=day)
+        .filter(cheque_due_date__lte=date_to)
     ]
 
     return {
         'date': day.isoformat(),
+        'date_from': day.isoformat(),
+        'date_to': date_to.isoformat(),
         'accounts': [
             {
                 'account_name': section['account_name'],
@@ -726,7 +748,7 @@ def daily_summary(business_id, day):
         'total_receivable': receivables(business_id)['total'],
         'total_payable': payables(business_id)['total'],
         'pending_cheques': cheques_due,
-        'profit': profit_estimate(business_id, day, day),
+        'profit': profit_estimate(business_id, day, date_to),
     }
 
 
