@@ -35,6 +35,7 @@ from .models import (
     Product, ProductVariant, ProductVariantType, Supplier, Unit,
 )
 from .filters import GlobalSearch
+from .search.engine import search as global_search
 
 
 class CategoryViewSet(ReadOnlyModelViewSet):
@@ -859,6 +860,31 @@ class MultiModelSearchView(APIView):
         
         return Response(results, status=status.HTTP_200_OK)
     
+
+class GlobalSearchView(APIView):
+    """
+    GET /global-search/?q=<text> - the header's search box.
+
+    Every type the user may see, five hits each with a total, empty groups
+    left out. See root/search for how types are declared and matched.
+    """
+
+    def get(self, request):
+        business = get_active_business(request)
+        if not business:
+            return Response({
+                'detail': 'No active business exists. Please contact admin.'
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            return Response(
+                global_search(request, business, request.query_params.get('q', '')),
+                status=status.HTTP_200_OK)
+        except Exception as error:
+            print(f"There was an error performing the search: {error}")
+            return Response({'detail': 'Internal Server Error.'},
+                            status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
 
 class KeyPerformanceIndicatorsViewSet(ViewSet):
 
