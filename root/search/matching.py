@@ -9,6 +9,13 @@ Turning a query into a filter for one search type.
   choice   - the query is matched against each choice's LABEL and the
              matching codes are searched. A code is never matched as text:
              that is what made "c" match every completed invoice.
+
+A query of several words matches a record when every word matches one of
+its fields, not necessarily the same one: "Royal Fan White" finds the White
+variant of the Royal Fan, whose name and variant name are separate fields.
+The list pages' search boxes (DRF's SearchFilter) work the same way. The
+whole phrase still matches too, which is what finds a phone number typed
+with spaces in it.
 """
 import re
 from decimal import Decimal, InvalidOperation
@@ -70,8 +77,35 @@ def _digits_only(path):
 def build(search_type, query):
     """(Q, annotations) matching `query` for this type, or (None, {}) when
     nothing about the query can match it."""
-    condition = Q()
     annotations = {}
+    phrase = _match(search_type, query, annotations)
+
+    # Words with no letter or digit in them ("/", "-") would match almost
+    # anything, so they say nothing about what is wanted.
+    words = [word for word in query.split() if re.search(r"\w", word)]
+    if len(words) < 2:
+        return (phrase, annotations) if phrase is not None else (None, {})
+
+    every_word = Q()
+    for word in words:
+        part = _match(search_type, word, annotations)
+        if part is None:
+            # A word nothing on this type can match: no record has them all.
+            every_word = None
+            break
+        every_word &= part
+
+    condition = phrase
+    if every_word is not None:
+        condition = every_word if condition is None else condition | every_word
+    return (condition, annotations) if condition is not None else (None, {})
+
+
+def _match(search_type, query, annotations):
+    """The Q matching `query` as one term on any of this type's fields, or
+    None when none of them can. Phone annotations are added to
+    `annotations`; they depend only on the field, so words share them."""
+    condition = Q()
     matched_any = False
 
     for path in search_type.text_fields:
@@ -107,4 +141,4 @@ def build(search_type, query):
             condition |= Q(**{f"{path}__in": codes})
             matched_any = True
 
-    return (condition, annotations) if matched_any else (None, {})
+    return condition if matched_any else None

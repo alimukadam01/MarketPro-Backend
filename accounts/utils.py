@@ -802,13 +802,8 @@ def profit_estimate(business_id, date_from, date_to):
     expenses = (
         Expense.objects
         .filter(business_id=business_id)
-        .filter(
-            Q(transaction_record__date__gte=date_from,
-              transaction_record__date__lte=date_to) |
-            Q(transaction_record__isnull=True,
-              created_at__date__gte=date_from,
-              created_at__date__lte=date_to)
-        )
+        .with_expense_date()
+        .in_range('expense_date', date_from, date_to)
         .aggregate(total=Sum('amount'))['total'] or 0
     )
 

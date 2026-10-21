@@ -239,6 +239,20 @@ class MatchingTests(SearchFixture):
         self.assertIn(receipt.id, ids)
         self.assertIn("expense", self.groups(self.run_search("kiraya")))
 
+    def test_each_word_may_match_a_different_field(self):
+        unit = Product.objects.get(id=self.seeded["product"]).unit
+        fan = Product.objects.create(business=self.business, name="Royal Fan", unit=unit)
+        white = ProductVariant.objects.create(base=fan, name="No Name / White", sku="RF-1")
+        black = ProductVariant.objects.create(base=fan, name="Black", sku="RF-2")
+        # The product's name and the variant's name are separate fields.
+        ids = [h["id"] for h in self.groups(self.run_search("Royal Fan White"))["product_variant"]["hits"]]
+        self.assertIn(white.id, ids)
+        self.assertNotIn(black.id, ids)
+        # Every word has to match something.
+        self.assertNotIn("product_variant", self.groups(self.run_search("Royal Fan Purple")))
+        # A word that is only punctuation is ignored, not matched.
+        self.assertIn("product_variant", self.groups(self.run_search("Royal Fan / White")))
+
 
 class PermissionTests(SearchFixture):
     """T9."""

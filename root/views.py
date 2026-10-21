@@ -127,8 +127,12 @@ class ProductViewSet(ModelViewSet):
 
     filter_backends = [SearchFilter, DjangoFilterBackend]
     filterset_class = ProductFilter
+    # A product is found by its variants too: their names ("White / 1.5 Ton")
+    # and SKUs are what is printed on the invoice. Each word may match a
+    # different field, so "Royal Fan White" finds the fan with a White
+    # variant. SearchFilter de-duplicates across the variants join.
     search_fields = [
-        'id', 'name', 'desc', 'unit__name'
+        'id', 'name', 'code', 'desc', 'unit__name', 'variants__name', 'variants__sku',
     ]
 
     def get_queryset(self):
@@ -654,11 +658,15 @@ class ExpenseViewSet(PeriodFilterMixin, ModelViewSet):
         if not business:
             return []
 
-        return Expense.objects.filter(business_id=business.id).order_by('-created_at')
+        # Dated, sorted and period-switched by the day the money went out,
+        # which is what the transactions list shows for the same expense.
+        # created_at only breaks ties between expenses paid on one day.
+        return (Expense.objects.filter(business_id=business.id)
+                .with_expense_date()
+                .select_related('transaction_record__account')
+                .order_by('-expense_date', '-created_at'))
 
-    # Expense has no date of its own (see expense_amount_in_range), so the
-    # period goes by when it was recorded.
-    period_lookup = 'created_at__date'
+    period_lookup = 'expense_date'
 
     @action(['GET'], detail=False, url_path='summary', url_name='summary')
     def summary(self, request):
@@ -745,10 +753,11 @@ class ExpenseKPIViewSet(GenericViewSet):
             # The calendar month, as the card says. This counted every
             # expense the business had ever recorded.
             start, end = month_bounds()
-            monthly_total_expenses = Expense.objects.filter(
-                business_id=business.id,
-                created_at__date__gte=start, created_at__date__lte=end,
-            ).count()
+            monthly_total_expenses = (
+                Expense.objects.filter(business_id=business.id)
+                .with_expense_date()
+                .in_range('expense_date', start, end)
+                .count())
             return Response({
                 "monthly_total_expenses": monthly_total_expenses
             }, status=status.HTTP_200_OK)
@@ -773,11 +782,7 @@ class ExpenseKPIViewSet(GenericViewSet):
             # used as a number of days back: one day long on the 1st, and on
             # the 31st reaching into the previous month. It was never the
             # current month.
-            #
-            # Still dated on created_at, because that is the only date Expense
-            # has - no editable date, which is why an expense typed a week
-            # late lands in the wrong month. expense_amount_in_range says so
-            # on itself; fixing that needs a field, not a different call.
+            # Dated by the day the money went out (with_expense_date).
             start, end = month_bounds()
             monthly_total_expense_amount = Expense.objects.expense_amount_in_range(
                 business.id, start, end)
@@ -814,7 +819,7 @@ class ExpenseKPIViewSet(GenericViewSet):
         """
         Expenses over the dashboard chart's period: by hour today, by day for
         a week or a month, by week for a quarter, by month for a year. Dated
-        by when each expense was recorded, the only date an Expense has.
+        by the day the money went out (with_expense_date).
         """
         business = get_active_business(request)
         if not business:
@@ -825,14 +830,15 @@ class ExpenseKPIViewSet(GenericViewSet):
         period, start, end = period_from_params(
             request.query_params, default='month', allowed=TREND_PERIODS)
         expenses = in_period(
-            Expense.objects.filter(business_id=business.id),
-            'created_at__date', start, end,
-        ).values_list('created_at', 'amount')
+            Expense.objects.filter(business_id=business.id).with_expense_date(),
+            'expense_date', start, end,
+        )
 
         if period == 'today':
-            trend = hourly_trend(expenses)
+            # A paid date has no time of day; the hour is when it was entered.
+            trend = hourly_trend(expenses.values_list('created_at', 'amount'))
         else:
-            trend = daily_trend(expenses, period, start, end)
+            trend = daily_trend(expenses.values_list('expense_date', 'amount'), period, start, end)
         return Response({
             'trend': trend,
             'period': period_payload(period, start, end),

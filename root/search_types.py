@@ -137,6 +137,7 @@ register(SearchType(
     text_fields=["name", "desc", "sales_invoice__invoice_number"],
     number_fields=["id", "amount"],
     choice_fields={"category": None},
+    select_related=["transaction_record"],
     order_by=["-created_at", "-id"],
     priority=200,
     to_hit=lambda expense: Hit(
@@ -144,7 +145,7 @@ register(SearchType(
         title=expense.name,
         subtitle=expense.get_category_display(),
         amount=expense.amount,
-        date=expense.created_at,
+        date=expense.get_expense_date(),
         link=link("/expenses/update-expense", expense_id=expense.id),
     ),
 ))

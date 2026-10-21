@@ -170,10 +170,11 @@ class PeriodSwitchTests(TestCase):
         self.assertEqual(month['invoices_raised'], 1)
         self.assertEqual(month['payments_made'], 2500)
 
-    def test_expense_summary_goes_by_when_it_was_recorded(self):
+    def test_expense_summary_goes_by_when_it_was_paid(self):
         Expense.objects.create(business=self.business, name="Rent", category="kiraya", amount=50000)
         old = Expense.objects.create(business=self.business, name="Bill", category="bijli", amount=9000)
-        Expense.objects.filter(pk=old.pk).update(created_at=self.at(self.last_year))
+        # Entered today, paid last year: the paid date decides.
+        Transaction.objects.filter(expense=old).update(date=self.last_year)
 
         today = self.get('/expenses/summary/', period='today')
         self.assertEqual((today['expense_count'], today['expense_amount']), (1, 50000))

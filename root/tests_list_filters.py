@@ -116,6 +116,39 @@ class ExpenseFilterTests(ListFilterTests):
         self.assertIn(rent.id, self.ids("/expenses/", account=account.id))
 
 
+class ExpenseDateTests(ListFilterTests):
+    """An expense is dated by the day the money went out - its transaction's
+    date, which can be backdated - in the list and everywhere it is totted."""
+
+    def setUp(self):
+        super().setUp()
+        self.backdated = Expense.objects.create(business=self.business, name="Rent", category="kiraya", amount=700)
+        self.paid_on = self.today - timedelta(days=60)
+        Transaction.objects.filter(expense=self.backdated).update(date=self.paid_on)
+        self.current = Expense.objects.create(business=self.business, name="Bill", category="bijli", amount=300)
+
+    def test_the_list_shows_sorts_and_periods_by_the_paid_date(self):
+        rows = self.client.get("/expenses/").json()
+        self.assertEqual([row["id"] for row in rows], [self.current.id, self.backdated.id])
+        self.assertEqual(rows[1]["expense_date"], self.paid_on.isoformat())
+        self.assertEqual(self.ids("/expenses/", period="today"), {self.current.id})
+        old = {"date_from": self.paid_on.isoformat(), "date_to": self.paid_on.isoformat()}
+        self.assertEqual(self.ids("/expenses/", **old), {self.backdated.id})
+        summary = self.client.get("/expenses/summary/", old).json()
+        self.assertEqual(summary["expense_amount"], 700)
+
+    def test_the_list_names_the_account_it_was_paid_from(self):
+        row = next(r for r in self.client.get("/expenses/").json() if r["id"] == self.current.id)
+        account = Transaction.objects.get(expense=self.current).account
+        self.assertEqual(row["paid_from_name"], account.name)
+
+    def test_totals_follow_the_paid_date(self):
+        self.assertEqual(
+            Expense.objects.expense_amount_in_range(self.business.id, self.today, self.today), 300)
+        self.assertEqual(
+            Expense.objects.expense_amount_in_range(self.business.id, self.paid_on, self.paid_on), 700)
+
+
 class ReturnedItemFilterTests(ListFilterTests):
 
     def test_invoice_number_product_customer_type_and_damage(self):
@@ -172,6 +205,11 @@ class StockAndCatalogueFilterTests(ListFilterTests):
     def test_products_by_unit_and_status(self):
         self.assertEqual(self.ids("/products/", unit=self.unit.id), {self.paint.id})
         self.assertEqual(self.ids("/products/", is_active="false"), {self.putty.id})
+
+    def test_products_are_searched_by_their_variants(self):
+        # Words split across the product's name and a variant's name.
+        self.assertEqual(self.ids("/products/", search="Emulsion white"), {self.paint.id})
+        self.assertEqual(self.ids("/products/", search="F-2"), {self.putty.id})
 
     def test_customers_by_city(self):
         self.assertIn(self.ali_2.id, self.ids("/customers/", city=self.city2.id))
