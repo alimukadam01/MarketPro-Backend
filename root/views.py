@@ -35,6 +35,7 @@ from .models import (
     Product, ProductVariant, ProductVariantType, Supplier, Unit,
 )
 from .filters import GlobalSearch
+from .list_filters import CustomerFilter, ExpenseFilter, ProductFilter
 from .search.engine import search as global_search
 
 
@@ -125,7 +126,7 @@ class ProductVariantTypeViewSet(ReadOnlyModelViewSet):
 class ProductViewSet(ModelViewSet):
 
     filter_backends = [SearchFilter, DjangoFilterBackend]
-    filterset_fields = ['unit__name', 'is_active']
+    filterset_class = ProductFilter
     search_fields = [
         'id', 'name', 'desc', 'unit__name'
     ]
@@ -532,7 +533,7 @@ class LocationKPIViewSet(GenericViewSet):
 class CustomerViewSet(ModelViewSet):
 
     filter_backends = [SearchFilter, DjangoFilterBackend]
-    filterset_fields = ['city__name']
+    filterset_class = CustomerFilter
     search_fields = [
         'id', 'name', 'phone', 'email', 'address', 'city__name'
     ]
@@ -643,7 +644,7 @@ class CustomerKPIViewSet(GenericViewSet):
 class ExpenseViewSet(PeriodFilterMixin, ModelViewSet):
     serializer_class = ExpenseSerializer
     filter_backends = [SearchFilter, DjangoFilterBackend]
-    filterset_fields = ['name', 'category', 'desc', 'amount']
+    filterset_class = ExpenseFilter
     search_fields = [
         'id', 'name', 'category', 'desc', 'amount', 'created_at'
     ]

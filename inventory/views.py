@@ -6,6 +6,7 @@ from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework import status
 from root.utils import get_active_business
 from root.models import BaseQuerySet
+from .filters import InventoryItemFilter
 from .models import Inventory, InventoryItem
 from .serializers import AvailableProductSerializer, InventoryItemCreateSerializer, InventoryItemSerializer, InventoryItemUpdateSerializer, InventorySerializer
 
@@ -26,9 +27,7 @@ class InventoryViewSet(ModelViewSet):
 class InventoryItemsViewSet(ModelViewSet):
 
     filter_backends = [SearchFilter, DjangoFilterBackend]
-    filterset_fields = [
-        'inventory__id', 'location__name', 'product__base__name', 'product__name', 'track_code',
-    ]
+    filterset_class = InventoryItemFilter
     search_fields = [
         'id', 'location__name', 'product__base__name', 'product__name', 'track_code', 'unit_cost', 'unit_price'
     ]

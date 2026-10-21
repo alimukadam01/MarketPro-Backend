@@ -17,6 +17,7 @@ from root.periods import (
 from root.utils import get_active_business, whatsapp_number
 from sales.models import PurchaseReceipt, SalesInvoice, SalesReceipt
 from sales.utils import sync_charge_expenses
+from .filters import TransactionFilter
 from .models import MoneyAccount, PartyOpeningBalance, Transaction
 from .payments import (
     record_party_payment, resolve_party,
@@ -218,7 +219,7 @@ class TransactionViewSet(PeriodFilterMixin, ModelViewSet):
     # rather than adding to it.
     permission_classes = [IsAuthenticated, HasAccountingAccess]
     filter_backends = [SearchFilter, DjangoFilterBackend]
-    filterset_fields = ['type', 'status', 'payment_method', 'account', 'date']
+    filterset_class = TransactionFilter
     search_fields = ['id', 'reference', 'notes', 'type', 'amount']
 
     def get_queryset(self):

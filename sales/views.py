@@ -22,7 +22,9 @@ from inventory.models import InventoryItem
 from accounts.models import PartyPayment, Transaction
 from accounts.settlement import attach_settlement
 from accounts.utils import month_bounds, payables
-from .filters import PurchaseInvoiceFilter, SalesInvoiceFilter
+from .filters import (
+    PurchaseInvoiceFilter, PurchaseQuotationFilter, ReturnedItemFilter, SalesInvoiceFilter,
+)
 from .models import InvoiceImage, PurchaseInvoice, PurchaseInvoiceItem, PurchaseQuotation, PurchaseQuotationItem, PurchaseReceipt, ReturnedItem, SalesInvoice, SalesInvoiceItem, SalesReceipt
 from .utils import build_whatsapp_payload, invoice_room, overpaid_by, restockOnCancel, sync_charge_expenses, updateInventoryOnSale
 from .serializers import (
@@ -1261,9 +1263,7 @@ class SalesKPIViewSet(GenericViewSet):
 class ReturnedItemsViewSet(PeriodFilterMixin, ModelViewSet):
 
     filter_backends = [SearchFilter, DjangoFilterBackend]
-    filterset_fields = [
-        'invoice_item__sales_invoice__id', 'invoice_item__product__name', 'invoice_item__product__base__name', 'quantity'
-    ]
+    filterset_class = ReturnedItemFilter
     search_fields = [
         'id', 'invoice_item__sales_invoice__id', 'invoice_item__product__name', 'invoice_item__product__base__name'
     ]
@@ -1417,9 +1417,13 @@ class ReturnedItemsKPIViewSet(GenericViewSet):
 
 class PurchaseQuotationViewSet(ModelViewSet):
 
-    filter_backends = [SearchFilter]
+    filter_backends = [SearchFilter, DjangoFilterBackend]
+    filterset_class = PurchaseQuotationFilter
+    # 'status' and 'created_at' are out: an icontains on one-letter codes and
+    # on a timestamp matched almost everything. Status is a filter instead.
     search_fields = [
-        'id', 'quotation_no', 'status', 'notes', 'created_at'
+        'id', 'quotation_no', 'notes', 'items__product__name',
+        'items__product__base__name', 'items__supplier__name',
     ]
 
     def get_queryset(self):
@@ -1540,15 +1544,12 @@ class PurchaseQuotationViewSet(ModelViewSet):
 
 class PurchaseQuotationItemViewSet(ModelViewSet):
     filter_backends = [SearchFilter, DjangoFilterBackend]
-    '''
-    filterset_fields = [
-        'sales_invoice__id', 'sales_invoice__invoice_number', 'is_deducted',
-        'product__name', 'product__base__name', 'track_code', 'unit_price', 'quantity_received'
-    ]
+    # These were a copy of the sales invoice items' (sales_invoice__...),
+    # parked in a string; these are the quotation item's own.
+    filterset_fields = ['supplier', 'is_fulfilled', 'product']
     search_fields = [
-       'id', 'sales_invoice__id', 'sales_invoice__invoice_number', 'product__name', 'product__base__name', 'track_code', 'quantity_received', 'unit_price', 'discount'
+        'id', 'product__name', 'product__base__name', 'supplier__name', 'track_code', 'notes',
     ]
-    '''
 
     def get_queryset(self):
         return PurchaseQuotationItem.objects.filter(purchase_quotation_id=self.kwargs['purchase_quotation_pk'])
