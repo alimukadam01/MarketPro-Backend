@@ -173,8 +173,10 @@ class SalesInvoiceManager(models.Manager):
         # AND the denominator, so an itemless shell no longer counts as a zero
         # value order and drags the average down, while an invoice that really
         # totals 0.0 still counts. Returns 0 for a business with no invoices,
-        # matching total_sales above.
-        queryset = self.get_queryset().for_business(business_id)
+        # matching total_sales above. A cancelled invoice was never an order,
+        # so it stays out of the average as it does out of every other figure.
+        queryset = self.get_queryset().for_business(business_id).exclude(
+            status__in=self.model.CANCELLED_STATUSES)
 
         return int(queryset.aggregate(avg=Avg("total"))["avg"] or 0)
 

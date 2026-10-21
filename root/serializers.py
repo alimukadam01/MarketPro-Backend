@@ -499,6 +499,10 @@ class ExpenseSerializer(serializers.ModelSerializer):
     # so the detail response carried neither and the form fell back to blank.
     paid_from = serializers.SerializerMethodField()
     paid_on = serializers.SerializerMethodField()
+    # For the list: the account by name, and the expense's one date - the
+    # day the money went out, as the transactions list shows it.
+    paid_from_name = serializers.SerializerMethodField()
+    expense_date = serializers.SerializerMethodField()
     # So a screen can lock an expense the invoice owns, and say which invoice.
     is_invoice_charge = serializers.BooleanField(read_only=True)
     sales_invoice = serializers.PrimaryKeyRelatedField(read_only=True)
@@ -531,12 +535,21 @@ class ExpenseSerializer(serializers.ModelSerializer):
         transaction = self._transaction(expense)
         return transaction.date if transaction else None
 
+    def get_paid_from_name(self, expense):
+        transaction = self._transaction(expense)
+        account = transaction.account if transaction else None
+        return account.name if account else None
+
+    def get_expense_date(self, expense):
+        return expense.get_expense_date()
+
     class Meta:
         model = Expense
         fields = [
             'id', 'business', 'name', 'category', 'desc',
             'amount', 'created_at', 'account', 'date',
-            'paid_from', 'paid_on', 'is_invoice_charge', 'sales_invoice',
+            'paid_from', 'paid_on', 'paid_from_name', 'expense_date',
+            'is_invoice_charge', 'sales_invoice',
         ]
 
     def create(self, validated_data):

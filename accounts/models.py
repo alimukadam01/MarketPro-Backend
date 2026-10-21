@@ -392,13 +392,15 @@ class TransactionManager(models.Manager):
 
         return result
 
-    def day_book(self, business_id, day):
+    def day_book(self, business_id, day, date_to=None):
+        """The book's rows from `day` to `date_to` (just `day` without it),
+        in the order the money moved."""
         return (
             self.get_queryset()
             .for_business(business_id)
-            .filter(date=day)
+            .filter(date__gte=day, date__lte=date_to or day)
             .select_related('account', 'transfer_account')
-            .order_by('created_at')
+            .order_by('date', 'created_at')
         )
 
     def pending_cheques(self, business_id):

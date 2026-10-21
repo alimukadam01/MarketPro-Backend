@@ -150,10 +150,8 @@ def _catalogue():
             resolver=Expense.objects.expense_amount_in_range,
             allowed_filters=('expense_category',),
             allowed_subjects=(),
-            date_basis_label='Date recorded',
-            returns_treatment='None applicable. An expense carries only the '
-                              'date it was entered, so one recorded late falls '
-                              'in the month it was typed.',
+            date_basis_label='Date the money went out',
+            returns_treatment='None applicable.',
         ),
     )
 

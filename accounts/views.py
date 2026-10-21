@@ -1,5 +1,5 @@
 from django.db import transaction as db_transaction
-from django.db.models import Q
+from django.db.models import Q, Sum
 from django.utils import timezone
 from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework import status
@@ -10,9 +10,14 @@ from rest_framework.response import Response
 from rest_framework.viewsets import GenericViewSet, ModelViewSet
 
 from root.models import Customer, Expense, Supplier
+from root.periods import (
+    PeriodFilterMixin, in_period, is_filtered, period_from_params,
+    period_payload,
+)
 from root.utils import get_active_business, whatsapp_number
 from sales.models import PurchaseReceipt, SalesInvoice, SalesReceipt
 from sales.utils import sync_charge_expenses
+from .filters import TransactionFilter
 from .models import MoneyAccount, PartyOpeningBalance, Transaction
 from .payments import (
     record_party_payment, resolve_party,
@@ -207,14 +212,14 @@ class MoneyAccountViewSet(ModelViewSet):
             )
 
 
-class TransactionViewSet(ModelViewSet):
+class TransactionViewSet(PeriodFilterMixin, ModelViewSet):
 
     # HasAccountingAccess answers the module gate with a 403. It is listed
     # beside IsAuthenticated because permission_classes replaces the default
     # rather than adding to it.
     permission_classes = [IsAuthenticated, HasAccountingAccess]
     filter_backends = [SearchFilter, DjangoFilterBackend]
-    filterset_fields = ['type', 'status', 'payment_method', 'account', 'date']
+    filterset_class = TransactionFilter
     search_fields = ['id', 'reference', 'notes', 'type', 'amount']
 
     def get_queryset(self):
@@ -232,6 +237,35 @@ class TransactionViewSet(ModelViewSet):
             business_id=business.id
         ).select_related('account', 'transfer_account').order_by(
             '-date', '-created_at', '-id')
+
+    # The page's period switch narrows the table on the day the money moved.
+    period_lookup = 'date'
+
+    @action(['GET'], detail=False, url_path='summary', url_name='summary')
+    def summary(self, request):
+        """
+        Money in and money out across the rows the table shows - its search,
+        its filters and the period. Cleared money only, as on every cash
+        figure; a transfer between the shop's own accounts is neither.
+        """
+        business = get_active_business(request)
+        if not business:
+            return Response({
+                'detail': 'No active business exists. Please contact admin.'
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        period, start, end = period_from_params(request.query_params)
+        cleared = self.filter_queryset(self.get_queryset()).cleared()
+        money_in = cleared.filter(type__in=Transaction.IN_TYPES).aggregate(
+            total=Sum('amount'))['total'] or 0
+        money_out = cleared.filter(type__in=Transaction.OUT_TYPES).aggregate(
+            total=Sum('amount'))['total'] or 0
+        return Response({
+            'money_in': round(money_in),
+            'money_out': round(money_out),
+            'filtered': is_filtered(request),
+            'period': period_payload(period, start, end),
+        }, status=status.HTTP_200_OK)
 
     def get_serializer_class(self):
         method = self.request.method
@@ -821,10 +855,10 @@ class AccountingKPIViewSet(GenericViewSet):
         if guard_error:
             return guard_error
 
-        day = parse_date(request.query_params.get('date'), timezone.localdate())
+        day, date_to = self._book_range(request)
         try:
             return Response(
-                {'day_book': day_book(business.id, day)},
+                {'day_book': day_book(business.id, day, date_to)},
                 status=status.HTTP_200_OK
             )
         except Exception as error:
@@ -840,10 +874,10 @@ class AccountingKPIViewSet(GenericViewSet):
         if guard_error:
             return guard_error
 
-        day = parse_date(request.query_params.get('date'), timezone.localdate())
+        day, date_to = self._book_range(request)
         try:
             return Response(
-                {'daily_summary': daily_summary(business.id, day)},
+                {'daily_summary': daily_summary(business.id, day, date_to)},
                 status=status.HTTP_200_OK
             )
         except Exception as error:
@@ -852,6 +886,24 @@ class AccountingKPIViewSet(GenericViewSet):
                 {'detail': 'Internal Server Error.'},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
+
+    # The Book of Business periods: a book always has a first day, so there
+    # is no 'all'.
+    BOOK_PERIODS = ('today', 'week', 'month', 'quarter', 'year', 'custom')
+
+    def _book_range(self, request):
+        """(first day, last day) for the day book and its summary.
+
+        ?date= is the old single-day form and still works. ?period= (with
+        ?date_from= / ?date_to= for custom) is the Book of Business.
+        """
+        params = request.query_params
+        if params.get('period') or params.get('date_from'):
+            _, start, end = period_from_params(
+                params, default='today', allowed=self.BOOK_PERIODS)
+            return start, end
+        day = parse_date(params.get('date'), timezone.localdate())
+        return day, day
 
     @action(['GET'], detail=False, url_path='profit-estimate', url_name='profit-estimate')
     def profit_estimate(self, request):
@@ -862,15 +914,23 @@ class AccountingKPIViewSet(GenericViewSet):
         try:
             this_from, this_to = month_bounds()
             prev_from, prev_to = previous_month_bounds()
+            figures = {
+                'this_month': profit_estimate(
+                    business.id, this_from, this_to),
+                'previous_month': profit_estimate(
+                    business.id, prev_from, prev_to),
+                'is_estimate': True,
+            }
+            # The Ledgers card has a period switch; it asks with ?period=.
+            if request.query_params.get('period'):
+                period, start, end = period_from_params(
+                    request.query_params, default='month',
+                    allowed=('today', 'week', 'month', 'quarter', 'year'))
+                figures['selected'] = profit_estimate(business.id, start, end)
+                figures['period'] = period_payload(period, start, end)
             return Response(
                 {
-                    'profit_estimate': {
-                        'this_month': profit_estimate(
-                            business.id, this_from, this_to),
-                        'previous_month': profit_estimate(
-                            business.id, prev_from, prev_to),
-                        'is_estimate': True,
-                    }
+                    'profit_estimate': figures
                 },
                 status=status.HTTP_200_OK
             )

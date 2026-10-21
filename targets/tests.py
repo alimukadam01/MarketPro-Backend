@@ -441,15 +441,16 @@ class MeasurementTests(TestCase):
 
     # --- expenses --------------------------------------------------------
 
-    def test_expenses_are_dated_on_created_at(self):
+    def test_expenses_are_dated_on_the_day_they_were_paid(self):
         expense = Expense.objects.create(
             business=self.business, name='Bijli', amount=750)
-        # created_at is auto_now_add, so the row lands today. A Q3 target that
-        # contains today therefore sees it.
-        Expense.objects.filter(pk=expense.pk).update(
-            created_at=datetime(2026, 8, 15, 12, 0, tzinfo=dt_timezone.utc))
+        # Entered now (outside Q3), but paid in August: the paid date is the
+        # one the target counts, as the expense list and profit do.
+        Transaction.objects.filter(expense=expense).update(date=date(2026, 8, 15))
         target = self.q3(data_point='expenses')
         self.assertEqual(self.measure(target), 750)
+        Transaction.objects.filter(expense=expense).update(date=date(2026, 10, 1))
+        self.assertEqual(self.measure(target), 0)
 
 
 class TimezoneBoundaryTests(TestCase):

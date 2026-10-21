@@ -1,5 +1,5 @@
 from django.db import models
-from django.db.models.functions import TruncDate
+from django.db.models.functions import Coalesce, TruncDate
 from calendar import monthrange
 from datetime import date, datetime, timedelta
 from django.conf import settings
@@ -430,7 +430,21 @@ class Supplier(models.Model):
 
 
 class ExpenseQuerySet(BaseQuerySet):
-    pass
+
+    def with_expense_date(self):
+        """
+        Annotates `expense_date`: the day the money went out.
+
+        That is the date on the expense's mirrored Transaction, which the user
+        picks and may backdate. An expense with no transaction (older than the
+        accounting module) falls back to the day it was recorded. The list,
+        the dashboard, the trend, targets and the profit estimate all date an
+        expense by this, so a backdated expense lands in one month everywhere
+        - it used to be the month it was typed in some places and the month
+        it was paid in others.
+        """
+        return self.annotate(expense_date=Coalesce(
+            'transaction_record__date', TruncDate('created_at')))
 
 
 class ExpenseManager(models.Manager):
@@ -457,24 +471,38 @@ class ExpenseManager(models.Manager):
                                 category=None):
         """
         The absolute-window sibling of total_expense_amount, written for the
-        targets module.
-
-        Dated on created_at because that is the only date Expense has: no
-        editable date, no updated_at, no created_by. So an expense typed a week
-        after the money went out lands in the wrong month, and an expense
-        target can never be narrowed to a person. Both limits are stated on the
-        card rather than hidden.
+        targets module. Dated by the day the money went out
+        (ExpenseQuerySet.with_expense_date).
         """
         return (
             self.get_queryset()
             .for_business(business_id)
-            .in_range('created_at__date', date_from, date_to)
+            .with_expense_date()
+            .in_range('expense_date', date_from, date_to)
             .filter_optional(category=category)
             .aggregate(value=models.Sum('amount'))['value'] or 0
         )
 
     def monthly_expenses_trend(self, business_id):
-        return self.get_queryset().monthly_trend(business_id, 'amount')
+        """A value per day for the current month, by the day each expense was
+        paid. BaseQuerySet.monthly_trend reads created_at, so not that."""
+        today = timezone.localdate()
+        _, days_in_month = monthrange(today.year, today.month)
+        first, last = today.replace(day=1), today.replace(day=days_in_month)
+        totals = dict(
+            self.get_queryset()
+            .for_business(business_id)
+            .with_expense_date()
+            .in_range('expense_date', first, last)
+            .values('expense_date')
+            .annotate(total=models.Sum('amount'))
+            .values_list('expense_date', 'total')
+        )
+        return [
+            {"day": day.isoformat(),
+             "value": 0.0 if day > today else float(totals.get(day) or 0)}
+            for day in (first + timedelta(days=n) for n in range(days_in_month))
+        ]
 
 
 class Expense(models.Model):
@@ -515,6 +543,18 @@ class Expense(models.Model):
         null=True, blank=True, related_name='charge_expenses')
 
     objects = ExpenseManager()
+
+    def get_expense_date(self):
+        """The day the money went out (see ExpenseQuerySet.with_expense_date),
+        from the annotation when the row has it."""
+        annotated = self.__dict__.get('expense_date')
+        if annotated is not None:
+            return annotated
+        transaction = getattr(self, 'transaction_record', None)
+        if transaction is not None:
+            return transaction.date
+        from root.utils import local_date
+        return local_date(self.created_at)
 
     @property
     def is_invoice_charge(self):
