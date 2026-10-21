@@ -15,7 +15,9 @@ column cannot disagree, because they are the same code.
 from django.utils import timezone
 from django_filters import rest_framework as filters
 
-from .models import PurchaseInvoice, SalesInvoice
+from root.filter_ranges import date_range, number_range
+
+from .models import PurchaseInvoice, PurchaseQuotation, ReturnedItem, SalesInvoice
 
 
 def filter_by_payment_status(queryset, value):
@@ -75,6 +77,14 @@ class SalesInvoiceFilter(filters.FilterSet):
     status = filters.ChoiceFilter(
         choices=SalesInvoice.SALES_INVOICE_STATUS_CHOICES,
         method='filter_status')
+
+    # By id, not name: two customers can share a name, and the filter's
+    # dropdown keeps them apart. customer__name stays for older clients.
+    customer = filters.NumberFilter(field_name='customer')
+    created_by = filters.NumberFilter(field_name='created_by')
+    # An invoice is linked to a project through ProjectSalesInvoice.
+    project = filters.NumberFilter(field_name='projects__project', distinct=True)
+    total_min, total_max = number_range('total')
 
     class Meta:
         model = SalesInvoice
@@ -148,6 +158,11 @@ class PurchaseInvoiceFilter(filters.FilterSet):
     date_due_to = filters.DateFilter(
         field_name='date_due', lookup_expr='lte')
 
+    supplier = filters.NumberFilter(field_name='supplier')
+    created_by = filters.NumberFilter(field_name='created_by')
+    project = filters.NumberFilter(field_name='projects__project', distinct=True)
+    total_min, total_max = number_range('total')
+
     class Meta:
         model = PurchaseInvoice
         # The columns that were filterable before, unchanged.
@@ -157,3 +172,42 @@ class PurchaseInvoiceFilter(filters.FilterSet):
 
     def filter_payment_status(self, queryset, name, value):
         return filter_by_payment_status(queryset, value)
+
+
+class ReturnedItemFilter(filters.FilterSet):
+    """The returned items list: by invoice number, product, customer, where
+    the goods went and whether they came back damaged. The date is the page's
+    period switch."""
+
+    # The number on the invoice, matched in part - not the internal id the
+    # old filter asked for, which nobody ever sees.
+    invoice_number = filters.CharFilter(
+        field_name='invoice_item__sales_invoice__invoice_number', lookup_expr='icontains')
+    # The base product: one pick covers all its variants.
+    product = filters.NumberFilter(field_name='invoice_item__product__base')
+    customer = filters.NumberFilter(field_name='invoice_item__sales_invoice__customer')
+    return_type = filters.ChoiceFilter(choices=ReturnedItem.RETURN_TYPES)
+    is_damaged = filters.BooleanFilter()
+
+    class Meta:
+        model = ReturnedItem
+        # The fields that were filterable before, unchanged.
+        fields = [
+            'invoice_item__sales_invoice__id', 'invoice_item__product__name',
+            'invoice_item__product__base__name', 'quantity',
+        ]
+
+
+class PurchaseQuotationFilter(filters.FilterSet):
+    """The purchase quotations list. It has no period switch, so its date is
+    a range here."""
+
+    status = filters.ChoiceFilter(choices=PurchaseQuotation.PQ_STATUSES)
+    # A quotation asks several suppliers, one per item.
+    supplier = filters.NumberFilter(field_name='items__supplier', distinct=True)
+    project = filters.NumberFilter(field_name='projects__project', distinct=True)
+    created_from, created_to = date_range('created_at', is_datetime=True)
+
+    class Meta:
+        model = PurchaseQuotation
+        fields = []

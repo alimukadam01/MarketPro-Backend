@@ -4,7 +4,7 @@ from .views import (
     BusinessViewSet, BusinessConfigViewSet, CategoryViewSet, CityViewSet,
     CustomerKPIViewSet, CustomerViewSet, ExpenseKPIViewSet,
     ExpenseViewSet, LocationKPIViewSet,
-    LocationViewSet, MultiModelSearchView, ProductKPIViewSet, ProductRelatedVariantViewSet,
+    GlobalSearchView, LocationViewSet, MultiModelSearchView, ProductKPIViewSet, ProductRelatedVariantViewSet,
     SupplierKPIViewSet, SupplierViewSet, UnitViewSet,
     ProductViewSet, EmailTestingView, ProductVariantViewSet, ProductVariantTypeViewSet,
     EmployeeViewSet, EmployeePermissionsViewSet,
@@ -40,6 +40,9 @@ router.register('supplier-kpis', SupplierKPIViewSet, basename='supplier-kpis')
 router.register('expenses-kpis', ExpenseKPIViewSet, basename='expenses-kpis')
 
 urlpatterns = [
+    # The old search, kept until the new frontend is live; then removed with
+    # root/filters.py's MultiModelSearchEngine.
     path('search/', MultiModelSearchView.as_view()),
+    path('global-search/', GlobalSearchView.as_view()),
     path('test-email/', EmailTestingView.as_view()),
 ] + router.urls + products_router.urls + business_router.urls + employees_router.urls

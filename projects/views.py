@@ -2,6 +2,8 @@ from rest_framework import status
 from rest_framework.viewsets import ModelViewSet
 from rest_framework.response import Response
 from rest_framework.decorators import action
+from rest_framework.filters import SearchFilter
+from django_filters.rest_framework import DjangoFilterBackend
 
 from projects.serializers import CompleteProjectCreateSerializer, ProjectCreateSerializer, ProjectPurchaseInvoiceCreateSerializer, ProjectPurchaseInvoiceDetailSerializer, ProjectPurchaseInvoiceSerializer, ProjectSalesInvoiceCreateSerializer, ProjectSalesInvoiceDetailSerializer, ProjectSalesInvoiceSerializer, ProjectSerializer, ProjectTaskCreateSerializer, ProjectTaskSerializer, SimpleProjectSerializer
 from projects.models import Project, ProjectPurchaseInvoice, ProjectSalesInvoice, ProjectTask
@@ -11,6 +13,12 @@ from root.utils import get_active_business
 
 
 class ProjectViewSet(ModelViewSet):
+
+    # Without these the page's search box and its filter were both ignored:
+    # the view accepted the parameters and returned every project.
+    filter_backends = [SearchFilter, DjangoFilterBackend]
+    filterset_fields = ['customer', 'status']
+    search_fields = ['name', 'desc', 'customer__name']
 
     def get_queryset(self):
 
