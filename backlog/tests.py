@@ -557,6 +557,23 @@ class NewRecordsTests(BacklogFixture):
             'items': [{'product_id': variants[1]['id'], 'quantity': 1, 'unit_price': 700}]}, format='json')
         self.assertEqual(sale.status_code, 201, sale.content)
 
+    def test_the_owner_sees_what_was_added_from_the_page(self):
+        entry = self.claimed()
+        client = client_for(self.typist)
+        customer = client.post(f'/backlog-work/{entry.id}/new-customer/', {
+            'name': 'Shafiq Ahmed', 'city': self.city.id,
+            'opening_balance': {'amount': 5000, 'as_of_date': '2019-01-01'}}, format='json').json()
+        product = client.post(f'/backlog-work/{entry.id}/new-product/', {
+            'name': 'Enamel', 'unit': self.unit.id, 'stock': [{}]}, format='json').json()
+
+        rows = client_for(self.owner).get(f'/backlog-entries/{entry.id}/').json()['new_records']
+        self.assertEqual([(r['kind'], r['record_id'], r['label'], r['detail'], r['opening_balance']) for r in rows], [
+            ('customer', customer['id'], 'Shafiq Ahmed', 'Sukkur', 5000),
+            ('product', product['product']['id'], 'Enamel', '1 variant · Tin', None),
+        ])
+        # The entry person's view of the page carries no balance.
+        self.assertNotIn('new_records', client.get(f'/backlog-work/{entry.id}/').json())
+
     def test_only_with_a_page_open(self):
         entry = self.entry()
         response = client_for(self.typist).post(f'/backlog-work/{entry.id}/new-customer/', {

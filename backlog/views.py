@@ -43,7 +43,10 @@ def _entries(request):
                               'outputs__purchase_invoice__supplier',
                               'outputs__product__unit',
                               'outputs__inventory_item__product__base',
-                              'outputs__inventory_item__location'))
+                              'outputs__inventory_item__location',
+                              'new_records__customer__city', 'new_records__customer__opening_balance',
+                              'new_records__supplier__opening_balance', 'new_records__product__unit',
+                              'new_records__product__variants'))
 
 
 class UploadBatchViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, GenericViewSet):

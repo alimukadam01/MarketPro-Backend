@@ -5,7 +5,7 @@ from .models import (
     BacklogEntry, BacklogType, GlossaryEntry, GlossaryKind, GlossarySuggestion,
     Priority, UploadBatch,
 )
-from .outputs import describe
+from .outputs import describe, describe_new_record
 
 
 def person(user):
@@ -56,9 +56,13 @@ class BacklogEntrySerializer(serializers.ModelSerializer):
     entered_by = serializers.SerializerMethodField()
     verified_by = serializers.SerializerMethodField()
     outputs = serializers.SerializerMethodField()
+    new_records = serializers.SerializerMethodField()
 
     def get_image(self, entry):
         return image_url(self, entry.image)
+
+    def get_new_records(self, entry):
+        return [describe_new_record(row) for row in entry.new_records.all()]
 
     def get_claimed_by(self, entry):
         return person(entry.claimed_by)
@@ -79,7 +83,7 @@ class BacklogEntrySerializer(serializers.ModelSerializer):
             'priority', 'is_daily', 'image', 'notes', 'claimed_by', 'claimed_at',
             'entered_by', 'entered_at', 'verified_by', 'verified_at', 'cant_read_note',
             'review_note', 'rejection_count', 'seconds_spent', 'glossary_version',
-            'completed_list', 'outputs', 'created_at', 'updated_at',
+            'completed_list', 'outputs', 'new_records', 'created_at', 'updated_at',
         ]
 
 

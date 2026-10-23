@@ -220,6 +220,51 @@ class BacklogOutput(models.Model):
         return f'{self.entry_id}->{self.kind}#{getattr(self, f"{self.kind}_id", None)}'
 
 
+class BacklogNewRecord(models.Model):
+    """
+    A customer, supplier or product created from a page because the page
+    named one MarketPro did not have (BUGS.md #006). Kept so the owner
+    reviewing the page sees what was added to the shop's records.
+
+    Not a BacklogOutput: an output is what the page's own content became -
+    what Submit requires and approval acts on. A new customer is neither.
+    Exactly one link is set; deleting the record deletes this row with it.
+    """
+
+    entry = models.ForeignKey(BacklogEntry, on_delete=models.CASCADE, related_name='new_records')
+    customer = models.ForeignKey(
+        'root.Customer', on_delete=models.CASCADE, null=True, blank=True, related_name='+')
+    supplier = models.ForeignKey(
+        'root.Supplier', on_delete=models.CASCADE, null=True, blank=True, related_name='+')
+    product = models.ForeignKey(
+        'root.Product', on_delete=models.CASCADE, null=True, blank=True, related_name='+')
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name='+')
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            models.CheckConstraint(
+                name='backlog_new_record_exactly_one',
+                condition=(
+                    models.Q(customer__isnull=False, supplier__isnull=True, product__isnull=True)
+                    | models.Q(customer__isnull=True, supplier__isnull=False, product__isnull=True)
+                    | models.Q(customer__isnull=True, supplier__isnull=True, product__isnull=False)
+                ),
+            ),
+        ]
+
+    @property
+    def kind(self):
+        for name in ('customer', 'supplier', 'product'):
+            if getattr(self, f'{name}_id'):
+                return name
+        return None
+
+    def __str__(self):
+        return f'{self.entry_id}->new {self.kind}#{getattr(self, f"{self.kind}_id", None)}'
+
+
 class BacklogReview(models.Model):
     """One review of an entered page, kept even after it is redone, so
     accuracy (approved / reviewed) and the corrections survive (§12, §14)."""

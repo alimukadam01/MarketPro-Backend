@@ -53,6 +53,31 @@ def describe(output):
     return row
 
 
+def describe_new_record(row):
+    """A customer, supplier or product created from a page, as the owner
+    reviewing it sees it - with the opening balance a party came with. Only
+    the owner's serializer uses this: the entry person never sees a balance."""
+    kind = row.kind
+    item = {'id': row.id, 'kind': kind, 'record_id': getattr(row, f'{kind}_id')}
+    if kind in ('customer', 'supplier'):
+        party = getattr(row, kind)
+        opening = getattr(party, 'opening_balance', None)
+        item['label'] = party.name
+        if kind == 'customer':
+            item['detail'] = party.city.name if party.city_id else ''
+        else:
+            item['detail'] = party.business_name or ''
+        item['opening_balance'] = opening.amount if opening else None
+    else:
+        product = row.product
+        count = len(product.variants.all())
+        unit = product.unit.name if product.unit_id else ''
+        item['label'] = product.name
+        item['detail'] = ' · '.join(filter(None, [f'{count} variant{"s" if count != 1 else ""}', unit]))
+        item['opening_balance'] = None
+    return item
+
+
 def record_output(entry, record, user, created=True, entered=None, previous=None):
     kind = {
         'SalesInvoice': 'sales_invoice',

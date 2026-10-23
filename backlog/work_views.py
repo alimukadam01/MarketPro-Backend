@@ -35,7 +35,7 @@ from sales.serializers import (
 from . import lookups
 from .access import IsEntryWorker, is_owner
 from .glossary import current_version
-from .models import BacklogEntry, BacklogType, GlossaryEntry, GlossarySuggestion
+from .models import BacklogEntry, BacklogNewRecord, BacklogType, GlossaryEntry, GlossarySuggestion
 from .outputs import (
     OutputInUse, delete_output, describe, record_output, return_removed_sales_lines, variant_label,
 )
@@ -554,7 +554,7 @@ class BacklogWorkViewSet(GenericViewSet):
 
     @action(['POST'], detail=True, url_path='new-customer', url_name='new-customer')
     def new_customer(self, request, pk=None):
-        self.my_entry(pk, review=True)
+        entry = self.my_entry(pk, review=True)
         business = self.business()
         serializer = NewCustomerSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -566,11 +566,12 @@ class BacklogWorkViewSet(GenericViewSet):
                 business=business, name=data['name'].strip(), phone=data['phone'].strip() or None,
                 address=data['address'].strip() or None, city_id=data['city'])
             self._opening_balance(business, data.get('opening_balance'), customer=customer)
+            BacklogNewRecord.objects.create(entry=entry, customer=customer, created_by=request.user)
         return Response({'id': customer.id, 'label': customer.name}, status=status.HTTP_201_CREATED)
 
     @action(['POST'], detail=True, url_path='new-supplier', url_name='new-supplier')
     def new_supplier(self, request, pk=None):
-        self.my_entry(pk, review=True)
+        entry = self.my_entry(pk, review=True)
         business = self.business()
         serializer = NewSupplierSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -580,6 +581,7 @@ class BacklogWorkViewSet(GenericViewSet):
                 business=business, name=data['name'].strip(),
                 business_name=data['business_name'].strip() or None, phone=data['phone'].strip() or None)
             self._opening_balance(business, data.get('opening_balance'), supplier=supplier)
+            BacklogNewRecord.objects.create(entry=entry, supplier=supplier, created_by=request.user)
         label = f'{supplier.name} ({supplier.business_name})' if supplier.business_name else supplier.name
         return Response({'id': supplier.id, 'label': label}, status=status.HTTP_201_CREATED)
 
@@ -589,7 +591,7 @@ class BacklogWorkViewSet(GenericViewSet):
         product with no stock row cannot go on an invoice. A quantity typed
         here is a count, dated today (§8), so sales and purchases dated on or
         before today do not move it again."""
-        self.my_entry(pk, review=True)
+        entry = self.my_entry(pk, review=True)
         business = self.business()
         serializer = NewProductSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -618,6 +620,7 @@ class BacklogWorkViewSet(GenericViewSet):
                     quantity=quantity or 0, quantity_on_hand=quantity or 0,
                     unit_price=line.get('unit_price'), unit_cost=line.get('unit_cost'),
                     stock_counted_at=timezone.localdate() if quantity is not None else None)
+            BacklogNewRecord.objects.create(entry=entry, product=product, created_by=request.user)
         return Response({
             'product': {'id': product.id, 'label': product.name},
             'variants': [{'id': v.id, 'label': variant_label(v)} for v in variants],
