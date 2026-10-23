@@ -286,6 +286,21 @@ class EntryAndReviewTests(BacklogFixture):
         self.assertEqual(attached.image.name, image_name)
         self.assertEqual(BacklogReview.objects.get(entry=entry).outcome, 'approved')
 
+    def test_a_payment_on_a_page_sent_back(self):
+        from accounts.models import MoneyAccount
+        cash = MoneyAccount.objects.create(business=self.business, name='Counter', type='cash', is_default=True)
+        entry, output, client = self.enter_sale()
+        client.post(f'/backlog-work/{entry.id}/submit/')
+        client_for(self.owner).post(f'/backlog-entries/{entry.id}/send-back/', {'reason': 'Add the cash'},
+                                    format='json')
+        again = client_for(self.second)
+        self.assertEqual(again.post(f'/backlog-work/{entry.id}/claim/').status_code, 200)
+        # Exactly what the payments dialog sends.
+        body = {'amount': 3000, 'desc': '', 'account': cash.id, 'payment_method': 'cash',
+                'date': timezone.localdate().isoformat()}
+        paid = again.post(f'/backlog-work/{entry.id}/outputs/{output["id"]}/payments/', body, format='json')
+        self.assertEqual(paid.status_code, 201, paid.content)
+
     def test_submit_needs_something_entered(self):
         entry = self.claimed()
         self.assertEqual(client_for(self.typist).post(f'/backlog-work/{entry.id}/submit/').status_code, 400)
