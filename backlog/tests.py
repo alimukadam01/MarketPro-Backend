@@ -501,6 +501,69 @@ class DeletingOutputsTests(BacklogFixture):
         self.assertFalse(Product.objects.filter(pk=output['record_id']).exists())
 
 
+class NewRecordsTests(BacklogFixture):
+    """BUGS.md #006: a customer, supplier or product the page names but
+    MarketPro lacks is created from the entry screen."""
+
+    def test_a_new_customer_with_what_they_owe(self):
+        from accounts.models import PartyOpeningBalance
+        entry = self.claimed()
+        client = client_for(self.typist)
+        url = f'/backlog-work/{entry.id}/new-customer/'
+        self.assertEqual(client.post(url, {'name': 'Shafiq Ahmed', 'city': 99999}, format='json').status_code, 400)
+        response = client.post(url, {
+            'name': ' Shafiq Ahmed ', 'phone': '0300 1112223', 'city': self.city.id,
+            'opening_balance': {'amount': 5000, 'as_of_date': '2019-01-01'}}, format='json')
+        self.assertEqual(response.status_code, 201, response.content)
+        customer = Customer.objects.get(pk=response.json()['id'])
+        self.assertEqual(response.json(), {'id': customer.id, 'label': 'Shafiq Ahmed'})
+        self.assertEqual((customer.business, customer.city), (self.business, self.city))
+        balance = PartyOpeningBalance.objects.get(customer=customer)
+        self.assertEqual((balance.amount, str(balance.as_of_date)), (5000, '2019-01-01'))
+
+    def test_a_new_supplier_without_a_balance(self):
+        from accounts.models import PartyOpeningBalance
+        entry = self.claimed(type='purchase_invoice')
+        response = client_for(self.typist).post(f'/backlog-work/{entry.id}/new-supplier/', {
+            'name': 'Nippon', 'business_name': 'Nippon Paint Pakistan',
+            'opening_balance': {'amount': 0, 'as_of_date': '2019-01-01'}}, format='json')
+        self.assertEqual(response.status_code, 201, response.content)
+        self.assertEqual(response.json()['label'], 'Nippon (Nippon Paint Pakistan)')
+        self.assertFalse(PartyOpeningBalance.objects.filter(supplier_id=response.json()['id']).exists())
+
+    def test_a_new_product_comes_with_its_stock_rows(self):
+        entry = self.claimed()
+        client = client_for(self.typist)
+        url = f'/backlog-work/{entry.id}/new-product/'
+        body = {'name': 'Enamel', 'unit': self.unit.id, 'variants': [
+            {'attributes': {'Shade': 'Black'}}, {'attributes': {'Shade': 'White'}}],
+            'stock': [{'quantity': 12, 'unit_price': 680, 'unit_cost': 520}]}
+        self.assertEqual(client.post(url, body, format='json').status_code, 400)   # one row short
+
+        body['stock'].append({})
+        response = client.post(url, body, format='json')
+        self.assertEqual(response.status_code, 201, response.content)
+        variants = response.json()['variants']
+        self.assertEqual([v['label'] for v in variants], ['Enamel (Black)', 'Enamel (White)'])
+        black, white = (InventoryItem.objects.get(product_id=v['id']) for v in variants)
+        self.assertEqual((black.quantity_on_hand, black.unit_price, black.stock_counted_at, black.location),
+                         (12, 680, timezone.localdate(), self.shop))
+        self.assertEqual((white.quantity_on_hand, white.unit_price, white.stock_counted_at, white.location),
+                         (0, None, None, self.shop))
+
+        # And it can go straight onto the bill.
+        sale = client.post(f'/backlog-work/{entry.id}/sales-invoice/', {
+            'invoice_number': 'N-1', 'customer': self.customer.id, 'date_issued': timezone.localdate().isoformat(),
+            'items': [{'product_id': variants[1]['id'], 'quantity': 1, 'unit_price': 700}]}, format='json')
+        self.assertEqual(sale.status_code, 201, sale.content)
+
+    def test_only_with_a_page_open(self):
+        entry = self.entry()
+        response = client_for(self.typist).post(f'/backlog-work/{entry.id}/new-customer/', {
+            'name': 'X', 'city': self.city.id}, format='json')
+        self.assertEqual(response.status_code, 403)
+
+
 class GlossaryTests(BacklogFixture):
 
     def test_versions_are_exact(self):

@@ -9,7 +9,7 @@ from django.db.models import Q
 
 from accounts.models import MoneyAccount
 from projects.models import Project
-from root.models import Customer, Location, Product, ProductVariant, ProductVariantType, Supplier, Unit
+from root.models import City, Customer, Location, Product, ProductVariant, ProductVariantType, Supplier, Unit
 
 from .outputs import variant_label
 
@@ -79,6 +79,12 @@ def attributes(business, query):
     return [{'id': t.id, 'label': t.name} for t in qs.order_by('name')[:LIMIT]]
 
 
+def cities(business, query):
+    # Shared by every business, like units: a new customer needs one.
+    qs = _match(City.objects.all(), query, ['name'])
+    return [{'id': c.id, 'label': c.name} for c in qs.order_by('name')[:LIMIT]]
+
+
 def projects(business, query):
     qs = _match(Project.objects.filter(business_id=business.id), query, ['name'])
     return [{'id': p.id, 'label': p.name} for p in qs.order_by('name')[:LIMIT]]
@@ -94,4 +100,5 @@ KINDS = {
     'locations': locations,
     'attributes': attributes,
     'projects': projects,
+    'cities': cities,
 }
