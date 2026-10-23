@@ -301,6 +301,37 @@ class EntryAndReviewTests(BacklogFixture):
         paid = again.post(f'/backlog-work/{entry.id}/outputs/{output["id"]}/payments/', body, format='json')
         self.assertEqual(paid.status_code, 201, paid.content)
 
+    def test_what_the_khaata_settles_without_the_balance(self):
+        """BUGS.md #004: the entry person's dialog learns how much of this
+        invoice the khaata covers - and so what one more payment may be -
+        but never the customer's balance or the credits behind it."""
+        import datetime
+        from accounts.models import MoneyAccount, PartyPayment, Transaction
+        cash = MoneyAccount.objects.create(business=self.business, name='Counter', type='cash', is_default=True)
+        # PKR 10,000 the customer paid on account, before this bill.
+        money = Transaction.objects.create(
+            business=self.business, account=cash, type='customer_receipt', amount=10000,
+            date=datetime.date(2019, 1, 1), status='C', payment_method='cash')
+        PartyPayment.objects.create(business=self.business, transaction=money, customer=self.customer)
+
+        entry, output, client = self.enter_sale()     # 4 x 2,150 = 8,600
+        url = f'/backlog-work/{entry.id}/outputs/{output["id"]}/'
+        settled = client.get(url + 'settlement/')
+        self.assertEqual(settled.status_code, 200, settled.content)
+        data = settled.json()
+        self.assertEqual((data['total'], data['settled_from_khaata'], data['room'], data['still_owed']),
+                         (8600, 8600, 0, 0))
+        # One line for this invoice: no credit's remaining amount, date or reference.
+        self.assertEqual(data['settled_by'], [{'kind': 'khaata', 'id': 0,
+                                               'label': "Already on the customer's khaata",
+                                               'reference': '', 'date': None, 'applied': 8600}])
+        self.assertNotIn('overpaid', data)
+        self.assertNotIn('1400', settled.content.decode())     # what is left on account
+
+        body = {'amount': 100, 'account': cash.id, 'payment_method': 'cash',
+                'date': timezone.localdate().isoformat()}
+        self.assertEqual(client.post(url + 'payments/', body, format='json').status_code, 400)
+
     def test_submit_needs_something_entered(self):
         entry = self.claimed()
         self.assertEqual(client_for(self.typist).post(f'/backlog-work/{entry.id}/submit/').status_code, 400)

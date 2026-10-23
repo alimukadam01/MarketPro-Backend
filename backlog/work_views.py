@@ -249,6 +249,47 @@ class BacklogWorkViewSet(GenericViewSet):
         receipt = serializer.save()
         return Response({'id': receipt.id}, status=status.HTTP_201_CREATED)
 
+    @action(['GET'], detail=True, url_path=r'outputs/(?P<output_id>\d+)/settlement',
+            url_name='output-settlement')
+    def settlement(self, request, pk=None, output_id=None):
+        """What the payments dialog needs from the khaata, for this invoice
+        only: the figures the standard dialog reads (sales/views.py,
+        SettledInvoiceViewMixin.settlement), so the two dialogs agree with
+        the server on what is paid and how much one more payment may be.
+
+        Never the party's balance (§7): the credits that settled the
+        invoice come back as one line - how much of THIS invoice the khaata
+        covers - with no label, date, reference or remaining credit, and
+        the overpayment and refund figures are left out."""
+        from accounts.settlement import attach_settlement
+        from sales.utils import invoice_room
+
+        entry = self.my_entry(pk, review=True)
+        output = self.my_output(entry, output_id)
+        if output.kind not in ('sales_invoice', 'purchase_invoice'):
+            raise exceptions.NotFound()
+        invoice = output.record
+        attach_settlement([invoice])
+        total = float(invoice.total or 0)
+        paid = float(invoice.amount_paid or 0)
+        from_khaata = round(invoice.pool_applied or 0)
+        billed = 0 if invoice.status in (invoice.CANCELLED_STATUSES + invoice.DRAFT_STATUSES) else total
+        party = 'customer' if output.kind == 'sales_invoice' else 'supplier'
+        return Response({
+            'total': round(total),
+            'paid_on_invoice': round(invoice.receipts_paid or 0),
+            'settled_from_khaata': from_khaata,
+            'paid': round(paid),
+            'still_owed': round(max(total - paid, 0)),
+            'room': round(invoice_room(invoice)),
+            'billed': round(billed, 2),
+            'settled_by': [{
+                'kind': 'khaata', 'id': 0, 'label': f"Already on the {party}'s khaata",
+                'reference': '', 'date': None, 'applied': from_khaata,
+            }] if from_khaata > 0 else [],
+            'refunds': [],
+        })
+
     @action(['DELETE'], detail=True, url_path=r'outputs/(?P<output_id>\d+)/payments/(?P<payment_id>\d+)',
             url_name='output-payment')
     def payment(self, request, pk=None, output_id=None, payment_id=None):
