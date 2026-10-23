@@ -59,7 +59,8 @@ def suppliers(business, query):
 
 def accounts(business, query):
     qs = _match(MoneyAccount.objects.filter(business_id=business.id, is_active=True), query, ['name'])
-    return [{'id': a.id, 'label': a.name, 'type': a.type} for a in qs.order_by('name')[:LIMIT]]
+    return [{'id': a.id, 'label': a.name, 'type': a.type, 'is_default': a.is_default}
+            for a in qs.order_by('-is_default', 'name')[:LIMIT]]
 
 
 def units(business, query):

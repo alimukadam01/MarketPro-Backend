@@ -80,6 +80,30 @@ def _product_in_use(product):
     return False
 
 
+def return_removed_sales_lines(invoice, kept_ids):
+    """Before a correction removes lines from a sales invoice, give back what
+    those lines took out of stock.
+
+    The invoice update deletes a removed line with its deduction ledger and
+    returns nothing - on the invoice screens a line leaves through a return.
+    Here a removed line was a typing mistake, so its stock goes back, by the
+    ledger, exactly as restockOnCancel does for a whole invoice."""
+    from django.db.models import Sum
+    from inventory.models import InventoryItem
+
+    for line in invoice.invoice_items.exclude(id__in=kept_ids):
+        deducted = line.restocks.aggregate(total=Sum('quantity'))['total'] or 0
+        if not deducted:
+            continue
+        row = InventoryItem.objects.select_for_update().filter(
+            business_id=invoice.business_id, product_id=line.product_id).first()
+        if row:
+            row.quantity += deducted
+            row.quantity_on_hand += deducted
+            row.save(update_fields=['quantity', 'quantity_on_hand'])
+        line.restocks.all().delete()
+
+
 def delete_output(output):
     """Delete what the output produced, reversing its stock first."""
     from sales.utils import restockOnCancel, take_back_from_stock, units_in_stock

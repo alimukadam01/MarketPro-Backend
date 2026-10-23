@@ -324,6 +324,45 @@ class EntryAndReviewTests(BacklogFixture):
             'view': True, 'create': True, 'edit': True, 'delete': True}})
         self.assertEqual(client_for(staff).post(f'/backlog-entries/{entry.id}/approve/').status_code, 403)
 
+    def test_the_owner_corrects_an_entered_invoice_in_place(self):
+        entry, output, client = self.enter_sale()
+        client.post(f'/backlog-work/{entry.id}/outputs/{output["id"]}/payments/', {'amount': 1000},
+                    format='json')
+        client.post(f'/backlog-work/{entry.id}/submit/')
+        owner = client_for(self.owner)
+
+        # The page under review opens on the entry screen, with everything typed.
+        self.assertEqual(owner.get(f'/backlog-work/{entry.id}/').status_code, 200)
+        values = owner.get(f'/backlog-work/{entry.id}/outputs/{output["id"]}/').json()['values']
+        self.assertEqual(values['party'], {'id': self.customer.id, 'label': 'Hassan Builders'})
+        self.assertEqual([(l['quantity'], l['price']) for l in values['lines']], [(4, 2150)])
+        self.assertEqual([p['amount'] for p in values['payments']], [1000])
+
+        # Corrected through the invoice update: the stock follows.
+        line = values['lines'][0]
+        payload = {**self.sale_payload(), 'items': [{'id': line['id'], 'product_id': self.white.id,
+                                                     'quantity': 12, 'unit_price': 2150}]}
+        response = owner.put(f'/backlog-work/{entry.id}/outputs/{output["id"]}/', payload, format='json')
+        self.assertEqual(response.status_code, 200, response.content)
+        self.assertEqual(InventoryItem.objects.get(pk=self.stock.pk).quantity_on_hand, 38)
+
+        payment = values['payments'][0]['id']
+        self.assertEqual(owner.delete(
+            f'/backlog-work/{entry.id}/outputs/{output["id"]}/payments/{payment}/').status_code, 204)
+        self.assertFalse(SalesInvoice.objects.get(pk=output['record_id']).payment_receipts.exists())
+
+        # A line corrected downwards is replaced: its 12 come back, 2 go out.
+        payload = {**self.sale_payload(), 'items': [{'id': None, 'product_id': self.white.id, 'quantity': 2,
+                                                     'unit_price': 2150}]}
+        response = owner.put(f'/backlog-work/{entry.id}/outputs/{output["id"]}/', payload, format='json')
+        self.assertEqual(response.status_code, 200, response.content)
+        self.assertEqual(InventoryItem.objects.get(pk=self.stock.pk).quantity_on_hand, 48)
+
+        # Review opens records, not the page itself: submitting stays with entry.
+        self.assertEqual(owner.post(f'/backlog-work/{entry.id}/submit/').status_code, 403)
+        # And the entry person has handed it in, so it is closed to them.
+        self.assertEqual(client.get(f'/backlog-work/{entry.id}/').status_code, 403)
+
 
 class DeletingOutputsTests(BacklogFixture):
 
@@ -350,6 +389,26 @@ class DeletingOutputsTests(BacklogFixture):
         client.delete(f'/backlog-work/{entry.id}/outputs/{output["id"]}/')
         self.assertEqual(InventoryItem.objects.get(pk=self.stock.pk).quantity_on_hand, 50)
         self.assertFalse(PurchaseInvoice.objects.filter(pk=output['record_id']).exists())
+
+    def test_a_purchase_entered_and_corrected_as_the_screen_sends_it(self):
+        entry = self.claimed(type='purchase_invoice')
+        client = client_for(self.typist)
+        day = timezone.localdate().isoformat()
+        payload = {'invoice_number': 'P-2', 'supplier': self.supplier.id, 'status': 'R',
+                   'date_issued': day, 'date_due': day, 'delivery': None, 'notes': '',
+                   'tax': {'value': 0, 'type': 'percentage'}, 'project': None,
+                   'items': [{'id': None, 'product_id': self.white.id, 'quantity': 10, 'unit_cost': 1800}]}
+        response = client.post(f'/backlog-work/{entry.id}/purchase-invoice/', payload, format='json')
+        self.assertEqual(response.status_code, 201, response.content)
+        output = response.json()['output']
+        values = client.get(f'/backlog-work/{entry.id}/outputs/{output["id"]}/').json()['values']
+        self.assertEqual((values['status'], values['party']['id']), ('R', self.supplier.id))
+
+        line = values['lines'][0]
+        payload['items'] = [{'id': line['id'], 'product_id': self.white.id, 'quantity': 6, 'unit_cost': 1800}]
+        response = client.put(f'/backlog-work/{entry.id}/outputs/{output["id"]}/', payload, format='json')
+        self.assertEqual(response.status_code, 200, response.content)
+        self.assertEqual(InventoryItem.objects.get(pk=self.stock.pk).quantity_on_hand, 56)
 
     def test_a_stock_line_on_an_existing_row_is_put_back(self):
         entry = self.claimed(type='stock_list')

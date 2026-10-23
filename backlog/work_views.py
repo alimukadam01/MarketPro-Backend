@@ -26,14 +26,16 @@ from root.models import Location, ProductVariant
 from root.serializers import ProductAndVariantCreateSerializer, ProductAndVariantUpdateSerializer
 from root.utils import get_active_business
 from sales.serializers import (
-    PurchaseInvoiceAndItemsCreateSerializer, PurchaseReceiptCreateSerializer,
-    SalesInvoiceAndItemsCreateSerializer, SalesReceiptCreateSerializer,
+    PaymentReceiptSerializer, PurchaseInvoiceAndItemsCreateSerializer,
+    PurchaseInvoiceAndItemsUpdateSerializer, PurchaseReceiptCreateSerializer,
+    SalesInvoiceAndItemsCreateSerializer, SalesInvoiceAndItemsUpdateSerializer,
+    SalesReceiptCreateSerializer,
 )
 from . import lookups
-from .access import IsEntryWorker
+from .access import IsEntryWorker, is_owner
 from .glossary import current_version
 from .models import BacklogEntry, BacklogType, GlossaryEntry, GlossarySuggestion
-from .outputs import OutputInUse, delete_output, describe, record_output
+from .outputs import OutputInUse, delete_output, describe, record_output, return_removed_sales_lines
 from .serializers import (
     GlossaryEntrySerializer, GlossarySuggestionCreateSerializer, WorkEntrySerializer,
     WorkQueueItemSerializer,
@@ -81,8 +83,13 @@ class BacklogWorkViewSet(GenericViewSet):
     def entries(self):
         return BacklogEntry.objects.filter(business_id=self.business().id)
 
-    def my_entry(self, pk):
-        """The page this user is working on, or a 403/404 response."""
+    def my_entry(self, pk, review=False):
+        """The page this user is working on, or a 403/404 response.
+
+        With `review`, the owner may also open a page waiting for review:
+        they check it on the same screen and correct its records in place.
+        Only the record endpoints pass it - claiming, releasing and
+        submitting stay with the person doing the entry."""
         entry = (self.entries().filter(pk=pk)
                  .prefetch_related('outputs__sales_invoice__customer', 'outputs__purchase_invoice__supplier',
                                    'outputs__product__unit', 'outputs__inventory_item__product__base',
@@ -90,6 +97,8 @@ class BacklogWorkViewSet(GenericViewSet):
                  .first())
         if not entry:
             raise exceptions.NotFound()
+        if review and entry.status == BacklogEntry.ENTERED and is_owner(self.request.user, self.business()):
+            return entry
         if entry.status != BacklogEntry.IN_PROGRESS or entry.claimed_by_id != self.request.user.id:
             raise exceptions.PermissionDenied(NOT_YOURS['detail'])
         return entry
@@ -139,7 +148,7 @@ class BacklogWorkViewSet(GenericViewSet):
         })
 
     def retrieve(self, request, pk=None):
-        return Response(self.entry_data(self.my_entry(pk)))
+        return Response(self.entry_data(self.my_entry(pk, review=True)))
 
     @action(['POST'], detail=True, url_path='claim', url_name='claim')
     def claim(self, request, pk=None):
@@ -201,7 +210,7 @@ class BacklogWorkViewSet(GenericViewSet):
     # ── what a page produces ─────────────────────────────────────────────
 
     def _create_invoice(self, request, pk, kind):
-        entry = self.my_entry(pk)
+        entry = self.my_entry(pk, review=True)
         self.require_type(entry, kind)
         business = self.business()
         serializer_class = (SalesInvoiceAndItemsCreateSerializer if kind == BacklogType.SALES_INVOICE
@@ -226,7 +235,7 @@ class BacklogWorkViewSet(GenericViewSet):
             url_name='output-payments')
     def payments(self, request, pk=None, output_id=None):
         """A payment written on the bill, against the invoice entered from it."""
-        entry = self.my_entry(pk)
+        entry = self.my_entry(pk, review=True)
         output = self.my_output(entry, output_id)
         if output.kind == 'sales_invoice':
             serializer = SalesReceiptCreateSerializer(data=request.data, context={
@@ -240,9 +249,23 @@ class BacklogWorkViewSet(GenericViewSet):
         receipt = serializer.save()
         return Response({'id': receipt.id}, status=status.HTTP_201_CREATED)
 
+    @action(['DELETE'], detail=True, url_path=r'outputs/(?P<output_id>\d+)/payments/(?P<payment_id>\d+)',
+            url_name='output-payment')
+    def payment(self, request, pk=None, output_id=None, payment_id=None):
+        """Take back a payment entered from the bill."""
+        entry = self.my_entry(pk, review=True)
+        output = self.my_output(entry, output_id)
+        if output.kind not in ('sales_invoice', 'purchase_invoice'):
+            raise exceptions.NotFound()
+        receipt = output.record.payment_receipts.filter(pk=payment_id).first()
+        if not receipt:
+            raise exceptions.NotFound()
+        receipt.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
     @action(['POST'], detail=True, url_path='products', url_name='products')
     def products(self, request, pk=None):
-        entry = self.my_entry(pk)
+        entry = self.my_entry(pk, review=True)
         self.require_type(entry, BacklogType.PRODUCT_LIST)
         business = self.business()
         serializer = ProductAndVariantCreateSerializer(data=request.data, context={'business_id': business.id})
@@ -263,7 +286,7 @@ class BacklogWorkViewSet(GenericViewSet):
         """A stock or price list line: set on the product's stock row, created
         if the shop has none. An existing row's values are kept in the output
         so deleting it puts them back."""
-        entry = self.my_entry(pk)
+        entry = self.my_entry(pk, review=True)
         self.require_type(entry, BacklogType.STOCK_LIST, BacklogType.PRICE_LIST)
         values = self._stock_values(entry, request.data)
         business = self.business()
@@ -336,7 +359,7 @@ class BacklogWorkViewSet(GenericViewSet):
     def output(self, request, pk=None, output_id=None):
         """One record from the page: read it back for editing, change it,
         or delete it (stock reversed - backlog/outputs.py)."""
-        entry = self.my_entry(pk)
+        entry = self.my_entry(pk, review=True)
         output = self.my_output(entry, output_id)
         if request.method == 'GET':
             return Response({**describe(output), 'values': self._values_of(output)})
@@ -354,20 +377,40 @@ class BacklogWorkViewSet(GenericViewSet):
         if output.kind == 'inventory_item':
             return output.entered
         if output.kind in ('sales_invoice', 'purchase_invoice'):
-            invoice = output.record
-            party = invoice.customer if output.kind == 'sales_invoice' else invoice.supplier
-            lines = invoice.invoice_items.select_related('product__base')
-            return {
-                'invoice_number': invoice.invoice_number,
-                'party': party.name if party else '',
-                'date_issued': invoice.date_issued,
-                'lines': [{'product': line.product_id, 'label': describe_variant(line.product),
-                           'quantity': line.quantity,
-                           'price': getattr(line, 'unit_price', None) or getattr(line, 'unit_cost', None)}
-                          for line in lines],
-                'total': invoice.total,
-            }
+            return self._invoice_values(output)
         return {}
+
+    def _invoice_values(self, output):
+        """Everything the invoice entry form holds, so a page sent back - or
+        opened for review - loads as it was entered. Only what is on the
+        bill: its lines, its adjustments and the payments written on it."""
+        invoice = output.record
+        sales = output.kind == 'sales_invoice'
+        party = invoice.customer if sales else invoice.supplier
+        lines = invoice.invoice_items.select_related('product__base')
+        link = invoice.projects.select_related('project').first()
+        receipts = invoice.payment_receipts.select_related('transaction_record__account')
+        values = {
+            'invoice_number': invoice.invoice_number,
+            'party': {'id': party.id, 'label': party.name} if party else None,
+            'date_issued': invoice.date_issued,
+            'date_due': invoice.date_due,
+            'tax': invoice.tax or {},
+            'notes': invoice.notes or '',
+            'project': {'id': link.project_id, 'label': link.project.name} if link else None,
+            'lines': [{'id': line.id, 'product': line.product_id, 'label': describe_variant(line.product),
+                       'quantity': line.quantity - (getattr(line, 'returned_quantity', 0) or 0),
+                       'price': line.unit_price if sales else line.unit_cost}
+                      for line in lines],
+            'payments': PaymentReceiptSerializer(receipts, many=True, context={'request': self.request}).data,
+            'total': invoice.total,
+        }
+        if sales:
+            values.update(discount=invoice.discount or {},
+                          extra_charges=invoice.extra_charges or [])
+        else:
+            values.update(delivery=invoice.delivery, status=invoice.status)
+        return values
 
     def _update_output(self, request, entry, output):
         if output.kind == 'product':
@@ -391,8 +434,20 @@ class BacklogWorkViewSet(GenericViewSet):
             output.entered = self._entered(values, row.product)
             output.save(update_fields=['entered'])
             return Response({'output': describe(output)})
-        return Response({'detail': 'An invoice is changed by deleting it and entering it again.'},
-                        status=status.HTTP_400_BAD_REQUEST)
+        # An invoice: the same update the invoice screens use, so its stock
+        # and payments move exactly as they would there.
+        sales = output.kind == 'sales_invoice'
+        serializer_class = SalesInvoiceAndItemsUpdateSerializer if sales else PurchaseInvoiceAndItemsUpdateSerializer
+        serializer = serializer_class(output.record, data=request.data, context={
+            'business_id': self.business().id, 'user_id': request.user.id})
+        serializer.is_valid(raise_exception=True)
+        with transaction.atomic():
+            if sales:
+                kept = [item.get('id') for item in serializer.validated_data['items'] if item.get('id')]
+                return_removed_sales_lines(output.record, kept)
+            serializer.save()
+        output.refresh_from_db()
+        return Response({'output': describe(output)})
 
     # ── lookups and the glossary ─────────────────────────────────────────
 
