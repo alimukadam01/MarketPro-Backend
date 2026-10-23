@@ -31,6 +31,7 @@ from .utils import (
     units_in_stock,
     updateInventoryOnSale
 )
+from audit.helpers import audited_bulk_create, audited_bulk_update
 
 
 MAX_EXTRA_CHARGES = 20
@@ -495,8 +496,8 @@ class PurchaseInvoiceAndItemsCreateSerializer(serializers.ModelSerializer):
                     quantity=item['quantity'],
                     unit_cost=item['unit_cost']
                 ) for item in items]
-                invoice_items = PurchaseInvoiceItem.objects.bulk_create(
-                    invoice_items)
+                invoice_items = audited_bulk_create(
+                    PurchaseInvoiceItem, invoice_items)
 
                 if project_id:
                     ProjectPurchaseInvoice.objects.create(
@@ -643,8 +644,8 @@ class PurchaseInvoiceAndItemsUpdateSerializer(serializers.ModelSerializer):
             line.unit_cost = item['unit_cost']
             kept.append((line, was_product, was_quantity))
         if kept:
-            PurchaseInvoiceItem.objects.bulk_update(
-                [line for line, _, _ in kept], ['product', 'quantity', 'unit_cost'])
+            audited_bulk_update(
+                PurchaseInvoiceItem, [line for line, _, _ in kept], ['product', 'quantity', 'unit_cost'])
 
         for line, was_product, was_quantity in kept:
             in_stock = units_in_stock(line)
@@ -663,7 +664,7 @@ class PurchaseInvoiceAndItemsUpdateSerializer(serializers.ModelSerializer):
                 units = line.quantity - in_stock if in_stock else line.quantity - was_quantity
                 receive_into_stock(line, units, self.instance)
 
-        new_lines = PurchaseInvoiceItem.objects.bulk_create([
+        new_lines = audited_bulk_create(PurchaseInvoiceItem, [
             PurchaseInvoiceItem(
                 business_id=self.context['business_id'],
                 purchase_invoice=self.instance,
@@ -1018,8 +1019,8 @@ class RestockSerializer(serializers.Serializer):
                 item.notes = invoice_item.notes
 
         with transaction.atomic():
-            InventoryItem.objects.bulk_create(new_inventory_items)
-            InventoryItem.objects.bulk_update(inventory_items, [
+            audited_bulk_create(InventoryItem, new_inventory_items)
+            audited_bulk_update(InventoryItem, inventory_items, [
                 'location', 'quantity', 'quantity_on_hand',
                 'unit_cost', 'notes'
             ])
@@ -1056,7 +1057,7 @@ class SalesInvoiceAndItemsCreateSerializer(ExtraChargesValidationMixin,
                     quantity_received=item['quantity'],
                     unit_price=item['unit_price']
                 ) for item in items]
-                SalesInvoiceItem.objects.bulk_create(invoice_items)
+                audited_bulk_create(SalesInvoiceItem, invoice_items)
 
                 if project_id:
                     ProjectSalesInvoice.objects.create(
@@ -1183,10 +1184,10 @@ class SalesInvoiceAndItemsUpdateSerializer(ExtraChargesValidationMixin,
                     id__in=[item.id for item in updated_items]).delete()
 
                 if new_items:
-                    new_items = SalesInvoiceItem.objects.bulk_create(new_items)
+                    new_items = audited_bulk_create(SalesInvoiceItem, new_items)
 
                 if grown:
-                    SalesInvoiceItem.objects.bulk_update(grown, ['quantity'])
+                    audited_bulk_update(SalesInvoiceItem, grown, ['quantity'])
                     for line in grown:
                         # A line the system has already taken out of stock is
                         # re-flagged from its ledger: with the quantity up it is
@@ -1450,7 +1451,7 @@ class PurchaseQuotationAndItemsCreateSerializer(serializers.ModelSerializer):
                     **item
                 ))
 
-            PurchaseQuotationItem.objects.bulk_create(quotation_items)
+            audited_bulk_create(PurchaseQuotationItem, quotation_items)
 
         return quotation
 
@@ -1510,8 +1511,8 @@ class PurchaseQuotationAndItemsUpdateSerializer(serializers.ModelSerializer):
                         ))
 
                 if new_items:
-                    new_items = PurchaseQuotationItem.objects.bulk_create(
-                        new_items)
+                    new_items = audited_bulk_create(
+                        PurchaseQuotationItem, new_items)
 
                 # Items on the frontend can't be updated,
                 # They can either be created or deleted.

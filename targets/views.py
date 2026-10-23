@@ -18,6 +18,7 @@ from .serializers import (
     TargetUpdateSerializer,
 )
 from .utils import dashboard_progress, has_targets_access, progress, summarise
+from audit.helpers import audited_bulk_create
 
 
 NO_BUSINESS = {'detail': 'No active business exists. Please contact admin.'}
@@ -140,7 +141,7 @@ class TargetViewSet(ModelViewSet):
                 notes=source.notes,
             )
             if rows:
-                TargetFilter.objects.bulk_create([
+                audited_bulk_create(TargetFilter, [
                     TargetFilter(
                         target=copy, dimension=row.dimension,
                         value_id=row.value_id, value_text=row.value_text,

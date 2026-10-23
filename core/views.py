@@ -55,6 +55,8 @@ class IsAdminRole(IsAuthenticated):
 
 class AccessConfigView(APIView):
     permission_classes = [IsAuthenticated]
+    # Read at login by every role, data entry included.
+    allow_backlog_role = {'GET'}
 
     def get(self, request):
         business_id = request.query_params.get('business_id')

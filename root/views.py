@@ -37,6 +37,7 @@ from .models import (
 from .filters import GlobalSearch
 from .list_filters import CustomerFilter, ExpenseFilter, ProductFilter
 from .search.engine import search as global_search
+from audit.helpers import audited_bulk_update
 
 
 class CategoryViewSet(ReadOnlyModelViewSet):
@@ -59,6 +60,8 @@ class UnitViewSet(ReadOnlyModelViewSet):
 
 # inject authentication here
 class BusinessViewSet(ModelViewSet):
+    # Login reads the user's business; data entry may do that and no more.
+    allow_backlog_role = {'list:GET', 'retrieve:GET'}
 
     def get_queryset(self):
 
@@ -104,7 +107,7 @@ class BusinessViewSet(ModelViewSet):
             for business in businesses:
                 business.is_active = (business.id == int(self.kwargs['pk']))
 
-            Business.objects.bulk_update(businesses, ['is_active'])
+            audited_bulk_update(Business, businesses, ['is_active'])
 
             return Response({
                 "detail": "OK"

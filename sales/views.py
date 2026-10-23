@@ -64,6 +64,7 @@ from .serializers import (
     GenerateInvoiceSerializer,
     InvoiceImageSerializer
 )
+from audit.helpers import audited_update
 
 # Create your views here.
 
@@ -861,7 +862,7 @@ class SalesInvoiceViewSet(PeriodFilterMixin, SettledInvoiceViewMixin, ModelViewS
                 # it is cleared here so un-cancelling deducts exactly once more.
                 restockOnCancel(invoice)
                 invoice.status = 'X'
-                SalesInvoice.objects.filter(pk=invoice.pk).update(status='X')
+                audited_update(SalesInvoice.objects.filter(pk=invoice.pk), status='X')
                 # A cancelled sale paid out no charges: their expenses go too.
                 sync_charge_expenses(invoice)
 
@@ -895,7 +896,7 @@ class SalesInvoiceViewSet(PeriodFilterMixin, SettledInvoiceViewMixin, ModelViewS
                 # Out of the manual state first, so recalculate_status stops
                 # treating it as sticky and can derive from the lines again.
                 invoice.status = 'D'
-                SalesInvoice.objects.filter(pk=invoice.pk).update(status='D')
+                audited_update(SalesInvoice.objects.filter(pk=invoice.pk), status='D')
                 invoice.recalculate_status()
                 updateInventoryOnSale(invoice)
                 # And the charge expenses come back, if it has been paid.
@@ -938,7 +939,7 @@ class SalesInvoiceViewSet(PeriodFilterMixin, SettledInvoiceViewMixin, ModelViewS
                 # nothing else should be touched by a change of buyer. It used
                 # to be here to dodge a post_save receiver that ran a stock
                 # deduction pass on any invoice save; that receiver is gone.
-                SalesInvoice.objects.filter(pk=invoice.pk).update(customer=customer)
+                audited_update(SalesInvoice.objects.filter(pk=invoice.pk), customer=customer)
 
             invoice.refresh_from_db()
 

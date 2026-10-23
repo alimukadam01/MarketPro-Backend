@@ -8,6 +8,8 @@ from django.conf import settings
 from django.utils import timezone
 from root.utils import generateTransactionId, local_date
 from root.models import Business, BusinessConfig, Customer, BaseItem, Supplier, Location, BaseQuerySet
+from audit.helpers import audited_update
+from audit.context import automatic
 
 
 # Create your models here.
@@ -370,6 +372,7 @@ class SalesInvoice(SettledInvoiceMixin, models.Model):
         derived = self.display_status
         return 'C' if derived in self.DERIVED_ONLY_STATUSES else derived
 
+    @automatic('signal:recalculate_status')
     def recalculate_status(self):
         """
         Bring the stored status back in line with the invoice's contents.
@@ -383,7 +386,7 @@ class SalesInvoice(SettledInvoiceMixin, models.Model):
         if new_status == self.status:
             return False
         self.status = new_status
-        SalesInvoice.objects.filter(pk=self.pk).update(status=new_status)
+        audited_update(SalesInvoice.objects.filter(pk=self.pk), status=new_status)
         return True
 
     def __str__(self):
@@ -406,6 +409,7 @@ class SalesInvoice(SettledInvoiceMixin, models.Model):
                 continue
         return round(total, 2)
 
+    @automatic('signal:adjust_totals')
     def adjust_totals(self):
         items = self.invoice_items.exclude(returned_quantity = F("quantity"))
         if not items:
@@ -793,6 +797,7 @@ class PurchaseInvoice(SettledInvoiceMixin, models.Model):
 
         return subtotal, subtotal + tax
 
+    @automatic('signal:adjust_totals')
     def adjust_totals(self):
         self.sub_total, self.total = self.computed_totals()
         self.save(update_fields=["sub_total", "total"])

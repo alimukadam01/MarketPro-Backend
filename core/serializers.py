@@ -25,6 +25,11 @@ class UserSerializer(serializers.Serializer):
     
     def get_permissions(self, user):
 
+        # Data entry has no module permissions at all: the backlog queue is
+        # the whole app (audit/authentication.py keeps it there).
+        if user.role == User.BACKLOG:
+            return {}
+
         if user.role == "employee":
             employee = user.emp_records.all()
             if employee:

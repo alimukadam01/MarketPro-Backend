@@ -18,6 +18,7 @@ from .models import (
     BusinessConfig,
 )
 from .utils import generate_sku, generate_variant_name
+from audit.helpers import audited_bulk_create, audited_bulk_update
 
 User = get_user_model()
 
@@ -351,9 +352,9 @@ class ProductAndVariantUpdateSerializer(serializers.ModelSerializer):
             try:
                 with transaction.atomic():
                     ProductVariant.objects.filter(id__in=tbd_variants).delete()
-                    ProductVariant.objects.bulk_create(tbc_variants)
-                    ProductVariant.objects.bulk_update(
-                        tbu_variants, fields=['name', 'attributes']
+                    audited_bulk_create(ProductVariant, tbc_variants)
+                    audited_bulk_update(
+                        ProductVariant, tbu_variants, fields=['name', 'attributes']
                     )
                     instance.save()
             except Exception as error:
@@ -409,7 +410,7 @@ class ProductAndVariantCreateSerializer(serializers.ModelSerializer):
                         ))
                         sku_count += 1
 
-                    ProductVariant.objects.bulk_create(new_variants)
+                    audited_bulk_create(ProductVariant, new_variants)
                 else:
                     ProductVariant.objects.create(
                         base=product,
@@ -600,7 +601,9 @@ class SimpleUserSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = User
-        fields = ['id', 'email', 'first_name', 'last_name']
+        # role: the Employees page tells data entry accounts apart.
+        fields = ['id', 'email', 'first_name', 'last_name', 'role']
+        read_only_fields = ['role']
 
 
 class SimpleEmployeeAccessSerializer(serializers.ModelSerializer):
@@ -637,11 +640,15 @@ class EmployeeAndUserCreateSerializer(serializers.ModelSerializer):
     email = serializers.EmailField()
     password = serializers.CharField(max_length=256)
     re_password = serializers.CharField(max_length=256)
-    permissions = serializers.DictField()
+    permissions = serializers.DictField(required=False, default=dict)
+    # 'employee', or 'backlog' for a data entry account. Set explicitly:
+    # left to the model default, every employee came out an 'admin'.
+    role = serializers.ChoiceField(
+        choices=[User.EMPLOYEE, User.BACKLOG], required=False, default=User.EMPLOYEE)
 
     class Meta:
         model = Employee
-        fields = ['first_name', 'last_name', 'email', 'password', 're_password', 'permissions']
+        fields = ['first_name', 'last_name', 'email', 'password', 're_password', 'permissions', 'role']
 
     def create(self, validated_data):
 
@@ -649,12 +656,18 @@ class EmployeeAndUserCreateSerializer(serializers.ModelSerializer):
             with transaction.atomic():
                 email = validated_data.pop('email')
                 permissions = validated_data.pop('permissions')
+                role = validated_data.pop('role', User.EMPLOYEE)
+                # Data entry has no module permissions; the backlog role is
+                # its whole access.
+                if role == User.BACKLOG:
+                    permissions = {}
 
                 user = User.objects.create_user(
                     email,
                     password=validated_data.pop('password'),
                     first_name=validated_data.pop('first_name'),
                     last_name=validated_data.pop('last_name'),
+                    role=role,
                 )
 
                 employee = Employee.objects.create(

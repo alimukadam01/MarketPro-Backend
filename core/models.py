@@ -46,9 +46,13 @@ class User(AbstractUser):
 
     ADMIN    = 'admin'
     EMPLOYEE = 'employee'
+    # A data entry account: one per shop, an Employee of it, and allowed
+    # only the backlog work endpoints (audit/authentication.py).
+    BACKLOG  = 'backlog'
     ROLE_CHOICES = [
         (ADMIN,    'Admin'),
         (EMPLOYEE, 'Employee'),
+        (BACKLOG,  'Data entry'),
     ]
 
     username    = None

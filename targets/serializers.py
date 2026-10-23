@@ -12,6 +12,7 @@ from .catalogue import (
 )
 from .models import ManualDataPoint, Target, TargetFilter
 from .utils import period_label, resolve_period
+from audit.helpers import audited_bulk_create
 
 
 ### Filters ---------------------------------------------------------------
@@ -385,7 +386,7 @@ class TargetCreateSerializer(TargetValidationMixin, serializers.ModelSerializer)
                 **data
             )
             if resolved:
-                TargetFilter.objects.bulk_create([
+                audited_bulk_create(TargetFilter, [
                     TargetFilter(target=target, **row) for row in resolved
                 ])
 
@@ -436,7 +437,7 @@ class TargetUpdateSerializer(TargetValidationMixin, serializers.ModelSerializer)
             if resolved is not None:
                 instance.filters.all().delete()
                 if resolved:
-                    TargetFilter.objects.bulk_create([
+                    audited_bulk_create(TargetFilter, [
                         TargetFilter(target=instance, **row) for row in resolved
                     ])
 
