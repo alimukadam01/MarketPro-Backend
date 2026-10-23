@@ -32,6 +32,7 @@ from .utils import (
     updateInventoryOnSale
 )
 from audit.helpers import audited_bulk_create, audited_bulk_update
+from .stock_rule import reconcile_purchase_invoice, reconcile_sales_invoice, stock_dates
 
 
 MAX_EXTRA_CHARGES = 20
@@ -461,11 +462,15 @@ class PurchaseInvoiceUpdateSerializer(serializers.ModelSerializer):
         ]
 
     def update(self, instance, validated_data):
+        dated_before = stock_dates(instance)
         for attr, value in validated_data.items():
             setattr(instance, attr, value)
 
         instance.save()
         instance.adjust_totals()
+        # A new delivery or invoice date can cross a stock count.
+        if stock_dates(instance) != dated_before and reconcile_purchase_invoice(instance):
+            restock_purchase(instance)
         return instance
 
 
@@ -565,6 +570,7 @@ class PurchaseInvoiceAndItemsUpdateSerializer(serializers.ModelSerializer):
         # Measured before anything changes, so only the overpayment this
         # Update creates is refunded (refund_new_overpayment).
         overpaid_before = overpaid_by(self.instance)
+        dated_before = stock_dates(self.instance)
 
         try:
             # All of it in one transaction, totals and refund included: a
@@ -580,6 +586,10 @@ class PurchaseInvoiceAndItemsUpdateSerializer(serializers.ModelSerializer):
                     self.instance.save()
                     receiving = self.instance.status in RECEIVED_PURCHASE_STATUSES
                     self._apply_lines(items, receiving)
+                    # The delivery or invoice date may have moved across a
+                    # stock count (sales/stock_rule.py).
+                    if stock_dates(self.instance) != dated_before:
+                        reconcile_purchase_invoice(self.instance)
                     self.instance.adjust_totals()
 
                 self.instance.refresh_from_db()
@@ -945,11 +955,16 @@ class SalesInvoiceUpdateSerializer(ExtraChargesValidationMixin,
         ]
 
     def save(self, **kwargs):
+        dated_before = stock_dates(self.instance)
 
         for attr, value in self.validated_data.items():
             setattr(self.instance, attr, value)
 
         self.instance.save()
+        # A new invoice date can cross a stock count.
+        if stock_dates(self.instance) != dated_before:
+            reconcile_sales_invoice(self.instance)
+            updateInventoryOnSale(self.instance)
         # The charges or the invoice date may have changed.
         sync_charge_expenses(self.instance)
         return self.instance
@@ -1127,6 +1142,7 @@ class SalesInvoiceAndItemsUpdateSerializer(ExtraChargesValidationMixin,
         # Measured before anything changes, so only the overpayment this
         # Update creates is refunded (refund_new_overpayment).
         overpaid_before = overpaid_by(self.instance)
+        dated_before = stock_dates(self.instance)
 
         try:
             with transaction.atomic():
@@ -1205,6 +1221,10 @@ class SalesInvoiceAndItemsUpdateSerializer(ExtraChargesValidationMixin,
                 # lines are only final once the new ones are created and the
                 # removed ones deleted, and the status is derived from them.
                 self.instance.recalculate_status()
+                # The date may have moved across a stock count: lines change
+                # sides before the deduction pass (sales/stock_rule.py).
+                if stock_dates(self.instance) != dated_before:
+                    reconcile_sales_invoice(self.instance)
                 updateInventoryOnSale(self.instance)
                 # After the status: a draft or cancelled invoice records none.
                 sync_charge_expenses(self.instance)

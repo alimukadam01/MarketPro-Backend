@@ -563,6 +563,9 @@ class SalesInvoiceItem(BaseItem):
     quantity_received = models.IntegerField(default=0)
     returned_quantity = models.PositiveIntegerField(default=0)
     is_deducted = models.BooleanField(default=False)
+    # Dated on or before its product's stock count, so the count already
+    # includes it: marked done without moving stock (sales/stock_rule.py).
+    stock_skipped = models.BooleanField(default=False)
 
     objects = SalesInvoiceItemManager()
 
@@ -883,6 +886,8 @@ class PurchaseInvoiceItem(BaseItem):
     unit_cost = models.FloatField()
     quantity_received = models.IntegerField(default=0)
     is_restocked = models.BooleanField(default=False)
+    # See SalesInvoiceItem.stock_skipped.
+    stock_skipped = models.BooleanField(default=False)
     is_partially_restocked = models.BooleanField(default=False)
 
     objects = PurchaseInvoiceItemManager()

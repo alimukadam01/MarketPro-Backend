@@ -110,6 +110,12 @@ class InventoryItem(BaseItem):
     unit_price = models.FloatField(null=True, blank=True)
     reorder_level = models.IntegerField(null=True, blank=True)
     last_transaction = models.CharField(max_length=256, null=True, blank=True)
+    # The day a person last counted this stock and typed the figure in
+    # (§8). A sale or purchase dated on or before it is already in that
+    # count, so it does not move stock again (sales/stock_rule.py). Set by
+    # a person's quantity edit or an import - never by a sale, purchase,
+    # return or price change, so not "last updated at".
+    stock_counted_at = models.DateField(null=True, blank=True)
 
     def __str__(self):
         return f"{self.quantity} x {self.product.base.name} ({self.product.name})"

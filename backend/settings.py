@@ -160,7 +160,12 @@ REST_FRAMEWORK = {
     ),
     'DEFAULT_PERMISSION_CLASSES': [
         'rest_framework.permissions.IsAuthenticated',
-    ]
+    ],
+    # The backlog entry screens' type-ahead (backlog/work_views.py): the one
+    # call that could page through a shop's names, so it is rate limited.
+    'DEFAULT_THROTTLE_RATES': {
+        'backlog_lookup': '240/min',
+    },
 }
 
 SIMPLE_JWT = {

@@ -65,6 +65,7 @@ from .serializers import (
     InvoiceImageSerializer
 )
 from audit.helpers import audited_update
+from .stock_rule import return_applies
 
 # Create your views here.
 
@@ -1371,6 +1372,12 @@ class ReturnedItemsViewSet(PeriodFilterMixin, ModelViewSet):
                 }, status=status.HTTP_400_BAD_REQUEST)
 
             instance.return_type = 'to_inventory'
+
+            # Recorded on or before the product's stock count: the counted
+            # figure already has it back (sales/stock_rule.py).
+            if not return_applies(instance):
+                instance.save()
+                return Response({"detail": "OK"}, status=status.HTTP_200_OK)
 
             inventory_item = InventoryItem.objects.get(
                 product=instance.invoice_item.product)

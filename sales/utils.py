@@ -14,6 +14,7 @@ from .models import PurchaseInvoiceItemRestock
 from root.utils import generateTransactionId, local_date, whatsapp_number
 from audit.helpers import audited_bulk_create, audited_bulk_update
 from audit.context import automatic
+from .stock_rule import skip_purchase_line, skip_sales_line, stock_applies
 
 
 def getRestockField(is_partial: bool) -> str:
@@ -240,6 +241,11 @@ def updateInventoryOnSale(instance: SalesInvoice):
             # first time its invoice was edited.
             if item.is_deducted:
                 continue
+            # Dated on or before this product's stock count: the count
+            # already has it (sales/stock_rule.py).
+            if not stock_applies(item):
+                skip_sales_line(item)
+                continue
             delta = item.compute_restock_delta()
             if delta > 0:
                 inventory_item.apply_restock_delta(True, delta, generateTransactionId(instance))
@@ -348,7 +354,12 @@ def units_in_stock(line):
 @automatic('signal:receive_into_stock')
 def receive_into_stock(line, units, invoice):
     """Put `units` of this line's product into stock and log them against it."""
-    if units <= 0:
+    if units <= 0 or line.stock_skipped:
+        return
+    # Delivered on or before this product's stock count: the count already
+    # has it (sales/stock_rule.py).
+    if not stock_applies(line):
+        skip_purchase_line(line)
         return
     data = line.morph()
     stock = InventoryItem.objects.filter(
@@ -422,6 +433,8 @@ def restock_purchase(invoice):
         lines = PurchaseInvoiceItem.objects.filter(
             purchase_invoice_id=invoice.pk).select_related('product')
         for line in lines:
+            if line.stock_skipped:
+                continue
             receive_into_stock(line, line.compute_restock_delta(), invoice)
         invoice.update_restock_flags()
 

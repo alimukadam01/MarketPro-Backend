@@ -419,11 +419,13 @@ class ProductAndVariantCreateSerializer(serializers.ModelSerializer):
                     )
 
         except Exception as error:
+            # Give back the SKU numbers the failed batch took, then fail: this
+            # used to fall through and return a `product` never assigned.
             print(f"Error creating product variants: {error}")
-
-            business = Business.objects.get(self.context['business_id'])
+            business = Business.objects.get(pk=self.context['business_id'])
             business.sku_counter -= sku_count
             business.save(update_fields=['sku_counter'])
+            raise
 
         return product
 
