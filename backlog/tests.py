@@ -332,6 +332,24 @@ class EntryAndReviewTests(BacklogFixture):
                 'date': timezone.localdate().isoformat()}
         self.assertEqual(client.post(url + 'payments/', body, format='json').status_code, 400)
 
+    def test_saving_a_page_keeps_the_bills_date(self):
+        """The date is read back as the shop's day, so saving it again - as
+        every correction and every approval does - leaves it alone."""
+        entry = self.claimed()
+        client = client_for(self.typist)
+        payload = {**self.sale_payload(), 'date_issued': '2025-05-05', 'date_due': '2025-05-05'}
+        output = client.post(f'/backlog-work/{entry.id}/sales-invoice/', payload, format='json').json()['output']
+        url = f'/backlog-work/{entry.id}/outputs/{output["id"]}/'
+        values = client.get(url).json()['values']
+        self.assertEqual(values['date_issued'], '2025-05-05')
+
+        line = values['lines'][0]
+        again = {**payload, 'date_issued': values['date_issued'],
+                 'items': [{'id': line['id'], 'product_id': self.white.id, 'quantity': 4, 'unit_price': 2150}]}
+        for _ in range(2):
+            self.assertEqual(client.put(url, again, format='json').status_code, 200)
+        self.assertEqual(client.get(url).json()['values']['date_issued'], '2025-05-05')
+
     def test_submit_needs_something_entered(self):
         entry = self.claimed()
         self.assertEqual(client_for(self.typist).post(f'/backlog-work/{entry.id}/submit/').status_code, 400)

@@ -25,7 +25,7 @@ from inventory.models import InventoryItem
 from accounts.models import PartyOpeningBalance
 from root.models import City, Customer, Location, ProductVariant, Supplier, Unit
 from root.serializers import ProductAndVariantCreateSerializer, ProductAndVariantUpdateSerializer
-from root.utils import get_active_business
+from root.utils import get_active_business, local_date
 from sales.serializers import (
     PaymentReceiptSerializer, PurchaseInvoiceAndItemsCreateSerializer,
     PurchaseInvoiceAndItemsUpdateSerializer, PurchaseReceiptCreateSerializer,
@@ -485,7 +485,11 @@ class BacklogWorkViewSet(GenericViewSet):
         values = {
             'invoice_number': invoice.invoice_number,
             'party': {'id': party.id, 'label': party.name} if party else None,
-            'date_issued': invoice.date_issued,
+            # The day in the shop's time zone. date_issued is a timestamp, and
+            # read as UTC its first ten characters are the day before for
+            # anything saved at local midnight - which every save then wrote
+            # back, moving the date a day earlier each time.
+            'date_issued': local_date(invoice.date_issued),
             'date_due': invoice.date_due,
             'tax': invoice.tax or {},
             'notes': invoice.notes or '',
