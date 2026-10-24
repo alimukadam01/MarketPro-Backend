@@ -37,10 +37,8 @@ def variants(business, query, with_stock=False):
           .select_related('base', 'base__unit'))
     qs = _match(qs, query, ['base__name', 'name', 'sku', 'base__code'])
     rows = list(qs.order_by('base__name', 'name')[:LIMIT])
-    # With its product's id and name, so a picker can tell a name typed is
-    # an existing product's and offer to add variants to it.
-    found = [{'id': v.id, 'label': variant_label(v), 'unit': v.base.unit.name if v.base.unit_id else '',
-              'product': v.base_id, 'product_name': v.base.name} for v in rows]
+    found = [{'id': v.id, 'label': variant_label(v), 'unit': v.base.unit.name if v.base.unit_id else ''}
+             for v in rows]
     if with_stock:
         # A sales page labels what has run out, as the sales screens do -
         # yes or no only, never how many (section 7). Still pickable there:

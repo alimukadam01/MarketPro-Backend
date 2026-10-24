@@ -23,10 +23,7 @@ from rest_framework.viewsets import GenericViewSet
 from audit.helpers import audited_update
 from inventory.models import InventoryItem
 from root.models import Location, ProductVariant
-from root.new_records import (
-    add_variants, create_customer, create_product_with_stock, create_supplier, product_answer,
-    product_for_editing, supplier_label,
-)
+from root.new_records import create_customer, create_supplier, supplier_label
 from root.serializers import ProductAndVariantCreateSerializer, ProductAndVariantUpdateSerializer
 from root.utils import get_active_business, local_date
 from sales.serializers import (
@@ -505,7 +502,7 @@ class BacklogWorkViewSet(GenericViewSet):
         output.refresh_from_db()
         return Response({'output': describe(output)})
 
-    # ── new customers, suppliers and products (BUGS.md #006) ─────────────
+    # ── new customers and suppliers (BUGS.md #006) ──────────────────────
     #
     # A name on the page that MarketPro does not have yet is created from
     # the entry screen, tied to the page the user has open. The answer is
@@ -515,7 +512,9 @@ class BacklogWorkViewSet(GenericViewSet):
     def new_customer(self, request, pk=None):
         entry = self.my_entry(pk, review=True)
         with transaction.atomic():
-            customer = create_customer(self.business(), request.data)
+            # No opening balance from a backlog page: a money figure typed
+            # while entering an old bill is a guess (root/new_records.py).
+            customer = create_customer(self.business(), request.data, with_balance=False)
             BacklogNewRecord.objects.create(entry=entry, customer=customer, created_by=request.user)
         return Response({'id': customer.id, 'label': customer.name}, status=status.HTTP_201_CREATED)
 
@@ -523,30 +522,9 @@ class BacklogWorkViewSet(GenericViewSet):
     def new_supplier(self, request, pk=None):
         entry = self.my_entry(pk, review=True)
         with transaction.atomic():
-            supplier = create_supplier(self.business(), request.data)
+            supplier = create_supplier(self.business(), request.data, with_balance=False)
             BacklogNewRecord.objects.create(entry=entry, supplier=supplier, created_by=request.user)
         return Response({'id': supplier.id, 'label': supplier_label(supplier)}, status=status.HTTP_201_CREATED)
-
-    @action(['POST'], detail=True, url_path='new-product', url_name='new-product')
-    def new_product(self, request, pk=None):
-        """A product with its variants and a stock row for each
-        (root/new_records.py)."""
-        entry = self.my_entry(pk, review=True)
-        with transaction.atomic():
-            product, variants = create_product_with_stock(self.business(), request.data)
-            BacklogNewRecord.objects.create(entry=entry, product=product, created_by=request.user)
-        return Response(product_answer(product, variants), status=status.HTTP_201_CREATED)
-
-    @action(['GET', 'POST'], detail=True, url_path=r'products/(?P<product_id>\d+)', url_name='product')
-    def product(self, request, pk=None, product_id=None):
-        """A product the page names and MarketPro has: GET its details and
-        variants (names and attributes only), POST the dialog's changes and
-        new variants with their stock rows (root/new_records.py)."""
-        self.my_entry(pk, review=True)
-        if request.method == 'GET':
-            return Response(product_for_editing(self.business(), product_id))
-        product, new_variants = add_variants(self.business(), product_id, request.data)
-        return Response(product_answer(product, new_variants))
 
     # ── lookups and the glossary ─────────────────────────────────────────
 
