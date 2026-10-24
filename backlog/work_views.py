@@ -555,7 +555,10 @@ class BacklogWorkViewSet(GenericViewSet):
         finder = lookups.KINDS.get(kind)
         if not finder:
             raise exceptions.NotFound()
-        return Response(finder(self.business(), request.query_params.get('q', '')))
+        query = request.query_params.get('q', '')
+        if kind == 'variants' and request.query_params.get('stock') == '1':
+            return Response(lookups.variants(self.business(), query, with_stock=True))
+        return Response(finder(self.business(), query))
 
     @action(['GET'], detail=False, url_path='glossary', url_name='glossary')
     def glossary(self, request):

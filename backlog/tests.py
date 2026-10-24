@@ -227,6 +227,13 @@ class VisibilityTests(BacklogFixture):
                     # can be matched to it for "Add variants" - an id and a name.
                     self.assertLessEqual(set(row), {'id', 'label', 'unit', 'type', 'is_default',
                                                     'product', 'product_name'})
+        # On a sales page, whether a product is in stock - yes or no, no figure.
+        stocked = client.get('/backlog-work/lookup/variants/', {'q': 'emulsion', 'stock': '1'}).json()
+        self.assertEqual([(row['id'], row['in_stock']) for row in stocked], [(self.white.id, True)])
+        InventoryItem.objects.filter(pk=self.stock.pk).update(quantity_on_hand=0)
+        stocked = client.get('/backlog-work/lookup/variants/', {'q': 'emulsion', 'stock': '1'}).json()
+        self.assertEqual(stocked[0]['in_stock'], False)
+        self.assertFalse(set(stocked[0]) & self.FIGURES)
         found = client.get('/backlog-work/lookup/variants/', {'q': 'emulsion white'}).json()
         self.assertEqual([row['id'] for row in found], [self.white.id])
 

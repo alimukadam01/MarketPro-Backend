@@ -8,6 +8,7 @@ is one query, filtered to the business and to the text typed, capped.
 from django.db.models import Q
 
 from accounts.models import MoneyAccount
+from inventory.models import InventoryItem
 from projects.models import Project
 from root.models import City, Customer, Location, Product, ProductVariant, ProductVariantType, Supplier, Unit
 
@@ -30,16 +31,26 @@ def _match(qs, query, fields):
     return qs
 
 
-def variants(business, query):
+def variants(business, query, with_stock=False):
     qs = (ProductVariant.objects
           .filter(base__business_id=business.id, is_active=True, base__is_active=True)
           .select_related('base', 'base__unit'))
     qs = _match(qs, query, ['base__name', 'name', 'sku', 'base__code'])
+    rows = list(qs.order_by('base__name', 'name')[:LIMIT])
     # With its product's id and name, so a picker can tell a name typed is
     # an existing product's and offer to add variants to it.
-    return [{'id': v.id, 'label': variant_label(v), 'unit': v.base.unit.name if v.base.unit_id else '',
-             'product': v.base_id, 'product_name': v.base.name}
-            for v in qs.order_by('base__name', 'name')[:LIMIT]]
+    found = [{'id': v.id, 'label': variant_label(v), 'unit': v.base.unit.name if v.base.unit_id else '',
+              'product': v.base_id, 'product_name': v.base.name} for v in rows]
+    if with_stock:
+        # A sales page labels what has run out, as the sales screens do -
+        # yes or no only, never how many (section 7). Still pickable there:
+        # an old bill is history.
+        stocked = set(InventoryItem.objects.filter(
+            business_id=business.id, product_id__in=[v.id for v in rows], quantity_on_hand__gt=0,
+        ).values_list('product_id', flat=True))
+        for row in found:
+            row['in_stock'] = row['id'] in stocked
+    return found
 
 
 def products(business, query):
