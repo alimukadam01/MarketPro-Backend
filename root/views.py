@@ -37,6 +37,9 @@ from .models import (
 from .filters import GlobalSearch
 from .list_filters import CustomerFilter, ExpenseFilter, ProductFilter
 from .search.engine import search as global_search
+from .new_records import (
+    create_customer, create_product_with_stock, create_supplier, product_answer, supplier_label,
+)
 from audit.helpers import audited_bulk_update
 
 
@@ -137,6 +140,17 @@ class ProductViewSet(ModelViewSet):
     search_fields = [
         'id', 'name', 'code', 'desc', 'unit__name', 'variants__name', 'variants__sku',
     ]
+
+    @action(['POST'], detail=False, url_path='create-with-stock', url_name='create-with-stock')
+    def create_with_stock(self, request):
+        """A product typed on an invoice that is not in MarketPro yet: the
+        product, its variants and a stock row for each, in one go
+        (root/new_records.py). Answers with ids and names."""
+        business = get_active_business(request)
+        if not business:
+            return Response({'detail': 'No active business exists. Please contact admin.'}, status=status.HTTP_400_BAD_REQUEST)
+        product, variants = create_product_with_stock(business, request.data)
+        return Response(product_answer(product, variants), status=status.HTTP_201_CREATED)
 
     def get_queryset(self):
         business = get_active_business(self.request)
@@ -366,6 +380,16 @@ class SupplierViewSet(ModelViewSet):
 
     serializer_class = SupplierSerializer
 
+    @action(['POST'], detail=False, url_path='create-with-balance', url_name='create-with-balance')
+    def create_with_balance(self, request):
+        """A supplier typed on an invoice that is not in MarketPro yet, with
+        the balance their khaata stood at, if given (root/new_records.py)."""
+        business = get_active_business(request)
+        if not business:
+            return Response({'detail': 'No active business exists. Please contact admin.'}, status=status.HTTP_400_BAD_REQUEST)
+        supplier = create_supplier(business, request.data)
+        return Response({'id': supplier.id, 'label': supplier_label(supplier)}, status=status.HTTP_201_CREATED)
+
     def get_queryset(self):
         business = get_active_business(self.request)
         if not business:
@@ -544,6 +568,16 @@ class CustomerViewSet(ModelViewSet):
     search_fields = [
         'id', 'name', 'phone', 'email', 'address', 'city__name'
     ]
+
+    @action(['POST'], detail=False, url_path='create-with-balance', url_name='create-with-balance')
+    def create_with_balance(self, request):
+        """A customer typed on an invoice that is not in MarketPro yet, with
+        the balance their khaata stood at, if given (root/new_records.py)."""
+        business = get_active_business(request)
+        if not business:
+            return Response({'detail': 'No active business exists. Please contact admin.'}, status=status.HTTP_400_BAD_REQUEST)
+        customer = create_customer(business, request.data)
+        return Response({'id': customer.id, 'label': customer.name}, status=status.HTTP_201_CREATED)
 
     def get_queryset(self):
         business = get_active_business(self.request)

@@ -25,7 +25,8 @@ from root.models import (
 from sales.models import InvoiceImage, PurchaseInvoice, ReturnedItem, SalesInvoice, SalesInvoiceItem
 from .metrics import person_metrics
 from .models import (
-    BacklogEntry, BacklogOutput, BacklogReview, GlossaryEntry, GlossarySuggestion, UploadBatch,
+    BacklogEntry, BacklogNewRecord, BacklogOutput, BacklogReview, GlossaryEntry, GlossarySuggestion,
+    UploadBatch,
 )
 
 User = get_user_model()
@@ -591,6 +592,41 @@ class NewRecordsTests(BacklogFixture):
         ])
         # The entry person's view of the page carries no balance.
         self.assertNotIn('new_records', client.get(f'/backlog-work/{entry.id}/').json())
+
+    def test_the_invoice_screens_create_the_same_way(self):
+        """The create screens' endpoints make the same records, without a
+        page - and are closed to a data entry account."""
+        from accounts.models import PartyOpeningBalance
+        owner = client_for(self.owner)
+        customer = owner.post('/customers/create-with-balance/', {
+            'name': 'Walk-in Builders', 'city': self.city.id,
+            'opening_balance': {'amount': 750, 'as_of_date': '2026-01-01'}}, format='json')
+        self.assertEqual(customer.status_code, 201, customer.content)
+        self.assertEqual(PartyOpeningBalance.objects.get(customer_id=customer.json()['id']).amount, 750)
+
+        supplier = owner.post('/suppliers/create-with-balance/', {'name': 'Nippon'}, format='json')
+        self.assertEqual((supplier.status_code, supplier.json()['label']), (201, 'Nippon'))
+
+        product = owner.post('/products/create-with-stock/', {
+            'name': 'Gloss', 'unit': self.unit.id, 'stock': [{'quantity': 5, 'unit_price': 900}]}, format='json')
+        self.assertEqual(product.status_code, 201, product.content)
+        variant = product.json()['variants'][0]['id']
+        self.assertEqual(InventoryItem.objects.get(product_id=variant).quantity_on_hand, 5)
+        self.assertFalse(BacklogNewRecord.objects.exists())
+
+        typist = client_for(self.typist)
+        for url in ('/customers/create-with-balance/', '/suppliers/create-with-balance/',
+                    '/products/create-with-stock/'):
+            self.assertEqual(typist.post(url, {'name': 'X'}, format='json').status_code, 403, url)
+
+    def test_staff_can_read_the_names_lookup(self):
+        staff = User.objects.create_user(email='staff-lookup@example.com', password='pw', role=User.EMPLOYEE)
+        Employee.objects.create(user=staff, business=self.business, created_by=self.owner)
+        response = client_for(staff).get('/backlog-work/lookup/units/')
+        self.assertEqual(response.status_code, 200, response.content)
+        self.assertIn('Tin', [row['label'] for row in response.json()])
+        # The rest of the entry screens stays closed to them.
+        self.assertEqual(client_for(staff).get('/backlog-work/queue/').status_code, 403)
 
     def test_only_with_a_page_open(self):
         entry = self.entry()

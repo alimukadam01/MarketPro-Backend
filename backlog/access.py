@@ -55,6 +55,13 @@ class IsBusinessOwner(BasePermission):
         return is_owner(request.user, get_active_business(request))
 
 
+class HasActiveBusiness(BasePermission):
+    """Anyone working in a business - for what every one of them may see."""
+
+    def has_permission(self, request, view):
+        return get_active_business(request) is not None
+
+
 class IsEntryWorker(BasePermission):
     """The entry screens: a data entry account, or the owner doing the
     work themselves."""

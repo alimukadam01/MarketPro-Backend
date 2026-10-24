@@ -22,8 +22,10 @@ from rest_framework.viewsets import GenericViewSet
 
 from audit.helpers import audited_update
 from inventory.models import InventoryItem
-from accounts.models import PartyOpeningBalance
-from root.models import City, Customer, Location, ProductVariant, Supplier, Unit
+from root.models import Location, ProductVariant
+from root.new_records import (
+    create_customer, create_product_with_stock, create_supplier, product_answer, supplier_label,
+)
 from root.serializers import ProductAndVariantCreateSerializer, ProductAndVariantUpdateSerializer
 from root.utils import get_active_business, local_date
 from sales.serializers import (
@@ -33,12 +35,10 @@ from sales.serializers import (
     SalesReceiptCreateSerializer,
 )
 from . import lookups
-from .access import IsEntryWorker, is_owner
+from .access import HasActiveBusiness, IsEntryWorker, is_owner
 from .glossary import current_version
 from .models import BacklogEntry, BacklogNewRecord, BacklogType, GlossaryEntry, GlossarySuggestion
-from .outputs import (
-    OutputInUse, delete_output, describe, record_output, return_removed_sales_lines, variant_label,
-)
+from .outputs import OutputInUse, delete_output, describe, record_output, return_removed_sales_lines
 from .serializers import (
     GlossaryEntrySerializer, GlossarySuggestionCreateSerializer, WorkEntrySerializer,
     WorkQueueItemSerializer,
@@ -58,54 +58,6 @@ class StockLineSerializer(serializers.Serializer):
     unit_cost = serializers.FloatField(required=False, allow_null=True, min_value=0)
 
 
-class OpeningBalanceSerializer(serializers.Serializer):
-    """A balance carried over from the paper khaata. Positive: the customer
-    owes the shop, or the shop owes the supplier (PartyOpeningBalance)."""
-
-    amount = serializers.IntegerField()
-    as_of_date = serializers.DateField()
-
-
-class NewCustomerSerializer(serializers.Serializer):
-    name = serializers.CharField(max_length=256)
-    phone = serializers.CharField(max_length=256, required=False, allow_blank=True, default='')
-    address = serializers.CharField(required=False, allow_blank=True, default='')
-    city = serializers.IntegerField()
-    opening_balance = OpeningBalanceSerializer(required=False, allow_null=True)
-
-
-class NewSupplierSerializer(serializers.Serializer):
-    name = serializers.CharField(max_length=256)
-    business_name = serializers.CharField(max_length=256, required=False, allow_blank=True, default='')
-    phone = serializers.CharField(max_length=256, required=False, allow_blank=True, default='')
-    opening_balance = OpeningBalanceSerializer(required=False, allow_null=True)
-
-
-class NewStockSerializer(serializers.Serializer):
-    """Step two of a new product: its stock row. Nothing is required but the
-    row itself - a sale only moves stock that has a row to move."""
-
-    location = serializers.IntegerField(required=False, allow_null=True)
-    quantity = serializers.IntegerField(required=False, allow_null=True, min_value=0)
-    unit_price = serializers.FloatField(required=False, allow_null=True, min_value=0)
-    unit_cost = serializers.FloatField(required=False, allow_null=True, min_value=0)
-
-
-class NewProductSerializer(serializers.Serializer):
-    name = serializers.CharField(max_length=256)
-    unit = serializers.IntegerField()
-    desc = serializers.CharField(required=False, allow_blank=True, default='')
-    variants = serializers.ListField(child=serializers.DictField(), required=False, default=list)
-    # One per variant, in the same order; one for a product with no variants.
-    stock = NewStockSerializer(many=True)
-
-    def validate(self, attrs):
-        wanted = max(len(attrs['variants']), 1)
-        if len(attrs['stock']) != wanted:
-            raise serializers.ValidationError({'stock': [f'Give a stock row for each of the {wanted} variants.']})
-        return attrs
-
-
 # What each list type may set on a stock row.
 STOCK_FIELDS = {
     BacklogType.STOCK_LIST: ('location', 'quantity', 'counted_at'),
@@ -118,6 +70,14 @@ class BacklogWorkViewSet(GenericViewSet):
     permission_classes = [IsAuthenticated, IsEntryWorker]
     parser_classes = [JSONParser, MultiPartParser, FormParser]
     throttle_scope = 'backlog_lookup'
+
+    def get_permissions(self):
+        # The type-ahead also serves the create dialogs on the invoice
+        # screens, which the shop's employees use: names only, so anyone in
+        # the business may read it.
+        if self.action == 'lookup':
+            return [IsAuthenticated(), HasActiveBusiness()]
+        return super().get_permissions()
 
     def get_throttles(self):
         # Only the type-ahead is rate limited (§7): it is the one call a
@@ -551,84 +511,31 @@ class BacklogWorkViewSet(GenericViewSet):
     # the entry screen, tied to the page the user has open. The answer is
     # the new record's id and name, as a lookup's is - never a figure.
 
-    def _opening_balance(self, business, values, **party):
-        if values and values.get('amount'):
-            PartyOpeningBalance.objects.create(
-                business=business, amount=values['amount'], as_of_date=values['as_of_date'], **party)
-
     @action(['POST'], detail=True, url_path='new-customer', url_name='new-customer')
     def new_customer(self, request, pk=None):
         entry = self.my_entry(pk, review=True)
-        business = self.business()
-        serializer = NewCustomerSerializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        data = serializer.validated_data
-        if not City.objects.filter(pk=data['city']).exists():
-            raise exceptions.ValidationError({'city': ['Pick a city from the list.']})
         with transaction.atomic():
-            customer = Customer.objects.create(
-                business=business, name=data['name'].strip(), phone=data['phone'].strip() or None,
-                address=data['address'].strip() or None, city_id=data['city'])
-            self._opening_balance(business, data.get('opening_balance'), customer=customer)
+            customer = create_customer(self.business(), request.data)
             BacklogNewRecord.objects.create(entry=entry, customer=customer, created_by=request.user)
         return Response({'id': customer.id, 'label': customer.name}, status=status.HTTP_201_CREATED)
 
     @action(['POST'], detail=True, url_path='new-supplier', url_name='new-supplier')
     def new_supplier(self, request, pk=None):
         entry = self.my_entry(pk, review=True)
-        business = self.business()
-        serializer = NewSupplierSerializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        data = serializer.validated_data
         with transaction.atomic():
-            supplier = Supplier.objects.create(
-                business=business, name=data['name'].strip(),
-                business_name=data['business_name'].strip() or None, phone=data['phone'].strip() or None)
-            self._opening_balance(business, data.get('opening_balance'), supplier=supplier)
+            supplier = create_supplier(self.business(), request.data)
             BacklogNewRecord.objects.create(entry=entry, supplier=supplier, created_by=request.user)
-        label = f'{supplier.name} ({supplier.business_name})' if supplier.business_name else supplier.name
-        return Response({'id': supplier.id, 'label': label}, status=status.HTTP_201_CREATED)
+        return Response({'id': supplier.id, 'label': supplier_label(supplier)}, status=status.HTTP_201_CREATED)
 
     @action(['POST'], detail=True, url_path='new-product', url_name='new-product')
     def new_product(self, request, pk=None):
-        """A product, its variants and a stock row for each, in one go: a
-        product with no stock row cannot go on an invoice. A quantity typed
-        here is a count, dated today (§8), so sales and purchases dated on or
-        before today do not move it again."""
+        """A product with its variants and a stock row for each
+        (root/new_records.py)."""
         entry = self.my_entry(pk, review=True)
-        business = self.business()
-        serializer = NewProductSerializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        data = serializer.validated_data
-        if not Unit.objects.filter(pk=data['unit']).exists():
-            raise exceptions.ValidationError({'unit': ['Pick a unit from the list.']})
-        locations = {line.get('location') for line in data['stock'] if line.get('location')}
-        if locations and Location.objects.filter(pk__in=locations, business_id=business.id).count() != len(locations):
-            raise exceptions.ValidationError({'stock': ['Pick a location from the list.']})
-        default_location = (Location.objects.filter(business_id=business.id)
-                            .order_by('-is_default', 'id').values_list('id', flat=True).first())
-
         with transaction.atomic():
-            product_serializer = ProductAndVariantCreateSerializer(data={
-                'name': data['name'].strip(), 'unit': data['unit'], 'desc': data['desc'],
-                'variants': [{'attributes': v.get('attributes') or {}} for v in data['variants']],
-            }, context={'business_id': business.id})
-            product_serializer.is_valid(raise_exception=True)
-            product = product_serializer.save()
-            variants = list(product.variants.order_by('id'))
-            for variant, line in zip(variants, data['stock']):
-                quantity = line.get('quantity')
-                InventoryItem.objects.create(
-                    business_id=business.id, inventory=business.inventory_glance, product=variant,
-                    location_id=line.get('location') or default_location,
-                    quantity=quantity or 0, quantity_on_hand=quantity or 0,
-                    unit_price=line.get('unit_price'), unit_cost=line.get('unit_cost'),
-                    stock_counted_at=timezone.localdate() if quantity is not None else None)
+            product, variants = create_product_with_stock(self.business(), request.data)
             BacklogNewRecord.objects.create(entry=entry, product=product, created_by=request.user)
-        return Response({
-            'product': {'id': product.id, 'label': product.name},
-            'variants': [{'id': v.id, 'label': variant_label(v)} for v in variants],
-        }, status=status.HTTP_201_CREATED)
+        return Response(product_answer(product, variants), status=status.HTTP_201_CREATED)
 
     # ── lookups and the glossary ─────────────────────────────────────────
 
