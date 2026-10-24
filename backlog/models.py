@@ -222,9 +222,12 @@ class BacklogOutput(models.Model):
 
 class BacklogNewRecord(models.Model):
     """
-    A customer, supplier or product created from a page because the page
-    named one MarketPro did not have (BUGS.md #006). Kept so the owner
-    reviewing the page sees what was added to the shop's records.
+    A customer, supplier, product or product variant created from a page
+    because the page named one MarketPro did not have (BUGS.md #006). Kept
+    so the owner reviewing the page sees what was added to the shop's
+    records. Products and variants come only from a stock page
+    (backlog/new_products.py); a variant here is one added to a product
+    MarketPro already had - a new product's own variants come with it.
 
     Not a BacklogOutput: an output is what the page's own content became -
     what Submit requires and approval acts on. A new customer is neither.
@@ -238,6 +241,8 @@ class BacklogNewRecord(models.Model):
         'root.Supplier', on_delete=models.CASCADE, null=True, blank=True, related_name='+')
     product = models.ForeignKey(
         'root.Product', on_delete=models.CASCADE, null=True, blank=True, related_name='+')
+    variant = models.ForeignKey(
+        'root.ProductVariant', on_delete=models.CASCADE, null=True, blank=True, related_name='+')
     created_by = models.ForeignKey(
         settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name='+')
     created_at = models.DateTimeField(auto_now_add=True)
@@ -247,16 +252,21 @@ class BacklogNewRecord(models.Model):
             models.CheckConstraint(
                 name='backlog_new_record_exactly_one',
                 condition=(
-                    models.Q(customer__isnull=False, supplier__isnull=True, product__isnull=True)
-                    | models.Q(customer__isnull=True, supplier__isnull=False, product__isnull=True)
-                    | models.Q(customer__isnull=True, supplier__isnull=True, product__isnull=False)
+                    models.Q(customer__isnull=False, supplier__isnull=True, product__isnull=True,
+                             variant__isnull=True)
+                    | models.Q(customer__isnull=True, supplier__isnull=False, product__isnull=True,
+                               variant__isnull=True)
+                    | models.Q(customer__isnull=True, supplier__isnull=True, product__isnull=False,
+                               variant__isnull=True)
+                    | models.Q(customer__isnull=True, supplier__isnull=True, product__isnull=True,
+                               variant__isnull=False)
                 ),
             ),
         ]
 
     @property
     def kind(self):
-        for name in ('customer', 'supplier', 'product'):
+        for name in ('customer', 'supplier', 'product', 'variant'):
             if getattr(self, f'{name}_id'):
                 return name
         return None

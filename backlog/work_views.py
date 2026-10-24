@@ -32,7 +32,7 @@ from sales.serializers import (
     SalesInvoiceAndItemsCreateSerializer, SalesInvoiceAndItemsUpdateSerializer,
     SalesReceiptCreateSerializer,
 )
-from . import lookups
+from . import lookups, new_products
 from .access import HasActiveBusiness, IsEntryWorker, is_owner
 from .glossary import current_version
 from .models import BacklogEntry, BacklogNewRecord, BacklogType, GlossaryEntry, GlossarySuggestion
@@ -525,6 +525,36 @@ class BacklogWorkViewSet(GenericViewSet):
             supplier = create_supplier(self.business(), request.data, with_balance=False)
             BacklogNewRecord.objects.create(entry=entry, supplier=supplier, created_by=request.user)
         return Response({'id': supplier.id, 'label': supplier_label(supplier)}, status=status.HTTP_201_CREATED)
+
+    # ── new products and variants, from a stock page only ───────────────
+    #
+    # The page is the count: the product is made without stock, and the
+    # stock line entered next makes its stock row (backlog/new_products.py).
+    # An invoice page never creates one.
+
+    @action(['POST'], detail=True, url_path='new-product', url_name='new-product')
+    def new_product(self, request, pk=None):
+        entry = self.my_entry(pk, review=True)
+        self.require_type(entry, BacklogType.STOCK_LIST)
+        with transaction.atomic():
+            product, variants = new_products.create_product(self.business(), request.data)
+            BacklogNewRecord.objects.create(entry=entry, product=product, created_by=request.user)
+        return Response(new_products.answer(product, variants), status=status.HTTP_201_CREATED)
+
+    @action(['GET', 'POST'], detail=True, url_path=r'products/(?P<product_id>\d+)/variants',
+            url_name='product-variants')
+    def product_variants(self, request, pk=None, product_id=None):
+        """A product the page names and MarketPro has: GET its details and
+        variants (names and attributes only), POST new variants for it."""
+        entry = self.my_entry(pk, review=True)
+        self.require_type(entry, BacklogType.STOCK_LIST)
+        if request.method == 'GET':
+            return Response(new_products.product_for_adding(self.business(), product_id))
+        with transaction.atomic():
+            product, variants = new_products.add_variants(self.business(), product_id, request.data)
+            BacklogNewRecord.objects.bulk_create([
+                BacklogNewRecord(entry=entry, variant=variant, created_by=request.user) for variant in variants])
+        return Response(new_products.answer(product, variants), status=status.HTTP_201_CREATED)
 
     # ── lookups and the glossary ─────────────────────────────────────────
 

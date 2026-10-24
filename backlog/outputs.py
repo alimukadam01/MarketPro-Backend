@@ -54,7 +54,7 @@ def describe(output):
 
 
 def describe_new_record(row):
-    """A customer, supplier or product created from a page, as the owner
+    """A customer, supplier, product or variant created from a page, as the owner
     reviewing it sees it - with the opening balance a party came with. Only
     the owner's serializer uses this: the entry person never sees a balance."""
     kind = row.kind
@@ -68,6 +68,12 @@ def describe_new_record(row):
         else:
             item['detail'] = party.business_name or ''
         item['opening_balance'] = opening.amount if opening else None
+    elif kind == 'variant':
+        # A variant added to a product MarketPro had: it opens its product.
+        item['record_id'] = row.variant.base_id
+        item['label'] = variant_label(row.variant)
+        item['detail'] = 'new variant'
+        item['opening_balance'] = None
     else:
         product = row.product
         count = len(product.variants.all())

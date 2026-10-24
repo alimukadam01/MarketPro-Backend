@@ -223,7 +223,10 @@ class VisibilityTests(BacklogFixture):
                 self.assertEqual(response.status_code, 200)
                 for row in response.json():
                     self.assertFalse(set(row) & self.FIGURES, row)
-                    self.assertLessEqual(set(row), {'id', 'label', 'unit', 'type', 'is_default'})
+                    # product / product_name: a variant's product, so a stock page
+                    # can offer to add variants to it - an id and a name.
+                    self.assertLessEqual(set(row), {'id', 'label', 'unit', 'type', 'is_default',
+                                                    'product', 'product_name'})
         # On a sales page, whether a product is in stock - yes or no, no figure.
         stocked = client.get('/backlog-work/lookup/variants/', {'q': 'emulsion', 'stock': '1'}).json()
         self.assertEqual([(row['id'], row['in_stock']) for row in stocked], [(self.white.id, True)])
@@ -529,8 +532,9 @@ class DeletingOutputsTests(BacklogFixture):
 
 class NewRecordsTests(BacklogFixture):
     """BUGS.md #006: a customer or supplier the page names but MarketPro
-    lacks is created from the picker. Products are not: one made to finish
-    an invoice came with made-up stock (root/new_records.py)."""
+    lacks is created from the picker. A product only from a stock page,
+    without stock: one made to finish an invoice came with made-up stock
+    (root/new_records.py, backlog/new_products.py)."""
 
     def test_a_new_customer_from_a_backlog_page_takes_no_balance(self):
         """An opening balance is a money figure; typed while entering an old
@@ -559,19 +563,84 @@ class NewRecordsTests(BacklogFixture):
         self.assertEqual(response.json()['label'], 'Nippon (Nippon Paint Pakistan)')
         self.assertFalse(PartyOpeningBalance.objects.filter(supplier_id=response.json()['id']).exists())
 
-    def test_products_are_not_created_from_a_picker(self):
-        """Products and their stock come from the Products and Inventory
-        screens, not from an invoice."""
+    def test_products_are_not_created_from_an_invoice(self):
+        """Only a stock page makes products; the invoice screens' endpoints
+        for it are gone."""
         entry = self.claimed()
-        body = {'name': 'Enamel', 'unit': self.unit.id, 'stock': [{'quantity': 5}]}
+        body = {'name': 'Enamel', 'unit': self.unit.id}
+        typist = client_for(self.typist)
+        self.assertEqual(typist.post(f'/backlog-work/{entry.id}/new-product/', body, format='json').status_code, 400)
+        self.assertEqual(typist.post(f'/backlog-work/{entry.id}/products/{self.paint.id}/variants/',
+                                     {'variants': [{'attributes': {'Shade': 'Ivory'}}]},
+                                     format='json').status_code, 400)
         # Gone: a 404, or a 405 where the path now reads as a product's own.
         gone = (404, 405)
-        self.assertIn(client_for(self.typist).post(
-            f'/backlog-work/{entry.id}/new-product/', body, format='json').status_code, gone)
         owner = client_for(self.owner)
         self.assertIn(owner.post('/products/create-with-stock/', body, format='json').status_code, gone)
         self.assertIn(owner.get(f'/products/{self.paint.id}/variants-and-stock/').status_code, gone)
         self.assertFalse(Product.objects.filter(name='Enamel').exists())
+
+    def test_a_stock_page_creates_a_product_without_stock(self):
+        """The stock line entered next is the count: it makes the row."""
+        entry = self.claimed(type='stock_list')
+        client = client_for(self.typist)
+        url = f'/backlog-work/{entry.id}/new-product/'
+        self.assertEqual(client.post(url, {'name': 'Enamel', 'unit': self.unit.id, 'variants': [
+            {'attributes': {'Colour': 'Black'}}, {'attributes': {'Colour': 'black'}}]},
+            format='json').status_code, 400)
+        self.assertEqual(client.post(url, {'name': 'Enamel', 'unit': self.unit.id, 'variants': [
+            {'attributes': {'Colour': ' '}}]}, format='json').status_code, 400)
+        response = client.post(url, {
+            'name': 'Enamel', 'unit': self.unit.id, 'desc': 'Gloss',
+            'variants': [{'attributes': {'Colour': 'Black'}}, {'attributes': {'Colour': 'Red'}}],
+            'stock': [{'quantity': 99}]}, format='json')
+        self.assertEqual(response.status_code, 201, response.content)
+        product = Product.objects.get(name='Enamel', business=self.business)
+        self.assertEqual(response.json(), {
+            'product': {'id': product.id, 'label': 'Enamel'},
+            'variants': [{'id': v.id, 'label': f'Enamel ({v.name})'} for v in product.variants.order_by('id')]})
+        self.assertEqual([v.name for v in product.variants.order_by('id')], ['Black', 'Red'])
+        self.assertFalse(InventoryItem.objects.filter(product__base=product).exists())
+
+        black = response.json()['variants'][0]['id']
+        line = client.post(f'/backlog-work/{entry.id}/inventory/',
+                           {'product': black, 'quantity': 12, 'counted_at': '2026-10-01'}, format='json')
+        self.assertEqual(line.status_code, 201, line.content)
+        self.assertEqual(InventoryItem.objects.get(product_id=black).quantity_on_hand, 12)
+
+        rows = client_for(self.owner).get(f'/backlog-entries/{entry.id}/').json()['new_records']
+        self.assertEqual([(r['kind'], r['record_id'], r['label'], r['detail']) for r in rows],
+                         [('product', product.id, 'Enamel', '2 variants · Tin')])
+
+    def test_a_stock_page_adds_variants_to_a_product_it_has(self):
+        entry = self.claimed(type='stock_list')
+        client = client_for(self.typist)
+        url = f'/backlog-work/{entry.id}/products/{self.paint.id}/variants/'
+        shown = client.get(url).json()
+        self.assertEqual((shown['name'], shown['unit'], [v['label'] for v in shown['variants']]),
+                         ('Weather Emulsion', {'id': self.unit.id, 'label': 'Tin'},
+                          ['Weather Emulsion (Sweet White)']))
+        self.assertNotIn('2150', str(shown))
+
+        self.assertEqual(client.post(url, {'variants': []}, format='json').status_code, 400)
+        self.assertEqual(client.post(url, {'variants': [{'attributes': {'Shade': 'sweet white'}}]},
+                                     format='json').status_code, 400)
+        response = client.post(url, {'name': 'Renamed', 'variants': [{'attributes': {'Shade': 'Ivory'}}]},
+                               format='json')
+        self.assertEqual(response.status_code, 201, response.content)
+        ivory = ProductVariant.objects.get(base=self.paint, name='Ivory')
+        self.assertEqual(response.json()['variants'], [{'id': ivory.id, 'label': 'Weather Emulsion (Ivory)'}])
+        # Only variants are added: the product's details stay as they were.
+        self.paint.refresh_from_db()
+        self.assertEqual(self.paint.name, 'Weather Emulsion')
+        self.assertFalse(InventoryItem.objects.filter(product=ivory).exists())
+
+        rows = client_for(self.owner).get(f'/backlog-entries/{entry.id}/').json()['new_records']
+        self.assertEqual([(r['kind'], r['record_id'], r['label'], r['detail']) for r in rows],
+                         [('variant', self.paint.id, 'Weather Emulsion (Ivory)', 'new variant')])
+        elsewhere = Business.objects.create(name='Elsewhere', owner=self.owner, phone='03000000000')
+        theirs = Product.objects.create(business=elsewhere, name='Theirs', unit=self.unit)
+        self.assertEqual(client.get(f'/backlog-work/{entry.id}/products/{theirs.id}/variants/').status_code, 404)
 
     def test_the_owner_sees_what_was_added_from_the_page(self):
         entry = self.claimed()
