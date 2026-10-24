@@ -308,6 +308,32 @@ def restockOnCancel(instance: SalesInvoice):
     instance.save(update_fields=['is_deducted'])
 
 
+@automatic('signal:return_removed_sales_line')
+def return_removed_sales_line(line: SalesInvoiceItem):
+    """A line taken off a sales invoice by an update gives back what it took
+    out of stock, by its deduction ledger - as restockOnCancel does for a
+    whole invoice, and as a purchase update takes a removed line's stock back
+    out (take_back_from_stock).
+
+    Deleting the line alone dropped its ledger with it and returned nothing,
+    so correcting an invoice by deleting a mistyped line lost that stock for
+    good. A line nothing was deducted for - a draft's, a cancelled
+    invoice's, a migrated one's - has no ledger and changes nothing. Goods
+    that physically came back are a return, which has its own flow.
+    """
+    deducted = line.restocks.aggregate(total=Sum('quantity'))['total'] or 0
+    if not deducted:
+        return
+    row = InventoryItem.objects.select_for_update().filter(
+        business_id=line.business_id, product_id=line.product_id).first()
+    if row:
+        row.quantity += deducted
+        row.quantity_on_hand += deducted
+        row.last_transaction = generateTransactionId(line.sales_invoice)
+        row.save(update_fields=['quantity', 'quantity_on_hand', 'last_transaction'])
+    line.restocks.all().delete()
+
+
 # ── Purchase stock ────────────────────────────────────────────────────────────
 # A received purchase puts its lines into stock, and each line's restock ledger
 # (PurchaseInvoiceItemRestock) records how many units it put there. The ledger

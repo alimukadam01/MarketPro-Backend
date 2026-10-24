@@ -38,7 +38,7 @@ from . import lookups
 from .access import HasActiveBusiness, IsEntryWorker, is_owner
 from .glossary import current_version
 from .models import BacklogEntry, BacklogNewRecord, BacklogType, GlossaryEntry, GlossarySuggestion
-from .outputs import OutputInUse, delete_output, describe, record_output, return_removed_sales_lines
+from .outputs import OutputInUse, delete_output, describe, record_output
 from .serializers import (
     GlossaryEntrySerializer, GlossarySuggestionCreateSerializer, WorkEntrySerializer,
     WorkQueueItemSerializer,
@@ -497,10 +497,9 @@ class BacklogWorkViewSet(GenericViewSet):
         serializer = serializer_class(output.record, data=request.data, context={
             'business_id': self.business().id, 'user_id': request.user.id})
         serializer.is_valid(raise_exception=True)
+        # The update gives a removed sales line's stock back itself
+        # (sales/utils.py return_removed_sales_line), as on the invoice screens.
         with transaction.atomic():
-            if sales:
-                kept = [item.get('id') for item in serializer.validated_data['items'] if item.get('id')]
-                return_removed_sales_lines(output.record, kept)
             serializer.save()
         output.refresh_from_db()
         return Response({'output': describe(output)})

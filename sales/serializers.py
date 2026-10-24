@@ -25,6 +25,7 @@ from .utils import (
     refund_new_overpayment,
     restock_held,
     restock_purchase,
+    return_removed_sales_line,
     RECEIVED_PURCHASE_STATUSES,
     sync_charge_expenses,
     take_back_from_stock,
@@ -510,19 +511,22 @@ class PurchaseInvoiceAndItemsCreateSerializer(serializers.ModelSerializer):
                         purchase_invoice=purchase_invoice
                     )
 
-            purchase_invoice.adjust_totals()
+                # Inside the transaction: totals, the restock they trigger for a
+                # received purchase (restock_purchase) and any payment go with
+                # the invoice or not at all.
+                purchase_invoice.adjust_totals()
 
-            # Money paid at the time of purchase becomes a payment record;
-            # the accounts signal mirrors it into a transaction and
-            # payment_status derives from it.
-            if amount_paid and float(amount_paid) > 0:
-                PurchaseReceipt.objects.create(
-                    purchase_invoice_id=purchase_invoice.id,
-                    amount=min(
-                        float(amount_paid),
-                        purchase_invoice.total or float(amount_paid)
-                    ),
-                )
+                # Money paid at the time of purchase becomes a payment record;
+                # the accounts signal mirrors it into a transaction and
+                # payment_status derives from it.
+                if amount_paid and float(amount_paid) > 0:
+                    PurchaseReceipt.objects.create(
+                        purchase_invoice_id=purchase_invoice.id,
+                        amount=min(
+                            float(amount_paid),
+                            purchase_invoice.total or float(amount_paid)
+                        ),
+                    )
 
             return purchase_invoice
 
@@ -1080,28 +1084,31 @@ class SalesInvoiceAndItemsCreateSerializer(ExtraChargesValidationMixin,
                         sales_invoice=sales_invoice
                     )
 
-            sales_invoice.refresh_from_db()
-            sales_invoice.adjust_totals()
-            # Status before stock: it is derived from the lines, and
-            # updateInventoryOnSale only deducts for a COMPLETED invoice.
-            sales_invoice.recalculate_status()
-            updateInventoryOnSale(sales_invoice)
-            # Usually a no-op here: with no payment yet there is no account to
-            # pay the charges out of. The payment signal syncs again once one
-            # arrives.
-            sync_charge_expenses(sales_invoice)
+                # Still inside the transaction: a failure in the stock or the
+                # charges rolls the invoice back too, rather than leaving it
+                # half processed.
+                sales_invoice.refresh_from_db()
+                sales_invoice.adjust_totals()
+                # Status before stock: it is derived from the lines, and
+                # updateInventoryOnSale only deducts for a COMPLETED invoice.
+                sales_invoice.recalculate_status()
+                updateInventoryOnSale(sales_invoice)
+                # Usually a no-op here: with no payment yet there is no account to
+                # pay the charges out of. The payment signal syncs again once one
+                # arrives.
+                sync_charge_expenses(sales_invoice)
 
-            # Money received at the time of sale becomes a payment record;
-            # the accounts signal mirrors it into a transaction and
-            # payment_status derives from it.
-            if amount_paid and float(amount_paid) > 0:
-                SalesReceipt.objects.create(
-                    sales_invoice_id=sales_invoice.id,
-                    amount=min(
-                        float(amount_paid),
-                        sales_invoice.total or float(amount_paid)
-                    ),
-                )
+                # Money received at the time of sale becomes a payment record;
+                # the accounts signal mirrors it into a transaction and
+                # payment_status derives from it.
+                if amount_paid and float(amount_paid) > 0:
+                    SalesReceipt.objects.create(
+                        sales_invoice_id=sales_invoice.id,
+                        amount=min(
+                            float(amount_paid),
+                            sales_invoice.total or float(amount_paid)
+                        ),
+                    )
 
             return sales_invoice
 
@@ -1196,8 +1203,12 @@ class SalesInvoiceAndItemsUpdateSerializer(ExtraChargesValidationMixin,
                 # removed and added back at the same price is a new line, and
                 # would otherwise be on the invoice twice for a moment
                 # (unique_together on product and price).
-                existing_items.exclude(
-                    id__in=[item.id for item in updated_items]).delete()
+                # Each gives its stock back first: deleting the line drops its
+                # deduction ledger with it (return_removed_sales_line).
+                removed = existing_items.exclude(id__in=[item.id for item in updated_items])
+                for line in removed:
+                    return_removed_sales_line(line)
+                removed.delete()
 
                 if new_items:
                     new_items = audited_bulk_create(SalesInvoiceItem, new_items)
