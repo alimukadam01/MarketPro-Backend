@@ -88,3 +88,19 @@ class InvoiceWorkflowTests(TestCase):
         self.assertEqual(response.status_code, 400, response.content)
         self.assertIn("items", response.json())
         self.assertFalse(PurchaseInvoice.objects.exists())
+
+    def test_the_sales_picker_can_list_what_has_run_out(self):
+        """An out-of-stock product, and one never stocked, are listed with 0
+        on hand when asked for - so a sale shows them (disabled) instead of
+        inviting a duplicate - and left out otherwise."""
+        InventoryItem.objects.filter(product=self.blue).update(quantity_on_hand=0, quantity=0)
+        never = ProductVariant.objects.create(base=self.white.base, name="Green", sku="WF-3")
+        url = f"/inventory/{self.business.id}/items/get_available_items/"
+
+        listed = {row["product"]["id"]: row["available_quantity"] for row in self.client.get(url).json()}
+        self.assertEqual(listed, {self.white.id: 50})
+
+        listed = {row["product"]["id"]: row["available_quantity"]
+                  for row in self.client.get(url + "?include_out_of_stock=1").json()}
+        self.assertEqual(listed, {self.white.id: 50, self.blue.id: 0, never.id: 0})
+
