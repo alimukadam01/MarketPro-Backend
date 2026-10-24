@@ -38,7 +38,8 @@ from .filters import GlobalSearch
 from .list_filters import CustomerFilter, ExpenseFilter, ProductFilter
 from .search.engine import search as global_search
 from .new_records import (
-    create_customer, create_product_with_stock, create_supplier, product_answer, supplier_label,
+    add_variants, create_customer, create_product_with_stock, create_supplier, product_answer,
+    product_for_editing, supplier_label,
 )
 from audit.helpers import audited_bulk_update
 
@@ -151,6 +152,20 @@ class ProductViewSet(ModelViewSet):
             return Response({'detail': 'No active business exists. Please contact admin.'}, status=status.HTTP_400_BAD_REQUEST)
         product, variants = create_product_with_stock(business, request.data)
         return Response(product_answer(product, variants), status=status.HTTP_201_CREATED)
+
+    @action(['GET', 'POST'], detail=True, url_path='variants-and-stock', url_name='variants-and-stock')
+    def variants_and_stock(self, request, pk=None):
+        """A product an invoice's picker matched by name. GET: its details and
+        variants, for the dialog. POST: the dialog's changes - details,
+        variants updated, new variants with a stock row each; nothing is
+        deleted (root/new_records.py). Answers with the new variants."""
+        business = get_active_business(request)
+        if not business:
+            return Response({'detail': 'No active business exists. Please contact admin.'}, status=status.HTTP_400_BAD_REQUEST)
+        if request.method == 'GET':
+            return Response(product_for_editing(business, pk))
+        product, new_variants = add_variants(business, pk, request.data)
+        return Response(product_answer(product, new_variants), status=status.HTTP_200_OK)
 
     def get_queryset(self):
         business = get_active_business(self.request)

@@ -223,7 +223,10 @@ class VisibilityTests(BacklogFixture):
                 self.assertEqual(response.status_code, 200)
                 for row in response.json():
                     self.assertFalse(set(row) & self.FIGURES, row)
-                    self.assertLessEqual(set(row), {'id', 'label', 'unit', 'type', 'is_default'})
+                    # product / product_name: a variant's product, so a name typed
+                    # can be matched to it for "Add variants" - an id and a name.
+                    self.assertLessEqual(set(row), {'id', 'label', 'unit', 'type', 'is_default',
+                                                    'product', 'product_name'})
         found = client.get('/backlog-work/lookup/variants/', {'q': 'emulsion white'}).json()
         self.assertEqual([row['id'] for row in found], [self.white.id])
 
@@ -618,6 +621,55 @@ class NewRecordsTests(BacklogFixture):
         for url in ('/customers/create-with-balance/', '/suppliers/create-with-balance/',
                     '/products/create-with-stock/'):
             self.assertEqual(typist.post(url, {'name': 'X'}, format='json').status_code, 403, url)
+
+    def test_variants_added_to_a_product_the_name_matched(self):
+        owner = client_for(self.owner)
+        url = f'/products/{self.paint.id}/variants-and-stock/'
+        shown = owner.get(url).json()
+        self.assertEqual((shown['name'], shown['unit']['label']), ('Weather Emulsion', 'Tin'))
+        self.assertEqual([v['id'] for v in shown['variants']], [self.white.id])
+
+        response = owner.post(url, {
+            'name': 'Weather Emulsion', 'unit': self.unit.id, 'desc': 'Exterior',
+            'variants': [{'id': self.white.id, 'attributes': {'Shade': 'Brilliant White'}},
+                         {'attributes': {'Shade': 'Sky Blue'}}],
+            'stock': [{'quantity': 7, 'unit_price': 2300}]}, format='json')
+        self.assertEqual(response.status_code, 200, response.content)
+        new = response.json()['variants']
+        self.assertEqual([v['label'] for v in new], ['Weather Emulsion (Sky Blue)'])
+        self.assertEqual(InventoryItem.objects.get(product_id=new[0]['id']).quantity_on_hand, 7)
+        self.white.refresh_from_db()
+        self.assertEqual(self.white.name, 'Brilliant White')
+        self.paint.refresh_from_db()
+        self.assertEqual(self.paint.desc, 'Exterior')
+
+        # A variant left off the list is never deleted here.
+        owner.post(url, {'name': 'Weather Emulsion', 'unit': self.unit.id, 'variants': []}, format='json')
+        self.assertTrue(ProductVariant.objects.filter(pk=self.white.pk).exists())
+
+        # Another product's variant is refused.
+        other = Product.objects.create(business=self.business, name='Putty', unit=self.unit)
+        stray = ProductVariant.objects.create(base=other, name='default', sku='BL-9')
+        bad = owner.post(url, {'name': 'Weather Emulsion', 'unit': self.unit.id,
+                               'variants': [{'id': stray.id, 'attributes': {}}]}, format='json')
+        self.assertEqual(bad.status_code, 400)
+
+    def test_the_entry_person_adds_variants_from_the_page(self):
+        entry = self.claimed()
+        client = client_for(self.typist)
+        found = client.get('/backlog-work/lookup/variants/?q=Weather').json()
+        self.assertEqual((found[0]['product'], found[0]['product_name']), (self.paint.id, 'Weather Emulsion'))
+        url = f'/backlog-work/{entry.id}/products/{self.paint.id}/'
+        self.assertEqual(client.get(url).json()['variants'][0]['id'], self.white.id)
+        response = client.post(url, {
+            'name': 'Weather Emulsion', 'unit': self.unit.id,
+            'variants': [{'id': self.white.id, 'attributes': {}}, {'attributes': {'Shade': 'Red'}}],
+            'stock': [{}]}, format='json')
+        self.assertEqual(response.status_code, 200, response.content)
+        self.assertEqual(response.json()['variants'][0]['label'], 'Weather Emulsion (Red)')
+        # Only with a page open, and never the shop's stock in the answer.
+        self.assertNotIn('quantity', str(client.get(url).json()))
+        self.assertEqual(client_for(self.second).get(url).status_code, 403)
 
     def test_staff_can_read_the_names_lookup(self):
         staff = User.objects.create_user(email='staff-lookup@example.com', password='pw', role=User.EMPLOYEE)

@@ -35,7 +35,10 @@ def variants(business, query):
           .filter(base__business_id=business.id, is_active=True, base__is_active=True)
           .select_related('base', 'base__unit'))
     qs = _match(qs, query, ['base__name', 'name', 'sku', 'base__code'])
-    return [{'id': v.id, 'label': variant_label(v), 'unit': v.base.unit.name if v.base.unit_id else ''}
+    # With its product's id and name, so a picker can tell a name typed is
+    # an existing product's and offer to add variants to it.
+    return [{'id': v.id, 'label': variant_label(v), 'unit': v.base.unit.name if v.base.unit_id else '',
+             'product': v.base_id, 'product_name': v.base.name}
             for v in qs.order_by('base__name', 'name')[:LIMIT]]
 
 

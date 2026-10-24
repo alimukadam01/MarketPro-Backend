@@ -24,7 +24,8 @@ from audit.helpers import audited_update
 from inventory.models import InventoryItem
 from root.models import Location, ProductVariant
 from root.new_records import (
-    create_customer, create_product_with_stock, create_supplier, product_answer, supplier_label,
+    add_variants, create_customer, create_product_with_stock, create_supplier, product_answer,
+    product_for_editing, supplier_label,
 )
 from root.serializers import ProductAndVariantCreateSerializer, ProductAndVariantUpdateSerializer
 from root.utils import get_active_business, local_date
@@ -535,6 +536,17 @@ class BacklogWorkViewSet(GenericViewSet):
             product, variants = create_product_with_stock(self.business(), request.data)
             BacklogNewRecord.objects.create(entry=entry, product=product, created_by=request.user)
         return Response(product_answer(product, variants), status=status.HTTP_201_CREATED)
+
+    @action(['GET', 'POST'], detail=True, url_path=r'products/(?P<product_id>\d+)', url_name='product')
+    def product(self, request, pk=None, product_id=None):
+        """A product the page names and MarketPro has: GET its details and
+        variants (names and attributes only), POST the dialog's changes and
+        new variants with their stock rows (root/new_records.py)."""
+        self.my_entry(pk, review=True)
+        if request.method == 'GET':
+            return Response(product_for_editing(self.business(), product_id))
+        product, new_variants = add_variants(self.business(), product_id, request.data)
+        return Response(product_answer(product, new_variants))
 
     # ── lookups and the glossary ─────────────────────────────────────────
 
