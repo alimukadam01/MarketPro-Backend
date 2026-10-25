@@ -3,6 +3,7 @@ from django.db.models.signals import post_save
 from django.dispatch import receiver
 
 from .models import Business, Customer, Employee, EmployeeAccess
+from audit.context import automatic
 
 
 def _crud(enabled):
@@ -12,6 +13,7 @@ def _crud(enabled):
 ### every business gets a counter-sale customer, so a walk-in invoice can be
 ### raised before the buyer is known
 @receiver(post_save, sender=Business)
+@automatic('signal:create_walk_in_customer')
 def createWalkInCustomer(sender, instance: Business, created, **kwargs):
     if not created:
         return

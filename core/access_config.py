@@ -65,7 +65,7 @@ class UserAccessConfig:
 
         # Only load EmployeeAccess for employees
         self.emp_perm = None
-        if self.role == user.is_employee:
+        if self.role == user.EMPLOYEE:
             self.emp_perm = EmployeeAccess.objects.filter(
                 user=user, business=business
             ).first()
@@ -82,6 +82,10 @@ class UserAccessConfig:
         return getattr(self.biz_cfg, flag, True)
 
     def _module_config(self, module):
+        # Data entry sees no module: its whole app is the backlog queue.
+        if self.role == self.user.BACKLOG:
+            return {'enabled': False, **_ALL_FALSE}
+
         if not self._module_enabled_in_business(module):
             return {'enabled': False, **_ALL_FALSE}
 
@@ -105,5 +109,6 @@ class UserAccessConfig:
     def to_dict(self):
         return {
             'role':    self.role,
+            'backlog_entry': self.role == self.user.BACKLOG,
             'modules': {m: self._module_config(m) for m in MODULES},
         }

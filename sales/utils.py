@@ -12,6 +12,9 @@ from inventory.models import InventoryItem
 from .models import PurchaseInvoice
 from .models import PurchaseInvoiceItemRestock
 from root.utils import generateTransactionId, local_date, whatsapp_number
+from audit.helpers import audited_bulk_create, audited_bulk_update
+from audit.context import automatic
+from .stock_rule import skip_purchase_line, skip_sales_line, stock_applies
 
 
 def getRestockField(is_partial: bool) -> str:
@@ -139,22 +142,22 @@ def update_inventory(instance, is_partially_received):
     try:
         with transaction.atomic():
             if to_update:
-                InventoryItem.objects.bulk_update(
-                    to_update,
+                audited_bulk_update(
+                    InventoryItem, to_update,
                     ['quantity', 'quantity_on_hand', 'last_transaction_id']
                 )
 
             if to_create:
-                InventoryItem.objects.bulk_create(to_create)
+                audited_bulk_create(InventoryItem, to_create)
 
             if updated_invoice_items:
-                PurchaseInvoiceItem.objects.bulk_update(
-                    updated_invoice_items,
+                audited_bulk_update(
+                    PurchaseInvoiceItem, updated_invoice_items,
                     ['is_partially_restocked', 'is_restocked']
                 )
 
             if restock_objs:
-                PurchaseInvoiceItemRestock.objects.bulk_create(restock_objs)
+                audited_bulk_create(PurchaseInvoiceItemRestock, restock_objs)
 
     except Exception as error:
         print(error)
@@ -194,6 +197,7 @@ def checkSalesInvoiceItemCreateFields(attrs):
 def reserveSalesInvoiceItem(item):
     pass
 
+@automatic('signal:update_inventory_on_sale')
 def updateInventoryOnSale(instance: SalesInvoice):
     """
     Move the sold goods out of stock.
@@ -237,6 +241,11 @@ def updateInventoryOnSale(instance: SalesInvoice):
             # first time its invoice was edited.
             if item.is_deducted:
                 continue
+            # Dated on or before this product's stock count: the count
+            # already has it (sales/stock_rule.py).
+            if not stock_applies(item):
+                skip_sales_line(item)
+                continue
             delta = item.compute_restock_delta()
             if delta > 0:
                 inventory_item.apply_restock_delta(True, delta, generateTransactionId(instance))
@@ -249,6 +258,7 @@ def updateInventoryOnSale(instance: SalesInvoice):
     instance.save(update_fields=['is_deducted'])
 
 
+@automatic('signal:restock_on_cancel')
 def restockOnCancel(instance: SalesInvoice):
     """
     Cancelling an invoice returns its goods to stock.
@@ -298,6 +308,32 @@ def restockOnCancel(instance: SalesInvoice):
     instance.save(update_fields=['is_deducted'])
 
 
+@automatic('signal:return_removed_sales_line')
+def return_removed_sales_line(line: SalesInvoiceItem):
+    """A line taken off a sales invoice by an update gives back what it took
+    out of stock, by its deduction ledger - as restockOnCancel does for a
+    whole invoice, and as a purchase update takes a removed line's stock back
+    out (take_back_from_stock).
+
+    Deleting the line alone dropped its ledger with it and returned nothing,
+    so correcting an invoice by deleting a mistyped line lost that stock for
+    good. A line nothing was deducted for - a draft's, a cancelled
+    invoice's, a migrated one's - has no ledger and changes nothing. Goods
+    that physically came back are a return, which has its own flow.
+    """
+    deducted = line.restocks.aggregate(total=Sum('quantity'))['total'] or 0
+    if not deducted:
+        return
+    row = InventoryItem.objects.select_for_update().filter(
+        business_id=line.business_id, product_id=line.product_id).first()
+    if row:
+        row.quantity += deducted
+        row.quantity_on_hand += deducted
+        row.last_transaction = generateTransactionId(line.sales_invoice)
+        row.save(update_fields=['quantity', 'quantity_on_hand', 'last_transaction'])
+    line.restocks.all().delete()
+
+
 # ── Purchase stock ────────────────────────────────────────────────────────────
 # A received purchase puts its lines into stock, and each line's restock ledger
 # (PurchaseInvoiceItemRestock) records how many units it put there. The ledger
@@ -341,9 +377,15 @@ def units_in_stock(line):
     return line.restocks.aggregate(total=Sum('quantity'))['total'] or 0
 
 
+@automatic('signal:receive_into_stock')
 def receive_into_stock(line, units, invoice):
     """Put `units` of this line's product into stock and log them against it."""
-    if units <= 0:
+    if units <= 0 or line.stock_skipped:
+        return
+    # Delivered on or before this product's stock count: the count already
+    # has it (sales/stock_rule.py).
+    if not stock_applies(line):
+        skip_purchase_line(line)
         return
     data = line.morph()
     stock = InventoryItem.objects.filter(
@@ -368,6 +410,7 @@ def receive_into_stock(line, units, invoice):
     line.update_restock_flags()
 
 
+@automatic('signal:take_back_from_stock')
 def take_back_from_stock(line, units, product_id=None):
     """Take `units` this line put into stock back out, and off its ledger.
 
@@ -397,6 +440,7 @@ def take_back_from_stock(line, units, product_id=None):
             left = 0
 
 
+@automatic('signal:restock_purchase')
 def restock_purchase(invoice):
     """Stock whatever a received purchase's lines have not put in yet.
 
@@ -415,6 +459,8 @@ def restock_purchase(invoice):
         lines = PurchaseInvoiceItem.objects.filter(
             purchase_invoice_id=invoice.pk).select_related('product')
         for line in lines:
+            if line.stock_skipped:
+                continue
             receive_into_stock(line, line.compute_restock_delta(), invoice)
         invoice.update_restock_flags()
 
@@ -642,6 +688,7 @@ def paid_into_account(invoice):
     return None
 
 
+@automatic('signal:sync_charge_expenses')
 def sync_charge_expenses(invoice):
     """
     Make an invoice's charge expenses match its extra charges, now.

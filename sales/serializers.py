@@ -25,12 +25,15 @@ from .utils import (
     refund_new_overpayment,
     restock_held,
     restock_purchase,
+    return_removed_sales_line,
     RECEIVED_PURCHASE_STATUSES,
     sync_charge_expenses,
     take_back_from_stock,
     units_in_stock,
     updateInventoryOnSale
 )
+from audit.helpers import audited_bulk_create, audited_bulk_update
+from .stock_rule import reconcile_purchase_invoice, reconcile_sales_invoice, stock_dates
 
 
 MAX_EXTRA_CHARGES = 20
@@ -460,11 +463,15 @@ class PurchaseInvoiceUpdateSerializer(serializers.ModelSerializer):
         ]
 
     def update(self, instance, validated_data):
+        dated_before = stock_dates(instance)
         for attr, value in validated_data.items():
             setattr(instance, attr, value)
 
         instance.save()
         instance.adjust_totals()
+        # A new delivery or invoice date can cross a stock count.
+        if stock_dates(instance) != dated_before and reconcile_purchase_invoice(instance):
+            restock_purchase(instance)
         return instance
 
 
@@ -495,8 +502,8 @@ class PurchaseInvoiceAndItemsCreateSerializer(serializers.ModelSerializer):
                     quantity=item['quantity'],
                     unit_cost=item['unit_cost']
                 ) for item in items]
-                invoice_items = PurchaseInvoiceItem.objects.bulk_create(
-                    invoice_items)
+                invoice_items = audited_bulk_create(
+                    PurchaseInvoiceItem, invoice_items)
 
                 if project_id:
                     ProjectPurchaseInvoice.objects.create(
@@ -504,19 +511,22 @@ class PurchaseInvoiceAndItemsCreateSerializer(serializers.ModelSerializer):
                         purchase_invoice=purchase_invoice
                     )
 
-            purchase_invoice.adjust_totals()
+                # Inside the transaction: totals, the restock they trigger for a
+                # received purchase (restock_purchase) and any payment go with
+                # the invoice or not at all.
+                purchase_invoice.adjust_totals()
 
-            # Money paid at the time of purchase becomes a payment record;
-            # the accounts signal mirrors it into a transaction and
-            # payment_status derives from it.
-            if amount_paid and float(amount_paid) > 0:
-                PurchaseReceipt.objects.create(
-                    purchase_invoice_id=purchase_invoice.id,
-                    amount=min(
-                        float(amount_paid),
-                        purchase_invoice.total or float(amount_paid)
-                    ),
-                )
+                # Money paid at the time of purchase becomes a payment record;
+                # the accounts signal mirrors it into a transaction and
+                # payment_status derives from it.
+                if amount_paid and float(amount_paid) > 0:
+                    PurchaseReceipt.objects.create(
+                        purchase_invoice_id=purchase_invoice.id,
+                        amount=min(
+                            float(amount_paid),
+                            purchase_invoice.total or float(amount_paid)
+                        ),
+                    )
 
             return purchase_invoice
 
@@ -564,6 +574,7 @@ class PurchaseInvoiceAndItemsUpdateSerializer(serializers.ModelSerializer):
         # Measured before anything changes, so only the overpayment this
         # Update creates is refunded (refund_new_overpayment).
         overpaid_before = overpaid_by(self.instance)
+        dated_before = stock_dates(self.instance)
 
         try:
             # All of it in one transaction, totals and refund included: a
@@ -579,6 +590,10 @@ class PurchaseInvoiceAndItemsUpdateSerializer(serializers.ModelSerializer):
                     self.instance.save()
                     receiving = self.instance.status in RECEIVED_PURCHASE_STATUSES
                     self._apply_lines(items, receiving)
+                    # The delivery or invoice date may have moved across a
+                    # stock count (sales/stock_rule.py).
+                    if stock_dates(self.instance) != dated_before:
+                        reconcile_purchase_invoice(self.instance)
                     self.instance.adjust_totals()
 
                 self.instance.refresh_from_db()
@@ -643,8 +658,8 @@ class PurchaseInvoiceAndItemsUpdateSerializer(serializers.ModelSerializer):
             line.unit_cost = item['unit_cost']
             kept.append((line, was_product, was_quantity))
         if kept:
-            PurchaseInvoiceItem.objects.bulk_update(
-                [line for line, _, _ in kept], ['product', 'quantity', 'unit_cost'])
+            audited_bulk_update(
+                PurchaseInvoiceItem, [line for line, _, _ in kept], ['product', 'quantity', 'unit_cost'])
 
         for line, was_product, was_quantity in kept:
             in_stock = units_in_stock(line)
@@ -663,7 +678,7 @@ class PurchaseInvoiceAndItemsUpdateSerializer(serializers.ModelSerializer):
                 units = line.quantity - in_stock if in_stock else line.quantity - was_quantity
                 receive_into_stock(line, units, self.instance)
 
-        new_lines = PurchaseInvoiceItem.objects.bulk_create([
+        new_lines = audited_bulk_create(PurchaseInvoiceItem, [
             PurchaseInvoiceItem(
                 business_id=self.context['business_id'],
                 purchase_invoice=self.instance,
@@ -944,11 +959,16 @@ class SalesInvoiceUpdateSerializer(ExtraChargesValidationMixin,
         ]
 
     def save(self, **kwargs):
+        dated_before = stock_dates(self.instance)
 
         for attr, value in self.validated_data.items():
             setattr(self.instance, attr, value)
 
         self.instance.save()
+        # A new invoice date can cross a stock count.
+        if stock_dates(self.instance) != dated_before:
+            reconcile_sales_invoice(self.instance)
+            updateInventoryOnSale(self.instance)
         # The charges or the invoice date may have changed.
         sync_charge_expenses(self.instance)
         return self.instance
@@ -1018,8 +1038,8 @@ class RestockSerializer(serializers.Serializer):
                 item.notes = invoice_item.notes
 
         with transaction.atomic():
-            InventoryItem.objects.bulk_create(new_inventory_items)
-            InventoryItem.objects.bulk_update(inventory_items, [
+            audited_bulk_create(InventoryItem, new_inventory_items)
+            audited_bulk_update(InventoryItem, inventory_items, [
                 'location', 'quantity', 'quantity_on_hand',
                 'unit_cost', 'notes'
             ])
@@ -1056,7 +1076,7 @@ class SalesInvoiceAndItemsCreateSerializer(ExtraChargesValidationMixin,
                     quantity_received=item['quantity'],
                     unit_price=item['unit_price']
                 ) for item in items]
-                SalesInvoiceItem.objects.bulk_create(invoice_items)
+                audited_bulk_create(SalesInvoiceItem, invoice_items)
 
                 if project_id:
                     ProjectSalesInvoice.objects.create(
@@ -1064,28 +1084,31 @@ class SalesInvoiceAndItemsCreateSerializer(ExtraChargesValidationMixin,
                         sales_invoice=sales_invoice
                     )
 
-            sales_invoice.refresh_from_db()
-            sales_invoice.adjust_totals()
-            # Status before stock: it is derived from the lines, and
-            # updateInventoryOnSale only deducts for a COMPLETED invoice.
-            sales_invoice.recalculate_status()
-            updateInventoryOnSale(sales_invoice)
-            # Usually a no-op here: with no payment yet there is no account to
-            # pay the charges out of. The payment signal syncs again once one
-            # arrives.
-            sync_charge_expenses(sales_invoice)
+                # Still inside the transaction: a failure in the stock or the
+                # charges rolls the invoice back too, rather than leaving it
+                # half processed.
+                sales_invoice.refresh_from_db()
+                sales_invoice.adjust_totals()
+                # Status before stock: it is derived from the lines, and
+                # updateInventoryOnSale only deducts for a COMPLETED invoice.
+                sales_invoice.recalculate_status()
+                updateInventoryOnSale(sales_invoice)
+                # Usually a no-op here: with no payment yet there is no account to
+                # pay the charges out of. The payment signal syncs again once one
+                # arrives.
+                sync_charge_expenses(sales_invoice)
 
-            # Money received at the time of sale becomes a payment record;
-            # the accounts signal mirrors it into a transaction and
-            # payment_status derives from it.
-            if amount_paid and float(amount_paid) > 0:
-                SalesReceipt.objects.create(
-                    sales_invoice_id=sales_invoice.id,
-                    amount=min(
-                        float(amount_paid),
-                        sales_invoice.total or float(amount_paid)
-                    ),
-                )
+                # Money received at the time of sale becomes a payment record;
+                # the accounts signal mirrors it into a transaction and
+                # payment_status derives from it.
+                if amount_paid and float(amount_paid) > 0:
+                    SalesReceipt.objects.create(
+                        sales_invoice_id=sales_invoice.id,
+                        amount=min(
+                            float(amount_paid),
+                            sales_invoice.total or float(amount_paid)
+                        ),
+                    )
 
             return sales_invoice
 
@@ -1126,6 +1149,7 @@ class SalesInvoiceAndItemsUpdateSerializer(ExtraChargesValidationMixin,
         # Measured before anything changes, so only the overpayment this
         # Update creates is refunded (refund_new_overpayment).
         overpaid_before = overpaid_by(self.instance)
+        dated_before = stock_dates(self.instance)
 
         try:
             with transaction.atomic():
@@ -1179,14 +1203,18 @@ class SalesInvoiceAndItemsUpdateSerializer(ExtraChargesValidationMixin,
                 # removed and added back at the same price is a new line, and
                 # would otherwise be on the invoice twice for a moment
                 # (unique_together on product and price).
-                existing_items.exclude(
-                    id__in=[item.id for item in updated_items]).delete()
+                # Each gives its stock back first: deleting the line drops its
+                # deduction ledger with it (return_removed_sales_line).
+                removed = existing_items.exclude(id__in=[item.id for item in updated_items])
+                for line in removed:
+                    return_removed_sales_line(line)
+                removed.delete()
 
                 if new_items:
-                    new_items = SalesInvoiceItem.objects.bulk_create(new_items)
+                    new_items = audited_bulk_create(SalesInvoiceItem, new_items)
 
                 if grown:
-                    SalesInvoiceItem.objects.bulk_update(grown, ['quantity'])
+                    audited_bulk_update(SalesInvoiceItem, grown, ['quantity'])
                     for line in grown:
                         # A line the system has already taken out of stock is
                         # re-flagged from its ledger: with the quantity up it is
@@ -1204,6 +1232,10 @@ class SalesInvoiceAndItemsUpdateSerializer(ExtraChargesValidationMixin,
                 # lines are only final once the new ones are created and the
                 # removed ones deleted, and the status is derived from them.
                 self.instance.recalculate_status()
+                # The date may have moved across a stock count: lines change
+                # sides before the deduction pass (sales/stock_rule.py).
+                if stock_dates(self.instance) != dated_before:
+                    reconcile_sales_invoice(self.instance)
                 updateInventoryOnSale(self.instance)
                 # After the status: a draft or cancelled invoice records none.
                 sync_charge_expenses(self.instance)
@@ -1450,7 +1482,7 @@ class PurchaseQuotationAndItemsCreateSerializer(serializers.ModelSerializer):
                     **item
                 ))
 
-            PurchaseQuotationItem.objects.bulk_create(quotation_items)
+            audited_bulk_create(PurchaseQuotationItem, quotation_items)
 
         return quotation
 
@@ -1510,8 +1542,8 @@ class PurchaseQuotationAndItemsUpdateSerializer(serializers.ModelSerializer):
                         ))
 
                 if new_items:
-                    new_items = PurchaseQuotationItem.objects.bulk_create(
-                        new_items)
+                    new_items = audited_bulk_create(
+                        PurchaseQuotationItem, new_items)
 
                 # Items on the frontend can't be updated,
                 # They can either be created or deleted.

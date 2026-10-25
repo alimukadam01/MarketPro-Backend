@@ -64,6 +64,8 @@ from .serializers import (
     GenerateInvoiceSerializer,
     InvoiceImageSerializer
 )
+from audit.helpers import audited_update
+from .stock_rule import return_applies
 
 # Create your views here.
 
@@ -350,6 +352,12 @@ class PurchaseInvoiceViewSet(PeriodFilterMixin, SettledInvoiceViewMixin, ModelVi
 
             res_serializer = PurchaseInvoiceSerializer(purchase_invoice)
             return Response(res_serializer.data, status=status.HTTP_201_CREATED)
+
+        except exceptions.APIException:
+            # A validation error goes out as the 400 it is, with its reason -
+            # as on the sales create and on the purchase update. Caught below
+            # it became a bare 500.
+            raise
 
         except Exception as error:
             print(error)
@@ -861,7 +869,7 @@ class SalesInvoiceViewSet(PeriodFilterMixin, SettledInvoiceViewMixin, ModelViewS
                 # it is cleared here so un-cancelling deducts exactly once more.
                 restockOnCancel(invoice)
                 invoice.status = 'X'
-                SalesInvoice.objects.filter(pk=invoice.pk).update(status='X')
+                audited_update(SalesInvoice.objects.filter(pk=invoice.pk), status='X')
                 # A cancelled sale paid out no charges: their expenses go too.
                 sync_charge_expenses(invoice)
 
@@ -895,7 +903,7 @@ class SalesInvoiceViewSet(PeriodFilterMixin, SettledInvoiceViewMixin, ModelViewS
                 # Out of the manual state first, so recalculate_status stops
                 # treating it as sticky and can derive from the lines again.
                 invoice.status = 'D'
-                SalesInvoice.objects.filter(pk=invoice.pk).update(status='D')
+                audited_update(SalesInvoice.objects.filter(pk=invoice.pk), status='D')
                 invoice.recalculate_status()
                 updateInventoryOnSale(invoice)
                 # And the charge expenses come back, if it has been paid.
@@ -938,7 +946,7 @@ class SalesInvoiceViewSet(PeriodFilterMixin, SettledInvoiceViewMixin, ModelViewS
                 # nothing else should be touched by a change of buyer. It used
                 # to be here to dodge a post_save receiver that ran a stock
                 # deduction pass on any invoice save; that receiver is gone.
-                SalesInvoice.objects.filter(pk=invoice.pk).update(customer=customer)
+                audited_update(SalesInvoice.objects.filter(pk=invoice.pk), customer=customer)
 
             invoice.refresh_from_db()
 
@@ -1370,6 +1378,12 @@ class ReturnedItemsViewSet(PeriodFilterMixin, ModelViewSet):
                 }, status=status.HTTP_400_BAD_REQUEST)
 
             instance.return_type = 'to_inventory'
+
+            # Recorded on or before the product's stock count: the counted
+            # figure already has it back (sales/stock_rule.py).
+            if not return_applies(instance):
+                instance.save()
+                return Response({"detail": "OK"}, status=status.HTTP_200_OK)
 
             inventory_item = InventoryItem.objects.get(
                 product=instance.invoice_item.product)

@@ -5,7 +5,7 @@ from rest_framework.filters import SearchFilter
 from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework import status
 from root.utils import get_active_business
-from root.models import BaseQuerySet
+from root.models import BaseQuerySet, ProductVariant
 from .filters import InventoryItemFilter
 from .models import Inventory, InventoryItem
 from .serializers import AvailableProductSerializer, InventoryItemCreateSerializer, InventoryItemSerializer, InventoryItemUpdateSerializer, InventorySerializer
@@ -84,32 +84,54 @@ class InventoryItemsViewSet(ModelViewSet):
         }
     
     @action(['GET'], False)
-    def get_available_items(self, pk=None, inventory_pk=None):
-        try:
-            available_items = InventoryItem.objects.filter(
-                inventory_id=self.kwargs['inventory_pk'],
-                quantity_on_hand__gt=0
-            )
+    def get_available_items(self, request, inventory_pk=None):
+        """What a sale can be made from: each product with what is on hand
+        and its price.
 
-            available_products = [{
-                "product": item.product, 
-                "available_quantity": item.quantity_on_hand,
-                "unit_price": item.unit_price
-            } for item in available_items]
+        By default only what is in stock. With ?include_out_of_stock=1, every
+        active product, in stock or not (0 on hand, no price) - so the sales
+        screens can list a product that has run out, disabled, rather than
+        leave it looking missing and invite a duplicate from Create.
+
+        Scoped to the active business, not the URL: the screens pass the
+        business id where the inventory id goes, and the two only agree while
+        inventories happen to have been created in business order (see
+        InventoryQuerySet.get_items).
+        """
+        try:
+            business = get_active_business(request)
+            if not business:
+                return Response({'detail': 'No active business exists. Please contact admin.'},
+                                status=status.HTTP_400_BAD_REQUEST)
+            rows = (InventoryItem.objects.filter(inventory__business_id=business.id)
+                    .select_related('product__base__unit'))
+
+            if request.query_params.get('include_out_of_stock') in ('1', 'true'):
+                stock = {row.product_id: row for row in rows}
+                variants = (ProductVariant.objects
+                            .filter(base__business_id=business.id, is_active=True, base__is_active=True)
+                            .select_related('base__unit').order_by('base__name', 'name'))
+                available_products = [{
+                    "product": variant,
+                    "available_quantity": max(stock[variant.id].quantity_on_hand, 0) if variant.id in stock else 0,
+                    "unit_price": stock[variant.id].unit_price if variant.id in stock else None,
+                } for variant in variants]
+            else:
+                available_products = [{
+                    "product": item.product,
+                    "available_quantity": item.quantity_on_hand,
+                    "unit_price": item.unit_price
+                } for item in rows.filter(quantity_on_hand__gt=0)]
 
             serializer = AvailableProductSerializer(available_products, many=True)
-            
-            return Response(
-                data=serializer.data, 
-                status=status.HTTP_200_OK
-            )
+            return Response(data=serializer.data, status=status.HTTP_200_OK)
 
         except Exception as error:
             print(error)
             return Response({
                 "detail": "Internal Server Error"
             }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-        
+
     @action(['POST'], detail=False, url_path='bulk-delete', url_name='bulk-delete')
     def bulk_delete(self, request, inventory_pk=None):
         item_ids = request.data.get('item_ids', [])
