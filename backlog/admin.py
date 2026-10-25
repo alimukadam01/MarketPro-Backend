@@ -2,8 +2,13 @@ from django.contrib import admin
 
 from core.admin_masking import MaskedModelAdmin
 
-from .models import BacklogEntry
+from .models import (
+    BacklogEntry, BacklogNewRecord, BacklogOutput, BacklogReview, Glossary, GlossaryEntry, GlossarySuggestion,
+    UploadBatch,
+)
 
-# Registered through MaskedModelAdmin for consistency; BacklogEntry holds no
+# Registered through MaskedModelAdmin for consistency; none of these holds a
 # currency amount of its own.
-admin.site.register(BacklogEntry, MaskedModelAdmin)
+for model in (BacklogEntry, BacklogOutput, BacklogNewRecord, BacklogReview, UploadBatch,
+              Glossary, GlossaryEntry, GlossarySuggestion):
+    admin.site.register(model, MaskedModelAdmin)

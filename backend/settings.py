@@ -64,10 +64,13 @@ INSTALLED_APPS = [
     'backlog',
     'accounts',
     'targets',
+    'audit',
 ]
 
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
+    # A clean audit context per request (audit/context.py).
+    'audit.middleware.AuditContextMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'corsheaders.middleware.CorsMiddleware',
     'django.middleware.common.CommonMiddleware',
@@ -150,12 +153,19 @@ USE_I18N = True
 USE_TZ = True
 
 REST_FRAMEWORK = {
+    # simplejwt's, plus: it records who is acting for the audit trail, and
+    # keeps data entry accounts inside the backlog (audit/authentication.py).
     'DEFAULT_AUTHENTICATION_CLASSES': (
-        'rest_framework_simplejwt.authentication.JWTAuthentication',
+        'audit.authentication.AuditedJWTAuthentication',
     ),
     'DEFAULT_PERMISSION_CLASSES': [
         'rest_framework.permissions.IsAuthenticated',
-    ]
+    ],
+    # The backlog entry screens' type-ahead (backlog/work_views.py): the one
+    # call that could page through a shop's names, so it is rate limited.
+    'DEFAULT_THROTTLE_RATES': {
+        'backlog_lookup': '240/min',
+    },
 }
 
 SIMPLE_JWT = {

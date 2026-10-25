@@ -4,6 +4,7 @@ from root.serializers import SimpleBusinessSerializer, SimpleCustomerSerializer
 from sales.models import PurchaseQuotation, PurchaseQuotationItem, SalesInvoice, PurchaseInvoice
 from sales.serializers import PurchaseInvoiceSerializer, PurchaseQuotationSerializer, SalesInvoiceSerializer, SimpleSalesInvoiceSerializer, SimplePurchaseInvoiceSerializer
 from .models import Project, ProjectPurchaseInvoice, ProjectPurchaseQuotation, ProjectSalesInvoice, ProjectTask
+from audit.helpers import audited_bulk_create
 
 
 class ProjectTaskSerializer(serializers.ModelSerializer):
@@ -212,8 +213,8 @@ class CompleteProjectCreateSerializer(serializers.ModelSerializer):
                     **quotation_item
                 ) for quotation_item in quotation_items]
 
-                ProjectTask.objects.bulk_create(tasks_tbc)
-                PurchaseQuotationItem.objects.bulk_create(quotation_items_tbc)
+                audited_bulk_create(ProjectTask, tasks_tbc)
+                audited_bulk_create(PurchaseQuotationItem, quotation_items_tbc)
 
                 # link quotation to project
                 ProjectPurchaseQuotation.objects.create(

@@ -6,11 +6,13 @@ from .models import PurchaseInvoice, PurchaseInvoiceItem, SalesInvoice, SalesInv
 from .utils import (
     deleting_with_invoice, sync_charge_expenses, restock_purchase,
 )
+from audit.context import automatic
 
 
 ### update invoice totals
 @receiver(post_save, sender=SalesInvoiceItem)
 @receiver(post_delete, sender=SalesInvoiceItem)
+@automatic('signal:update_totals_after_sales_invoice_item')
 def updateTotalsAfterSalesInvoiceItem(sender, instance, **kwargs):
     if instance.sales_invoice:
         instance.sales_invoice.adjust_totals()
@@ -28,6 +30,7 @@ def updateTotalsAfterSalesInvoiceItem(sender, instance, **kwargs):
 
 ### automatically update inventory on purchase
 @receiver(post_save, sender=PurchaseInvoice)
+@automatic('signal:update_inventory_on_purchase')
 def updateInventoryOnPurchase(sender, instance: PurchaseInvoice, **kwargs):
     # Moved to sales/utils.py, which reads the lines fresh and cannot re-enter
     # itself - see restock_purchase.
@@ -37,6 +40,7 @@ def updateInventoryOnPurchase(sender, instance: PurchaseInvoice, **kwargs):
 ### update invoice totals
 @receiver(post_save, sender=PurchaseInvoiceItem)
 @receiver(post_delete, sender=PurchaseInvoiceItem)
+@automatic('signal:update_totals_after_purchase_invoice_item')
 def updateTotalsAfterPurchaseInvoiceItem(sender, instance, **kwargs):
     if instance.purchase_invoice:
         instance.purchase_invoice.adjust_totals()
@@ -60,5 +64,6 @@ def updateTotalsAfterPurchaseInvoiceItem(sender, instance, **kwargs):
 
 
 @receiver(post_save, sender=ReturnedItem)
+@automatic('signal:update_totals_after_return_item')
 def updateTotalsAfterReturnItem(sender, instance, created, **kwargs):
     instance.invoice_item.sales_invoice.adjust_totals()

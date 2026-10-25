@@ -37,6 +37,7 @@ from .utils import (
     previous_month_bounds, profit_estimate, receivables,
     uncleared_opening_balances,
 )
+from audit.helpers import audited_update
 
 
 NO_BUSINESS = {'detail': 'No active business exists. Please contact admin.'}
@@ -121,9 +122,9 @@ class MoneyAccountViewSet(ModelViewSet):
                 if not instance.is_active and instance.is_default:
                     instance.is_default = False
                     fields.append('is_default')
-                    MoneyAccount.objects.filter(
+                    audited_update(MoneyAccount.objects.filter(
                         id=MoneyAccount.objects.system_account_id(business.id)
-                    ).update(is_default=True)
+                    ), is_default=True)
 
                 instance.save(update_fields=fields)
 
@@ -157,9 +158,9 @@ class MoneyAccountViewSet(ModelViewSet):
 
             # Exactly one default at a time.
             with db_transaction.atomic():
-                MoneyAccount.objects.filter(
+                audited_update(MoneyAccount.objects.filter(
                     business_id=business.id, is_default=True
-                ).exclude(id=instance.id).update(is_default=False)
+                ).exclude(id=instance.id), is_default=False)
 
                 if not instance.is_default:
                     instance.is_default = True
@@ -530,7 +531,7 @@ class TransactionViewSet(PeriodFilterMixin, ModelViewSet):
                         payment_group=instance.payment_group,
                         business_id=business.id,
                     )
-                    updated = group.update(status=new_status)
+                    updated = audited_update(group, status=new_status)
                     # A bounce can change which account an invoice's extra
                     # charges leave from. The single-transaction branch below
                     # resyncs through its save signal; a queryset update sends

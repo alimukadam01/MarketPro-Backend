@@ -1,3 +1,4 @@
+from django.utils import timezone
 from rest_framework import serializers
 from root.models import Location
 from root.serializers import BaseItemSerializer, ProductVariantSerializer, SimpleProductVariantSerializer
@@ -14,6 +15,7 @@ class InventoryItemSerializer(BaseItemSerializer):
     unit_price = serializers.FloatField()
     reorder_level = serializers.IntegerField()
     last_transaction = serializers.CharField(read_only=True)
+    stock_counted_at = serializers.DateField(read_only=True)
     restock_needed = serializers.SerializerMethodField()
 
     def get_restock_needed(self, obj: InventoryItem):
@@ -27,13 +29,23 @@ class InventoryItemSerializer(BaseItemSerializer):
         return True
 
 
+def stamp_count(values, quantity_set):
+    """A person typing a quantity has counted the stock (§8): date the count
+    today, unless the date was given (an import says when its file was true)."""
+    if quantity_set and not values.get('stock_counted_at'):
+        values['stock_counted_at'] = timezone.localdate()
+    return values
+
+
 class InventoryItemCreateSerializer(serializers.ModelSerializer):
 
     def save(self, **kwargs):
+        values = stamp_count(dict(self.validated_data),
+                             'quantity' in self.validated_data or 'quantity_on_hand' in self.validated_data)
         return InventoryItem.objects.create(
             business_id = self.context['business_id'], 
             inventory_id = self.context['inventory_id'],
-            **self.validated_data
+            **values
         )
 
     class Meta:
@@ -41,15 +53,20 @@ class InventoryItemCreateSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'product', 'quantity', 'track_code', 
             'notes', 'location', 'quantity_on_hand', 'quantity_reserved',
-            'unit_cost', 'unit_price', 'reorder_level' 
+            'unit_cost', 'unit_price', 'reorder_level', 'stock_counted_at',
         ]
 
 
 class InventoryItemUpdateSerializer(serializers.ModelSerializer):
 
     def save(self, **kwargs):
-        
-        for attr, value in self.validated_data.items():
+        # Only a changed quantity is a count; a price edit is not (§8).
+        counted = any(
+            field in self.validated_data and self.validated_data[field] != getattr(self.instance, field)
+            for field in ('quantity', 'quantity_on_hand'))
+        values = stamp_count(dict(self.validated_data), counted)
+
+        for attr, value in values.items():
             setattr(self.instance, attr, value)
 
         self.instance.save()
@@ -59,7 +76,7 @@ class InventoryItemUpdateSerializer(serializers.ModelSerializer):
         model = InventoryItem
         fields = [
             'id', 'product', 'location', 'quantity', 'quantity_on_hand', 'quantity_reserved','track_code', 
-            'notes', 'unit_cost', 'unit_price', 'reorder_level'
+            'notes', 'unit_cost', 'unit_price', 'reorder_level', 'stock_counted_at',
         ]
 
 

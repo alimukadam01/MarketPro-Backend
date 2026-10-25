@@ -258,7 +258,8 @@ class PermissionTests(SearchFixture):
     """T9."""
 
     def employee(self, permissions):
-        user = User.objects.create_user(email="limited@example.com", password="pw-for-tests", role="employee")
+        user = User.objects.create_user(email=f"limited{User.objects.count()}@example.com",
+                                        password="pw-for-tests", role="employee")
         employee = Employee.objects.create(user=user, business=self.business, created_by=self.owner)
         EmployeeAccess.objects.create(employee=employee, permissions=permissions)
         return user, employee
@@ -275,14 +276,13 @@ class PermissionTests(SearchFixture):
         self.business.refresh_from_db()
         self.assertNotIn("returned_item", self.groups(self.run_search(TOKEN)))
 
-    def test_backlog_shows_an_employee_only_their_open_entries(self):
-        user, employee = self.employee({})
-        mine = BacklogEntry.objects.create(business=self.business, type="sales_invoice", image="b.png",
-                                           created_by=self.owner, assigned_to=employee, notes="zqxv mine")
+    def test_backlog_follows_the_backlog_module_permission(self):
         BacklogEntry.objects.create(business=self.business, type="sales_invoice", image="b.png",
-                                    created_by=self.owner, assigned_to=employee, notes="zqxv done", is_done=True)
-        ids = [h["id"] for h in self.groups(self.run_search(TOKEN, user=user))["backlog_entry"]["hits"]]
-        self.assertEqual(ids, [mine.id])
+                                    created_by=self.owner, book_label="zqxv book")
+        allowed, _ = self.employee({"backlog_entries": {"view": True}})
+        self.assertIn("backlog_entry", self.groups(self.run_search(TOKEN, user=allowed)))
+        denied, _ = self.employee({})
+        self.assertNotIn("backlog_entry", self.groups(self.run_search(TOKEN, user=denied)))
 
 
 class CostTests(SearchFixture):
