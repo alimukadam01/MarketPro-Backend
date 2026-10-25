@@ -24,7 +24,6 @@ from audit.helpers import audited_update
 from inventory.models import InventoryItem
 from root.models import Location, ProductVariant
 from root.new_records import create_customer, create_supplier, supplier_label
-from root.serializers import ProductAndVariantCreateSerializer, ProductAndVariantUpdateSerializer
 from root.utils import get_active_business, local_date
 from sales.serializers import (
     PaymentReceiptSerializer, PurchaseInvoiceAndItemsCreateSerializer,
@@ -46,7 +45,7 @@ NOT_YOURS = {'detail': 'This page is not one you are working on.'}
 
 
 class StockLineSerializer(serializers.Serializer):
-    """One line of a stock or price list. Only what the page can say."""
+    """One line of a stock list. Only what the page can say."""
 
     product = serializers.IntegerField()
     location = serializers.IntegerField(required=False, allow_null=True)
@@ -55,14 +54,6 @@ class StockLineSerializer(serializers.Serializer):
     unit_price = serializers.FloatField(required=False, allow_null=True, min_value=0)
     unit_cost = serializers.FloatField(required=False, allow_null=True, min_value=0)
     reorder_level = serializers.IntegerField(required=False, allow_null=True, min_value=0)
-
-
-# What each list type may set on a stock row. A stock page may also carry
-# the price, the cost and the reorder level, when the register has them.
-STOCK_FIELDS = {
-    BacklogType.STOCK_LIST: ('location', 'quantity', 'counted_at', 'unit_price', 'unit_cost', 'reorder_level'),
-    BacklogType.PRICE_LIST: ('unit_price', 'unit_cost'),
-}
 
 
 class BacklogWorkViewSet(GenericViewSet):
@@ -315,32 +306,15 @@ class BacklogWorkViewSet(GenericViewSet):
         receipt.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
 
-    @action(['POST'], detail=True, url_path='products', url_name='products')
-    def products(self, request, pk=None):
-        entry = self.my_entry(pk, review=True)
-        self.require_type(entry, BacklogType.PRODUCT_LIST)
-        business = self.business()
-        serializer = ProductAndVariantCreateSerializer(data=request.data, context={'business_id': business.id})
-        serializer.is_valid(raise_exception=True)
-        with transaction.atomic():
-            product = serializer.save()
-            output = record_output(entry, product, request.user, entered=self._product_values(product))
-        return Response({'output': describe(output)}, status=status.HTTP_201_CREATED)
-
-    def _product_values(self, product):
-        return {
-            'name': product.name, 'unit': product.unit_id, 'desc': product.desc or '',
-            'variants': [{'id': v.id, 'attributes': v.attributes or {}} for v in product.variants.all()],
-        }
-
     @action(['POST'], detail=True, url_path='inventory', url_name='inventory')
     def inventory(self, request, pk=None):
-        """A stock or price list line: set on the product's stock row, created
-        if the shop has none. An existing row's values are kept in the output
-        so deleting it puts them back."""
+        """A stock list line: set on the product's stock row, created if the
+        shop has none. With the count it may carry the price, the cost and
+        the reorder level, when the page has them. An existing row's values
+        are kept in the output so deleting it puts them back."""
         entry = self.my_entry(pk, review=True)
-        self.require_type(entry, BacklogType.STOCK_LIST, BacklogType.PRICE_LIST)
-        values = self._stock_values(entry, request.data)
+        self.require_type(entry, BacklogType.STOCK_LIST)
+        values = self._stock_values(request.data)
         business = self.business()
         variant = ProductVariant.objects.filter(pk=values.pop('product'), base__business_id=business.id).first()
         if not variant:
@@ -369,17 +343,12 @@ class BacklogWorkViewSet(GenericViewSet):
                                    entered=self._entered(values, variant), previous=previous)
         return Response({'output': describe(output)}, status=status.HTTP_201_CREATED)
 
-    def _stock_values(self, entry, data):
+    def _stock_values(self, data):
         serializer = StockLineSerializer(data=data)
         serializer.is_valid(raise_exception=True)
-        allowed = STOCK_FIELDS[entry.type]
-        values = {key: value for key, value in serializer.validated_data.items()
-                  if key == 'product' or key in allowed}
-        if entry.type == BacklogType.STOCK_LIST and values.get('quantity') is None:
+        values = dict(serializer.validated_data)
+        if values.get('quantity') is None:
             raise exceptions.ValidationError({'quantity': ['Enter the quantity counted.']})
-        if entry.type == BacklogType.PRICE_LIST and values.get('unit_price') is None \
-                and values.get('unit_cost') is None:
-            raise exceptions.ValidationError({'unit_price': ['Enter a price.']})
         location = values.get('location')
         if location and not Location.objects.filter(pk=location, business_id=self.business().id).exists():
             raise exceptions.ValidationError({'location': ['Pick a location from the list.']})
@@ -424,8 +393,6 @@ class BacklogWorkViewSet(GenericViewSet):
         return self._update_output(request, entry, output)
 
     def _values_of(self, output):
-        if output.kind == 'product':
-            return self._product_values(output.product)
         if output.kind == 'inventory_item':
             return output.entered
         if output.kind in ('sales_invoice', 'purchase_invoice'):
@@ -469,19 +436,8 @@ class BacklogWorkViewSet(GenericViewSet):
         return values
 
     def _update_output(self, request, entry, output):
-        if output.kind == 'product':
-            if not output.created:
-                return Response({'detail': 'Only a product entered from this page can be changed here.'},
-                                status=status.HTTP_400_BAD_REQUEST)
-            serializer = ProductAndVariantUpdateSerializer(
-                output.product, data=request.data, context={'business_id': self.business().id})
-            serializer.is_valid(raise_exception=True)
-            product = serializer.save()
-            output.entered = self._product_values(product)
-            output.save(update_fields=['entered'])
-            return Response({'output': describe(output)})
         if output.kind == 'inventory_item':
-            values = self._stock_values(entry, {**request.data, 'product': output.inventory_item.product_id})
+            values = self._stock_values({**request.data, 'product': output.inventory_item.product_id})
             values.pop('product')
             row = output.inventory_item
             changes = self._row_changes(values)

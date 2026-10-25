@@ -19,21 +19,21 @@ from root.models import BaseQuerySet, Business
 
 
 class BacklogType:
+    """What a page is. Sales invoices, purchase invoices and stock lists only,
+    for now: product and price lists were dropped to keep the backlog simple,
+    and come back when a shop needs them."""
+
     SALES_INVOICE = 'sales_invoice'
     PURCHASE_INVOICE = 'purchase_invoice'
-    PRODUCT_LIST = 'product_list'
-    PRICE_LIST = 'price_list'
     STOCK_LIST = 'stock_list'
 
     CHOICES = [
         (SALES_INVOICE, 'Sales Invoice'),
         (PURCHASE_INVOICE, 'Purchase Invoice'),
-        (PRODUCT_LIST, 'Product List'),
-        (PRICE_LIST, 'Price List'),
         (STOCK_LIST, 'Stock List'),
     ]
     # A page of many records, entered one at a time and marked complete.
-    LISTS = (PRODUCT_LIST, PRICE_LIST, STOCK_LIST)
+    LISTS = (STOCK_LIST,)
     INVOICES = (SALES_INVOICE, PURCHASE_INVOICE)
 
 

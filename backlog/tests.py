@@ -255,7 +255,7 @@ class VisibilityTests(BacklogFixture):
                 self.assertEqual(client.get(url).status_code, 403)
 
     def test_a_page_only_takes_records_of_its_type(self):
-        entry = self.claimed(type='product_list')
+        entry = self.claimed(type='stock_list')
         response = client_for(self.typist).post(f'/backlog-work/{entry.id}/sales-invoice/',
                                                 self.sale_payload(), format='json')
         self.assertEqual(response.status_code, 400)
@@ -486,8 +486,8 @@ class DeletingOutputsTests(BacklogFixture):
         self.assertEqual(InventoryItem.objects.get(pk=self.stock.pk).quantity_on_hand, 56)
 
     def test_a_stock_line_carries_price_cost_and_reorder_level(self):
-        """Optional on a stock page; a price list cannot set a reorder level.
-        A field first set on a correction is still put back on delete."""
+        """Optional on a stock page. A field first set on a correction is
+        still put back on delete."""
         entry = self.claimed(type='stock_list')
         client = client_for(self.typist)
         response = client.post(f'/backlog-work/{entry.id}/inventory/', {
@@ -514,12 +514,6 @@ class DeletingOutputsTests(BacklogFixture):
         self.assertEqual((row.quantity_on_hand, row.unit_price, row.unit_cost, row.reorder_level),
                          (50, 2150, 1800, None))
 
-        prices = self.claimed(user=self.second, type='price_list')
-        client_for(self.second).post(f'/backlog-work/{prices.id}/inventory/', {
-            'product': self.white.id, 'unit_price': 2400, 'reorder_level': 9}, format='json')
-        row.refresh_from_db()
-        self.assertEqual((row.unit_price, row.reorder_level), (2400, None))
-
     def test_a_stock_line_on_an_existing_row_is_put_back(self):
         entry = self.claimed(type='stock_list')
         client = client_for(self.typist)
@@ -537,32 +531,14 @@ class DeletingOutputsTests(BacklogFixture):
         row.refresh_from_db()
         self.assertEqual((row.quantity_on_hand, row.stock_counted_at), (50, None))
 
-    def test_a_price_list_sets_prices_only(self):
-        entry = self.claimed(type='price_list')
-        client = client_for(self.typist)
-        client.post(f'/backlog-work/{entry.id}/inventory/',
-                    {'product': self.white.id, 'unit_price': 2300, 'quantity': 999}, format='json')
-        row = InventoryItem.objects.get(pk=self.stock.pk)
-        self.assertEqual((row.unit_price, row.quantity_on_hand), (2300, 50))
-
-    def test_a_product_list_creates_and_edits_products(self):
-        entry = self.claimed(type='product_list')
-        client = client_for(self.typist)
-        response = client.post(f'/backlog-work/{entry.id}/products/', {
-            'name': 'Synthetic Enamel', 'unit': self.unit.id, 'desc': 'Gloss',
-            'variants': [{'attributes': {'Shade': 'Black', 'Size': 'Quarter'}},
-                         {'attributes': {'Shade': 'White', 'Size': 'Quarter'}}]}, format='json')
-        self.assertEqual(response.status_code, 201, response.content)
-        output = response.json()['output']
-        self.assertEqual((output['label'], output['variant_count']), ('Synthetic Enamel', 2))
-        values = client.get(f'/backlog-work/{entry.id}/outputs/{output["id"]}/').json()['values']
-        edited = client.put(f'/backlog-work/{entry.id}/outputs/{output["id"]}/', {
-            'name': 'Synthetic Enamel', 'unit': self.unit.id, 'desc': 'Gloss',
-            'variants': values['variants'][:1]}, format='json')
-        self.assertEqual(edited.status_code, 200, edited.content)
-        self.assertEqual(Product.objects.get(pk=output['record_id']).variants.count(), 1)
-        self.assertEqual(client.delete(f'/backlog-work/{entry.id}/outputs/{output["id"]}/').status_code, 204)
-        self.assertFalse(Product.objects.filter(pk=output['record_id']).exists())
+    def test_only_invoices_and_stock_lists_are_uploaded(self):
+        """Product and price lists are not taken, for now."""
+        owner = client_for(self.owner)
+        for kind in ('product_list', 'price_list'):
+            response = owner.post('/backlog-batches/', {'type': kind, 'files': [upload('p.png', png())]},
+                                  format='multipart')
+            self.assertEqual(response.status_code, 400, kind)
+        self.assertFalse(BacklogEntry.objects.filter(type__in=['product_list', 'price_list']).exists())
 
 
 class NewRecordsTests(BacklogFixture):
