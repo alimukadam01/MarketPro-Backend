@@ -485,6 +485,41 @@ class DeletingOutputsTests(BacklogFixture):
         self.assertEqual(response.status_code, 200, response.content)
         self.assertEqual(InventoryItem.objects.get(pk=self.stock.pk).quantity_on_hand, 56)
 
+    def test_a_stock_line_carries_price_cost_and_reorder_level(self):
+        """Optional on a stock page; a price list cannot set a reorder level.
+        A field first set on a correction is still put back on delete."""
+        entry = self.claimed(type='stock_list')
+        client = client_for(self.typist)
+        response = client.post(f'/backlog-work/{entry.id}/inventory/', {
+            'product': self.white.id, 'quantity': 40, 'unit_price': 2300, 'unit_cost': None}, format='json')
+        self.assertEqual(response.status_code, 201, response.content)
+        output = response.json()['output']
+        row = InventoryItem.objects.get(pk=self.stock.pk)
+        # An empty field leaves the row's own value.
+        self.assertEqual((row.quantity_on_hand, row.unit_price, row.unit_cost, row.reorder_level),
+                         (40, 2300, 1800, None))
+        self.assertEqual(client.get(f'/backlog-work/{entry.id}/outputs/{output["id"]}/').json()['values']['unit_price'],
+                         2300)
+
+        response = client.put(f'/backlog-work/{entry.id}/outputs/{output["id"]}/', {
+            'quantity': 40, 'unit_price': 2300, 'unit_cost': 1900, 'reorder_level': 5}, format='json')
+        self.assertEqual(response.status_code, 200, response.content)
+        row.refresh_from_db()
+        self.assertEqual((row.unit_cost, row.reorder_level), (1900, 5))
+        self.assertEqual(client.put(f'/backlog-work/{entry.id}/outputs/{output["id"]}/', {
+            'quantity': 40, 'reorder_level': -1}, format='json').status_code, 400)
+
+        client.delete(f'/backlog-work/{entry.id}/outputs/{output["id"]}/')
+        row.refresh_from_db()
+        self.assertEqual((row.quantity_on_hand, row.unit_price, row.unit_cost, row.reorder_level),
+                         (50, 2150, 1800, None))
+
+        prices = self.claimed(user=self.second, type='price_list')
+        client_for(self.second).post(f'/backlog-work/{prices.id}/inventory/', {
+            'product': self.white.id, 'unit_price': 2400, 'reorder_level': 9}, format='json')
+        row.refresh_from_db()
+        self.assertEqual((row.unit_price, row.reorder_level), (2400, None))
+
     def test_a_stock_line_on_an_existing_row_is_put_back(self):
         entry = self.claimed(type='stock_list')
         client = client_for(self.typist)

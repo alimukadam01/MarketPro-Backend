@@ -54,11 +54,13 @@ class StockLineSerializer(serializers.Serializer):
     counted_at = serializers.DateField(required=False, allow_null=True)
     unit_price = serializers.FloatField(required=False, allow_null=True, min_value=0)
     unit_cost = serializers.FloatField(required=False, allow_null=True, min_value=0)
+    reorder_level = serializers.IntegerField(required=False, allow_null=True, min_value=0)
 
 
-# What each list type may set on a stock row.
+# What each list type may set on a stock row. A stock page may also carry
+# the price, the cost and the reorder level, when the register has them.
 STOCK_FIELDS = {
-    BacklogType.STOCK_LIST: ('location', 'quantity', 'counted_at'),
+    BacklogType.STOCK_LIST: ('location', 'quantity', 'counted_at', 'unit_price', 'unit_cost', 'reorder_level'),
     BacklogType.PRICE_LIST: ('unit_price', 'unit_cost'),
 }
 
@@ -393,7 +395,7 @@ class BacklogWorkViewSet(GenericViewSet):
             changes['quantity'] = values['quantity']
             changes['quantity_on_hand'] = values['quantity']
             changes['stock_counted_at'] = values.get('counted_at') or timezone.localdate()
-        for field in ('unit_price', 'unit_cost'):
+        for field in ('unit_price', 'unit_cost', 'reorder_level'):
             if values.get(field) is not None:
                 changes[field] = values[field]
         return changes
@@ -482,11 +484,22 @@ class BacklogWorkViewSet(GenericViewSet):
             values = self._stock_values(entry, {**request.data, 'product': output.inventory_item.product_id})
             values.pop('product')
             row = output.inventory_item
-            for field, value in self._row_changes(values).items():
+            changes = self._row_changes(values)
+            if not output.created:
+                # A field set for the first time on a correction: what the row
+                # had before goes into `previous` too, so deleting the line
+                # still puts the row back as it was.
+                previous = dict(output.previous or {})
+                for field in changes:
+                    if field not in previous:
+                        value = getattr(row, field)
+                        previous[field] = value.isoformat() if isinstance(value, date) else value
+                output.previous = previous
+            for field, value in changes.items():
                 setattr(row, field, value)
             row.save()
             output.entered = self._entered(values, row.product)
-            output.save(update_fields=['entered'])
+            output.save(update_fields=['entered', 'previous'])
             return Response({'output': describe(output)})
         # An invoice: the same update the invoice screens use, so its stock
         # and payments move exactly as they would there.
