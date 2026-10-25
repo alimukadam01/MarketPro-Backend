@@ -36,6 +36,19 @@ class BacklogType:
     LISTS = (STOCK_LIST,)
     INVOICES = (SALES_INVOICE, PURCHASE_INVOICE)
 
+    # The order pages are listed and entered in: stock counts first, then
+    # what was bought, then what was sold - so the goods are in MarketPro
+    # before a page sells them, and a count entered late does not overwrite
+    # sales already taken from it.
+    ORDER = (STOCK_LIST, PURCHASE_INVOICE, SALES_INVOICE)
+
+    @classmethod
+    def rank(cls):
+        """An annotation: a page's place in ORDER, 0 first."""
+        return models.Case(
+            *[models.When(type=kind, then=models.Value(i)) for i, kind in enumerate(cls.ORDER)],
+            default=models.Value(len(cls.ORDER)), output_field=models.IntegerField())
+
 
 class Priority:
     NORMAL = 'normal'

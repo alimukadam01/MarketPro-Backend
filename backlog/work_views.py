@@ -136,7 +136,10 @@ class BacklogWorkViewSet(GenericViewSet):
                                    default=Value(1), output_field=IntegerField()),
                     urgency=Case(When(priority='high', then=Value(0)),
                                  default=Value(1), output_field=IntegerField()))
-                .order_by('mine', 'sent_back', '-is_daily', 'urgency', 'created_at', 'id'))
+                .annotate(type_rank=BacklogType.rank())
+                # The page in hand, then by type (BacklogType.ORDER), then
+                # within a type: sent back, today's, high priority, oldest.
+                .order_by('mine', 'type_rank', 'sent_back', '-is_daily', 'urgency', 'created_at', 'id'))
         totals = {
             'waiting': self.entries().filter(status=BacklogEntry.PENDING).count(),
             'daily': self.entries().filter(status=BacklogEntry.PENDING, is_daily=True).count(),

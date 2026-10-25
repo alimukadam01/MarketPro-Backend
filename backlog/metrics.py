@@ -4,7 +4,7 @@ reviews. Nothing is stored.
 
 Per entry person: volume, accuracy (approved / reviewed), median seconds per
 page by type, can't-read rate, and daily pages entered late (after the end of
-the next working day - Sunday is not one).
+the next working day - Friday is not one).
 
 Per business: pages left, pages done per day, and a projected finish at the
 recent rate.
@@ -25,9 +25,9 @@ OPEN = (BacklogEntry.PENDING, BacklogEntry.IN_PROGRESS, BacklogEntry.CANT_READ)
 
 def next_working_day_end(day):
     """The deadline for a page uploaded on `day`: the end of the next
-    working day, skipping Sunday."""
+    working day, skipping Friday - a page from Thursday is due Saturday."""
     deadline = day + timedelta(days=1)
-    if deadline.weekday() == 6:
+    if deadline.weekday() == 4:
         deadline += timedelta(days=1)
     return deadline
 

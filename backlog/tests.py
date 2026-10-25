@@ -185,10 +185,29 @@ class QueueAndClaimTests(BacklogFixture):
         daily = self.entry(is_daily=True)
         sent_back = self.entry(rejection_count=1, review_note='Line 2 is 12')
         high = self.entry(priority='high')
+        purchase = self.entry(type='purchase_invoice')
+        stock = self.entry(type='stock_list')
+        daily_purchase = self.entry(type='purchase_invoice', is_daily=True)
         mine = self.claimed()
         items = client_for(self.typist).get('/backlog-work/queue/').json()['items']
-        self.assertEqual([row['id'] for row in items], [mine.id, sent_back.id, daily.id, high.id, old.id])
+        # The page in hand; then stock lists, purchases, sales; within a type
+        # sent back, today's, high, oldest.
+        self.assertEqual([row['id'] for row in items],
+                         [mine.id, stock.id, daily_purchase.id, purchase.id,
+                          sent_back.id, daily.id, high.id, old.id])
         self.assertTrue(items[0]['mine'])
+        owner_list = client_for(self.owner).get('/backlog-entries/').json()
+        rows = owner_list['results'] if isinstance(owner_list, dict) else owner_list
+        self.assertEqual([row['type'] for row in rows][:4],
+                         ['stock_list', 'purchase_invoice', 'purchase_invoice', 'sales_invoice'])
+
+    def test_a_daily_page_is_due_the_next_working_day(self):
+        from datetime import date
+        from .metrics import next_working_day_end
+        # Friday is the day off: Thursday's pages are due Saturday.
+        self.assertEqual(next_working_day_end(date(2026, 10, 22)), date(2026, 10, 24))
+        self.assertEqual(next_working_day_end(date(2026, 10, 24)), date(2026, 10, 25))
+        self.assertEqual(next_working_day_end(date(2026, 10, 25)), date(2026, 10, 26))
 
     def test_someone_elses_page_is_closed(self):
         entry = self.claimed(user=self.second)

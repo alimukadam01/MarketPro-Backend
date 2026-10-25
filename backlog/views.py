@@ -20,7 +20,7 @@ from .access import BacklogModulePermission, IsBusinessOwner, is_owner
 from .glossary import approve_suggestion, change_term, current_version, reject_suggestion, add_term, remove_term
 from .metrics import business_metrics, person_metrics
 from .models import (
-    BacklogEntry, BacklogReview, GlossaryEntry, GlossarySuggestion, UploadBatch,
+    BacklogEntry, BacklogReview, BacklogType, GlossaryEntry, GlossarySuggestion, UploadBatch,
 )
 from .serializers import (
     BacklogEntrySerializer, BacklogEntryUpdateSerializer, GlossaryEntrySerializer,
@@ -106,7 +106,9 @@ class BacklogEntryViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin,
     search_fields = ['id', 'book_label', 'notes', 'review_note']
 
     def get_queryset(self):
-        return _entries(self.request).order_by('-created_at', '-id')
+        # By type (BacklogType.ORDER), newest first within each.
+        return (_entries(self.request).annotate(type_rank=BacklogType.rank())
+                .order_by('type_rank', '-created_at', '-id'))
 
     def get_serializer_class(self):
         if self.request.method in ('PUT', 'PATCH'):
