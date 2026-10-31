@@ -26,9 +26,17 @@ def audited_update(queryset, **fields):
     model = queryset.model
     names = _names(model, fields)
     lookups = ['pk', *names]
-    if any(field.name == 'business' for field in model._meta.concrete_fields):
+    has_business = any(field.name == 'business' for field in model._meta.concrete_fields)
+    if has_business:
         lookups.append('business_id')
     before = list(queryset.values(*dict.fromkeys(lookups)))
+    if not has_business:
+        # No column to read it from: each row's business is searched for
+        # through its related records (recorder.business_of).
+        businesses = {obj.pk: recorder.business_of(obj)
+                      for obj in model._default_manager.filter(pk__in=[row['pk'] for row in before])}
+        for row in before:
+            row['business_id'] = businesses.get(row['pk'])
     count = queryset.update(**fields)
 
     expressions = any(isinstance(value, BaseExpression) for value in fields.values())

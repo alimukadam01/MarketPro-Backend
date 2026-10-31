@@ -20,7 +20,7 @@ from rest_framework.response import Response
 from rest_framework.throttling import ScopedRateThrottle
 from rest_framework.viewsets import GenericViewSet
 
-from audit.helpers import audited_update
+from audit.helpers import audited_bulk_create, audited_update
 from inventory.models import InventoryItem
 from root.models import Location, ProductVariant
 from root.new_records import create_customer, create_supplier, supplier_label
@@ -524,7 +524,7 @@ class BacklogWorkViewSet(GenericViewSet):
             return Response(new_products.product_for_adding(self.business(), product_id))
         with transaction.atomic():
             product, variants = new_products.add_variants(self.business(), product_id, request.data)
-            BacklogNewRecord.objects.bulk_create([
+            audited_bulk_create(BacklogNewRecord, [
                 BacklogNewRecord(entry=entry, variant=variant, created_by=request.user) for variant in variants])
         return Response(new_products.answer(product, variants), status=status.HTTP_201_CREATED)
 

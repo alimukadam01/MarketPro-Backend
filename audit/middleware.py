@@ -14,3 +14,11 @@ class AuditContextMiddleware:
             return self.get_response(request)
         finally:
             context.end_request()
+
+    def process_view(self, request, view_func, view_args, view_kwargs):
+        """The user a session signed in - the Django admin's. The API's JWT
+        user is set later, by AuditedJWTAuthentication, inside the view; by
+        here AuthenticationMiddleware has run, wherever this sits."""
+        user = getattr(request, 'user', None)
+        if user is not None and user.is_authenticated:
+            context.set_actor(user)

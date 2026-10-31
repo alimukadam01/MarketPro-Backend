@@ -668,6 +668,13 @@ class NewRecordsTests(BacklogFixture):
         rows = client_for(self.owner).get(f'/backlog-entries/{entry.id}/').json()['new_records']
         self.assertEqual([(r['kind'], r['record_id'], r['label'], r['detail']) for r in rows],
                          [('variant', self.paint.id, 'Weather Emulsion (Ivory)', 'new variant')])
+        # The note tying the variant to this page is in the audit trail, under
+        # the person who added it.
+        from audit.models import AuditEvent
+        note = BacklogNewRecord.objects.get(entry=entry, variant=ivory)
+        event = AuditEvent.objects.get(model='backlog.backlognewrecord', object_id=str(note.id))
+        self.assertEqual((event.action, event.actor, event.business_id),
+                         ('bulk_create', self.typist, self.business.id))
         elsewhere = Business.objects.create(name='Elsewhere', owner=self.owner, phone='03000000000')
         theirs = Product.objects.create(business=elsewhere, name='Theirs', unit=self.unit)
         self.assertEqual(client.get(f'/backlog-work/{entry.id}/products/{theirs.id}/variants/').status_code, 404)
