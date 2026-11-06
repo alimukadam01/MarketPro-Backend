@@ -183,7 +183,7 @@ class BacklogWorkViewSet(GenericViewSet):
     def cant_read(self, request, pk=None):
         note = (request.data.get('note') or '').strip()
         if not note:
-            return Response({'note': ['Tell the owner what is wrong with the page.']},
+            return Response({'note': ['Say why you are returning the page.']},
                             status=status.HTTP_400_BAD_REQUEST)
         entry = self.my_entry(pk)
         entry.status = BacklogEntry.CANT_READ
