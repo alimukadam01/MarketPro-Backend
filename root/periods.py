@@ -154,34 +154,71 @@ class PeriodFilterMixin:
 
 TREND_PERIODS = ('today', 'week', 'month', 'quarter', 'year')
 
+# A custom range is cut by how long it is: days while a line of days is
+# still readable, then weeks, then months. 'all' is always by month.
+CUSTOM_DAILY_UP_TO = 62
+CUSTOM_WEEKLY_UP_TO = 366
+
 
 def trend_buckets(period, start, end):
     """[(label, first_day, last_day)] covering start..end for a period.
 
-    'today' is handled by hour in hourly_trend, so it is not cut here.
+    'today' is handled by hour in hourly_trend, so it is not cut here. A
+    custom range goes by day up to CUSTOM_DAILY_UP_TO days, by week up to
+    CUSTOM_WEEKLY_UP_TO, by month beyond; 'all' (start being the first day
+    there is anything) by month.
     """
     if period in ('week', 'month'):
-        days = (end - start).days + 1
-        return [
-            (_day_label(start + timedelta(days=i), period),
-             start + timedelta(days=i), start + timedelta(days=i))
-            for i in range(days)
-        ]
+        return _day_buckets(start, end, period)
     if period == 'quarter':
-        buckets, first, number = [], start, 1
-        while first <= end:
-            back = (first.weekday() - WEEK_STARTS_ON) % 7
-            week_end = min(first + timedelta(days=6 - back), end)
-            buckets.append((f'Week {number}', first, week_end))
-            first, number = week_end + timedelta(days=1), number + 1
-        return buckets
+        return _week_buckets(start, end, lambda first, number: f'Week {number}')
     if period == 'year':
         buckets = []
         for month in range(1, end.month + 1):
             last = min(date(end.year, month, monthrange(end.year, month)[1]), end)
             buckets.append((date(end.year, month, 1).strftime('%b'), date(end.year, month, 1), last))
         return buckets
+    if period == 'custom':
+        days = (end - start).days + 1
+        if days <= CUSTOM_DAILY_UP_TO:
+            return _day_buckets(start, end, period)
+        if days <= CUSTOM_WEEKLY_UP_TO:
+            return _week_buckets(start, end, lambda first, number: _day_label(first, period))
+        return _month_buckets(start, end)
+    if period == 'all':
+        return _month_buckets(start, end)
     raise ValueError(f'No buckets for "{period}".')
+
+
+def _day_buckets(start, end, period):
+    days = (end - start).days + 1
+    return [
+        (_day_label(start + timedelta(days=i), period),
+         start + timedelta(days=i), start + timedelta(days=i))
+        for i in range(days)
+    ]
+
+
+def _week_buckets(start, end, label):
+    """Shop weeks (Saturday to Friday), the first and last cut to the range."""
+    buckets, first, number = [], start, 1
+    while first <= end:
+        back = (first.weekday() - WEEK_STARTS_ON) % 7
+        week_end = min(first + timedelta(days=6 - back), end)
+        buckets.append((label(first, number), first, week_end))
+        first, number = week_end + timedelta(days=1), number + 1
+    return buckets
+
+
+def _month_buckets(start, end):
+    """Calendar months, the first and last cut to the range, labelled with
+    the year as well ("Mar 2026"): a range this long can cross one."""
+    buckets, first = [], start
+    while first <= end:
+        last = min(date(first.year, first.month, monthrange(first.year, first.month)[1]), end)
+        buckets.append((first.strftime('%b %Y'), first, last))
+        first = last + timedelta(days=1)
+    return buckets
 
 
 def _day_label(day, period):

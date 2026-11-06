@@ -452,6 +452,27 @@ class TransactionManager(models.Manager):
 
         return collapsed
 
+    def cash_movement(self, business_id, start=None, end=None, by='date'):
+        """[(when, signed amount)] for every cleared money row in start..end
+        (both inclusive; None leaves that side open): money in counts plus,
+        money out minus, a cash adjustment as signed. `by` is the date the
+        rows carry - 'date', or 'created_at' for an hour-by-hour day.
+        Notes move no money and are left out, as in monthly_cash_trend.
+        """
+        rows = self.get_queryset().for_business(business_id).cleared()
+        if start:
+            rows = rows.filter(date__gte=start)
+        if end:
+            rows = rows.filter(date__lte=end)
+        signed = []
+        for when, kind, amount in rows.values_list(by, 'type', 'amount'):
+            amount = amount or 0
+            if kind in Transaction.IN_TYPES or kind == 'cash_adjustment':
+                signed.append((when, amount))
+            elif kind in Transaction.OUT_TYPES:
+                signed.append((when, -amount))
+        return signed
+
     def monthly_cash_trend(self, business_id):
         """
         Day-by-day net cash movement for the current month.
