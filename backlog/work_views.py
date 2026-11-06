@@ -10,7 +10,7 @@ never a total from elsewhere, a stock figure or a balance (§7).
 from datetime import date
 
 from django.db import transaction
-from django.db.models import Case, IntegerField, Q, Value, When
+from django.db.models import Case, F, IntegerField, Q, Value, When
 from django.utils import timezone
 from rest_framework import exceptions, serializers, status
 from rest_framework.decorators import action
@@ -194,6 +194,56 @@ class BacklogWorkViewSet(GenericViewSet):
         entry.claimed_at = None
         entry.save(update_fields=['status', 'claimed_by', 'claimed_at', 'updated_at'])
         return Response({'detail': 'OK'})
+
+    @action(['GET', 'POST'], detail=True, url_path='pages', url_name='pages')
+    def pages(self, request, pk=None):
+        """An invoice that runs across several pages (BUGS #003).
+
+        GET: the pages of this upload that could be joined to it, for
+        "Choose...". POST: join one - `page_id`, or the page uploaded right
+        after the last one. The joined page leaves the queue and becomes the
+        next page of this invoice."""
+        entry = self.my_entry(pk)
+        self.require_type(entry, *BacklogType.INVOICES)
+        if request.method == 'GET':
+            return Response([
+                {'id': page.id, 'created_at': page.created_at,
+                 'image': request.build_absolute_uri(page.image.url) if page.image else None}
+                for page in entry.joinable()[:60]])
+
+        page_id = request.data.get('page_id')
+        page = entry.joinable().filter(pk=page_id).first() if page_id else entry.next_joinable()
+        if not page:
+            detail = ('That page cannot be added to this one.' if page_id
+                      else 'No page of this upload is left to add.')
+            return Response({'detail': detail}, status=status.HTTP_400_BAD_REQUEST)
+        # One conditional write, as claiming is: a page someone else has just
+        # taken is left alone.
+        joined = audited_update(
+            BacklogEntry.objects.filter(pk=page.pk, status=BacklogEntry.PENDING, part_of__isnull=True),
+            status=BacklogEntry.JOINED, part_of_id=entry.id, page_number=len(entry.pages()) + 1,
+            joined_by_id=request.user.id, joined_at=timezone.now(), claimed_by_id=None, claimed_at=None)
+        if not joined:
+            return Response({'detail': 'Someone else has taken that page. Try again.'},
+                            status=status.HTTP_409_CONFLICT)
+        return Response(self.entry_data(self.my_entry(pk)), status=status.HTTP_201_CREATED)
+
+    @action(['DELETE'], detail=True, url_path=r'pages/(?P<page_id>\d+)', url_name='page')
+    def page(self, request, pk=None, page_id=None):
+        """Detach a page joined by mistake: it goes back to the queue as a
+        page of its own, and the pages after it move up."""
+        entry = self.my_entry(pk)
+        page = entry.joined_pages.filter(pk=page_id).first()
+        if not page:
+            raise exceptions.NotFound()
+        number = page.page_number
+        with transaction.atomic():
+            audited_update(BacklogEntry.objects.filter(pk=page.pk),
+                           status=BacklogEntry.PENDING, part_of_id=None, page_number=1,
+                           joined_by_id=None, joined_at=None)
+            audited_update(entry.joined_pages.filter(page_number__gt=number),
+                           page_number=F('page_number') - 1)
+        return Response(self.entry_data(self.my_entry(pk)))
 
     @action(['POST'], detail=True, url_path='cant-read', url_name='cant-read')
     def cant_read(self, request, pk=None):

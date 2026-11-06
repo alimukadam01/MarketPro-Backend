@@ -27,6 +27,9 @@ register(SearchType(
     label="Backlog entries",
     model=BacklogEntry,
     module="backlog_entries",
+    # A page joined to another is found through that one (BUGS #003).
+    queryset=lambda request, business, access: (
+        BacklogEntry.objects.filter(business=business).exclude(status=BacklogEntry.JOINED)),
     text_fields=["book_label", "notes", "review_note", "cant_read_note"],
     number_fields=["id"],
     choice_fields={"type": None, "status": None},

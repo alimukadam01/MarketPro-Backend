@@ -116,16 +116,28 @@ class WorkQueueItemSerializer(serializers.ModelSerializer):
 class WorkEntrySerializer(WorkQueueItemSerializer):
     image = serializers.SerializerMethodField()
     outputs = serializers.SerializerMethodField()
+    # Every page of the invoice, the first being this one (BUGS #003).
+    pages = serializers.SerializerMethodField()
+    # Whether "Add the next page" has a page to add.
+    can_add_page = serializers.SerializerMethodField()
 
     def get_image(self, entry):
         return image_url(self, entry.image)
+
+    def get_pages(self, entry):
+        return [{'id': page.id, 'page_number': page.page_number, 'image': image_url(self, page.image)}
+                for page in entry.pages()]
+
+    def get_can_add_page(self, entry):
+        return entry.next_joinable() is not None
 
     def get_outputs(self, entry):
         return [describe(output) for output in entry.outputs.all()]
 
     class Meta(WorkQueueItemSerializer.Meta):
         fields = WorkQueueItemSerializer.Meta.fields + [
-            'image', 'outputs', 'claimed_at', 'completed_list', 'cant_read_note']
+            'image', 'outputs', 'claimed_at', 'completed_list', 'cant_read_note',
+            'pages', 'can_add_page']
 
 
 # ── Glossary ─────────────────────────────────────────────────────────────────
