@@ -124,11 +124,20 @@ class BacklogWorkViewSet(GenericViewSet):
     @action(['GET'], detail=False, url_path='queue', url_name='queue')
     def queue(self, request):
         """The user's own page in progress first, then the pool: pages sent
-        back, today's pages, high priority, oldest first."""
+        back, today's pages, high priority, oldest first.
+
+        ?type= narrows the pool to the pages the person has chosen to work
+        on (BUGS #002). Their own open page stays first whatever its type:
+        it is finished or released before another is taken."""
         user = request.user
+        chosen = request.query_params.get('type')
+        if chosen and chosen not in BacklogType.ORDER:
+            return Response({'type': [f'Choose one of: {", ".join(BacklogType.ORDER)}.']},
+                            status=status.HTTP_400_BAD_REQUEST)
+        mine = Q(status=BacklogEntry.IN_PROGRESS, claimed_by=user)
+        pool = Q(status=BacklogEntry.PENDING, type=chosen) if chosen else Q(status=BacklogEntry.PENDING)
         rows = (self.entries()
-                .filter(Q(status=BacklogEntry.PENDING)
-                        | Q(status=BacklogEntry.IN_PROGRESS, claimed_by=user))
+                .filter(pool | mine)
                 .annotate(
                     mine=Case(When(claimed_by=user, status=BacklogEntry.IN_PROGRESS, then=Value(0)),
                               default=Value(1), output_field=IntegerField()),
@@ -146,9 +155,16 @@ class BacklogWorkViewSet(GenericViewSet):
             'entered_today': self.entries().filter(entered_by=user,
                                                    entered_at__date=timezone.localdate()).count(),
             'sent_back': self.entries().filter(status=BacklogEntry.PENDING, rejection_count__gt=0).count(),
+            'waiting_by_type': {
+                kind: self.entries().filter(status=BacklogEntry.PENDING, type=kind).count()
+                for kind in BacklogType.ORDER
+            },
         }
         return Response({
             'totals': totals,
+            # The order the types are worked through, so the screens follow
+            # the one rule rather than a copy of it.
+            'type_order': list(BacklogType.ORDER),
             'items': WorkQueueItemSerializer(rows[:200], many=True, context={'request': request}).data,
         })
 

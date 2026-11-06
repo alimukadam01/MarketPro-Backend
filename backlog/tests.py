@@ -201,6 +201,28 @@ class QueueAndClaimTests(BacklogFixture):
         self.assertEqual([row['type'] for row in rows][:4],
                          ['stock_list', 'purchase_invoice', 'purchase_invoice', 'sales_invoice'])
 
+    def test_the_queue_for_one_type(self):
+        """?type= narrows the pool to what the person chose to work on; their
+        own open page stays first whatever its type (BUGS #002)."""
+        sale = self.entry()
+        purchase = self.entry(type='purchase_invoice')
+        stock = self.entry(type='stock_list')
+        mine = self.claimed(type='purchase_invoice')
+        client = client_for(self.typist)
+
+        body = client.get('/backlog-work/queue/', {'type': 'sales_invoice'}).json()
+        self.assertEqual([row['id'] for row in body['items']], [mine.id, sale.id])
+        self.assertEqual(body['type_order'], ['stock_list', 'purchase_invoice', 'sales_invoice'])
+        self.assertEqual(body['totals']['waiting_by_type'],
+                         {'stock_list': 1, 'purchase_invoice': 1, 'sales_invoice': 1})
+        self.assertEqual(body['totals']['waiting'], 3)
+
+        stocked = client.get('/backlog-work/queue/', {'type': 'stock_list'}).json()['items']
+        self.assertEqual([row['id'] for row in stocked], [mine.id, stock.id])
+        everything = client.get('/backlog-work/queue/').json()['items']
+        self.assertEqual([row['id'] for row in everything], [mine.id, stock.id, purchase.id, sale.id])
+        self.assertEqual(client.get('/backlog-work/queue/', {'type': 'payment'}).status_code, 400)
+
     def test_a_daily_page_is_due_the_next_working_day(self):
         from datetime import date
         from .metrics import next_working_day_end
