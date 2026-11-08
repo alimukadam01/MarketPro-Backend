@@ -154,18 +154,18 @@ class PeriodFilterMixin:
 
 TREND_PERIODS = ('today', 'week', 'month', 'quarter', 'year')
 
-# A custom range is cut by how long it is: days while a line of days is
-# still readable, then weeks, then months. 'all' is always by month.
-CUSTOM_DAILY_UP_TO = 62
-CUSTOM_WEEKLY_UP_TO = 366
+# A custom range is cut by how long it is: by day up to a month, by week up
+# to a quarter, by month beyond. 'all' is always by month.
+CUSTOM_DAILY_UP_TO = 31
+CUSTOM_WEEKLY_UP_TO = 92
 
 
 def trend_buckets(period, start, end):
     """[(label, first_day, last_day)] covering start..end for a period.
 
     'today' is handled by hour in hourly_trend, so it is not cut here. A
-    custom range goes by day up to CUSTOM_DAILY_UP_TO days, by week up to
-    CUSTOM_WEEKLY_UP_TO, by month beyond; 'all' (start being the first day
+    custom range goes by day up to CUSTOM_DAILY_UP_TO days (a month), by
+    week up to CUSTOM_WEEKLY_UP_TO (a quarter), by month beyond; 'all' (start being the first day
     there is anything) by month.
     """
     if period in ('week', 'month'):

@@ -249,9 +249,22 @@ class TrendBucketTests(TestCase):
         self.assertEqual(len(buckets), 10)
         self.assertEqual(buckets[0], ('1 Mar', date(2026, 3, 1), date(2026, 3, 1)))
 
-    def test_up_to_62_days_is_still_by_day(self):
+    def test_up_to_a_month_is_still_by_day(self):
         start = date(2026, 1, 1)
-        self.assertEqual(len(trend_buckets('custom', start, start + timedelta(days=61))), 62)
+        self.assertEqual(len(trend_buckets('custom', start, start + timedelta(days=30))), 31)
+
+    def test_just_over_a_month_goes_by_week(self):
+        start = date(2026, 1, 1)
+        buckets = trend_buckets('custom', start, start + timedelta(days=31))
+        self.assertLess(len(buckets), 32)
+        self.assertTrue(all((last - first).days <= 6 for _, first, last in buckets))
+
+    def test_over_a_quarter_goes_by_month(self):
+        buckets = trend_buckets('custom', date(2026, 1, 1), date(2026, 4, 2))     # 92 days, then 93
+        self.assertEqual(buckets[-1][2], date(2026, 4, 2))
+        self.assertTrue(all((last - first).days <= 6 for _, first, last in buckets))
+        buckets = trend_buckets('custom', date(2026, 1, 1), date(2026, 4, 3))
+        self.assertEqual([label for label, _, _ in buckets], ['Jan 2026', 'Feb 2026', 'Mar 2026', 'Apr 2026'])
 
     def test_a_longer_custom_range_goes_by_shop_week(self):
         # 2026-01-01 is a Thursday: its week runs to Friday 2 January.
