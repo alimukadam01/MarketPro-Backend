@@ -11,8 +11,8 @@ from rest_framework.viewsets import GenericViewSet, ModelViewSet
 
 from root.models import Customer, Expense, Supplier
 from root.periods import (
-    PeriodFilterMixin, in_period, is_filtered, period_from_params,
-    period_payload,
+    PERIODS, PeriodFilterMixin, daily_trend, hourly_trend, in_period, is_filtered,
+    period_from_params, period_payload,
 )
 from root.utils import get_active_business, whatsapp_number
 from sales.models import PurchaseReceipt, SalesInvoice, SalesReceipt
@@ -942,6 +942,40 @@ class AccountingKPIViewSet(GenericViewSet):
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
 
+    @action(['GET'], detail=False, url_path='cash-trend', url_name='cash-trend')
+    def cash_trend(self, request):
+        """
+        Net cash movement over the Accounting page's period (?period=, every
+        one the page offers, custom and all time included): money in less
+        money out, cleared money only. Today by hour; week and month by day;
+        quarter by week; year by month; custom and all time as
+        root.periods.trend_buckets cuts them.
+        """
+        business, guard_error = self._guard(request)
+        if guard_error:
+            return guard_error
+
+        period, start, end = period_from_params(
+            request.query_params, default='month', allowed=PERIODS)
+        if period == 'all':
+            # From the first day there is anything, by month.
+            first = (Transaction.objects.for_business(business.id).cleared()
+                     .order_by('date').values_list('date', flat=True).first())
+            end = timezone.localdate()
+            start = min(first, end) if first else end
+        if period == 'today':
+            trend = hourly_trend(Transaction.objects.cash_movement(
+                business.id, start, end, by='created_at'))
+        else:
+            trend = daily_trend(Transaction.objects.cash_movement(business.id, start, end),
+                                period, start, end)
+        return Response({
+            'trend': trend,
+            'period': period_payload(period, start, end),
+        }, status=status.HTTP_200_OK)
+
+    # Superseded by cash-trend, which follows the page's period. Kept for
+    # one release for any page still asking; nothing in this frontend does.
     @action(['GET'], detail=False, url_path='monthly-cash-trend', url_name='monthly-cash-trend')
     def monthly_cash_trend(self, request):
         business, guard_error = self._guard(request)
