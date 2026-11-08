@@ -91,12 +91,17 @@ class BacklogEntry(models.Model):
     ENTERED = 'entered'
     VERIFIED = 'verified'
     CANT_READ = 'cant_read'
+    # A later page of an invoice that runs across several (BUGS #003): it
+    # belongs to its first page (part_of) and goes wherever that goes, so
+    # the queue, claims and the counts all pass it by.
+    JOINED = 'joined'
     STATUS_CHOICES = [
         (PENDING, 'Pending'),
         (IN_PROGRESS, 'In progress'),
         (ENTERED, 'Waiting for review'),
         (VERIFIED, 'Verified'),
         (CANT_READ, "Can't read"),
+        (JOINED, 'Joined to another page'),
     ]
 
     # Kept for the old name, read by the admin and old migrations.
@@ -147,6 +152,19 @@ class BacklogEntry(models.Model):
     # A list page is many records; this says the person finished the page.
     completed_list = models.BooleanField(default=False)
 
+    # An invoice across several pages (BUGS #003). The first page is the
+    # document; each later one points at it, numbered in reading order -
+    # stored, never inferred from ids. Who joined it and when are kept: they
+    # are the record of which pages belong together, which an invoice reader
+    # will one day learn to propose (§14).
+    part_of = models.ForeignKey(
+        'self', on_delete=models.SET_NULL, null=True, blank=True, related_name='joined_pages')
+    page_number = models.PositiveSmallIntegerField(default=1)
+    joined_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='joined_backlog_pages')
+    joined_at = models.DateTimeField(null=True, blank=True)
+
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -159,6 +177,28 @@ class BacklogEntry(models.Model):
     @property
     def is_list(self):
         return self.type in BacklogType.LISTS
+
+    def pages(self):
+        """This page and the ones joined to it, in reading order."""
+        return [self, *self.joined_pages.order_by('page_number', 'id')]
+
+    def joinable(self):
+        """The pages that could be joined to this one: waiting, from the same
+        upload, of the same type, and not the start of an invoice of their
+        own. Invoices only - a stock list is never joined."""
+        if self.type not in BacklogType.INVOICES or not self.batch_id:
+            return BacklogEntry.objects.none()
+        return (BacklogEntry.objects
+                .filter(business_id=self.business_id, batch_id=self.batch_id, type=self.type,
+                        status=BacklogEntry.PENDING, part_of__isnull=True)
+                .exclude(pk=self.pk)
+                .exclude(joined_pages__isnull=False)
+                .order_by('id'))
+
+    def next_joinable(self):
+        """The page uploaded right after this invoice's last page, if any."""
+        last = max(page.id for page in self.pages())
+        return self.joinable().filter(id__gt=last).first()
 
     def __str__(self):
         return f"{self.id}-{self.type}-{self.status}"
