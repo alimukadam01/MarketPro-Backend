@@ -201,6 +201,28 @@ class QueueAndClaimTests(BacklogFixture):
         self.assertEqual([row['type'] for row in rows][:4],
                          ['stock_list', 'purchase_invoice', 'purchase_invoice', 'sales_invoice'])
 
+    def test_the_queue_for_one_type(self):
+        """?type= narrows the pool to what the person chose to work on; their
+        own open page stays first whatever its type (BUGS #002)."""
+        sale = self.entry()
+        purchase = self.entry(type='purchase_invoice')
+        stock = self.entry(type='stock_list')
+        mine = self.claimed(type='purchase_invoice')
+        client = client_for(self.typist)
+
+        body = client.get('/backlog-work/queue/', {'type': 'sales_invoice'}).json()
+        self.assertEqual([row['id'] for row in body['items']], [mine.id, sale.id])
+        self.assertEqual(body['type_order'], ['stock_list', 'purchase_invoice', 'sales_invoice'])
+        self.assertEqual(body['totals']['waiting_by_type'],
+                         {'stock_list': 1, 'purchase_invoice': 1, 'sales_invoice': 1})
+        self.assertEqual(body['totals']['waiting'], 3)
+
+        stocked = client.get('/backlog-work/queue/', {'type': 'stock_list'}).json()['items']
+        self.assertEqual([row['id'] for row in stocked], [mine.id, stock.id])
+        everything = client.get('/backlog-work/queue/').json()['items']
+        self.assertEqual([row['id'] for row in everything], [mine.id, stock.id, purchase.id, sale.id])
+        self.assertEqual(client.get('/backlog-work/queue/', {'type': 'payment'}).status_code, 400)
+
     def test_a_daily_page_is_due_the_next_working_day(self):
         from datetime import date
         from .metrics import next_working_day_end
@@ -858,3 +880,129 @@ class StockCountTests(BacklogFixture):
             created_at=timezone.make_aware(timezone.datetime(2020, 1, 1, 12, 0)))
         client_for(self.owner).post(f'/returned-items/{returned.id}/inventory-return/')
         self.assertEqual(self.on_hand(), 47)
+
+
+class JoinedPagesTests(BacklogFixture):
+    """An invoice that runs across several pages (BUGS #003): later pages of
+    the same upload are joined to the first, leave the queue, and go
+    wherever it goes."""
+
+    def batch(self, type='sales_invoice'):
+        return UploadBatch.objects.create(business=self.business, uploaded_by=self.owner, type=type)
+
+    def pages(self, batch, count, type='sales_invoice'):
+        return [self.entry(type=type, batch=batch) for _ in range(count)]
+
+    def claim(self, entry, user=None):
+        response = client_for(user or self.typist).post(f'/backlog-work/{entry.id}/claim/')
+        self.assertEqual(response.status_code, 200, response.content)
+
+    def join(self, entry, page_id=None, user=None):
+        body = {'page_id': page_id} if page_id else {}
+        return client_for(user or self.typist).post(f'/backlog-work/{entry.id}/pages/', body, format='json')
+
+    def test_add_the_next_page_and_detach(self):
+        batch = self.batch()
+        first, second, third = self.pages(batch, 3)
+        purchase = self.entry(type='purchase_invoice', batch=batch)   # same upload, other type
+        self.claim(first)
+
+        joined = self.join(first)
+        self.assertEqual(joined.status_code, 201, joined.content)
+        self.assertEqual([(p['id'], p['page_number']) for p in joined.json()['pages']],
+                         [(first.id, 1), (second.id, 2)])
+        self.assertTrue(joined.json()['can_add_page'])
+        body = self.join(first).json()
+        self.assertEqual([p['id'] for p in body['pages']], [first.id, second.id, third.id])
+        # The purchase invoice in the same upload is not a page of this one.
+        self.assertFalse(body['can_add_page'])
+        self.assertEqual(self.join(first).status_code, 400)
+
+        second.refresh_from_db()
+        self.assertEqual((second.status, second.part_of_id, second.joined_by), ('joined', first.id, self.typist))
+        # Out of the queue, and no one can take it on its own.
+        queued = [row['id'] for row in client_for(self.second).get('/backlog-work/queue/').json()['items']]
+        self.assertNotIn(second.id, queued)
+        self.assertIn(purchase.id, queued)
+        self.assertEqual(client_for(self.second).post(f'/backlog-work/{second.id}/claim/').status_code, 409)
+
+        # Detach page 2: back in the queue, and page 3 becomes page 2.
+        detached = client_for(self.typist).delete(f'/backlog-work/{first.id}/pages/{second.id}/')
+        self.assertEqual(detached.status_code, 200, detached.content)
+        self.assertEqual([(p['id'], p['page_number']) for p in detached.json()['pages']],
+                         [(first.id, 1), (third.id, 2)])
+        second.refresh_from_db()
+        self.assertEqual((second.status, second.part_of_id, second.page_number), ('pending', None, 1))
+
+    def test_which_pages_can_be_chosen(self):
+        batch = self.batch()
+        first, second, third = self.pages(batch, 3)
+        other_upload = self.entry(batch=self.batch())
+        someone_elses = self.entry(batch=batch)
+        self.claim(someone_elses, user=self.second)
+        self.claim(first)
+
+        listed = client_for(self.typist).get(f'/backlog-work/{first.id}/pages/').json()
+        self.assertEqual([row['id'] for row in listed], [second.id, third.id])
+        self.assertEqual(self.join(first, page_id=third.id).status_code, 201)
+        for page in (other_upload, someone_elses, first):
+            with self.subTest(page=page.id):
+                self.assertEqual(self.join(first, page_id=page.id).status_code, 400)
+
+        # Only on the person's own open page.
+        self.assertEqual(self.join(first, page_id=second.id, user=self.second).status_code, 403)
+
+    def test_a_page_that_starts_its_own_invoice_is_not_joined(self):
+        batch = self.batch()
+        first, second, third = self.pages(batch, 3)
+        self.claim(second)
+        self.join(second)                       # second + third
+        client_for(self.typist).post(f'/backlog-work/{second.id}/release/')
+        self.claim(first)
+        self.assertEqual(self.join(first, page_id=second.id).status_code, 400)
+        self.assertEqual(self.join(first).status_code, 400)
+
+    def test_never_on_a_stock_list(self):
+        batch = self.batch(type='stock_list')
+        first, _ = self.pages(batch, 2, type='stock_list')
+        self.claim(first)
+        self.assertEqual(self.join(first).status_code, 400)
+
+    def test_release_and_return_keep_the_pages_together(self):
+        batch = self.batch()
+        first, second = self.pages(batch, 2)
+        self.claim(first)
+        self.join(first)
+        client_for(self.typist).post(f'/backlog-work/{first.id}/release/')
+        self.claim(first, user=self.second)
+        pages = client_for(self.second).get(f'/backlog-work/{first.id}/').json()['pages']
+        self.assertEqual([p['id'] for p in pages], [first.id, second.id])
+
+        client_for(self.second).post(f'/backlog-work/{first.id}/cant-read/', {'note': 'Page 2 is blurred'},
+                                     format='json')
+        second.refresh_from_db()
+        self.assertEqual((second.status, second.part_of_id), ('joined', first.id))
+
+    def test_approval_puts_every_page_on_the_invoice(self):
+        batch = self.batch()
+        first, second = self.pages(batch, 2)
+        self.claim(first)
+        self.join(first)
+        client = client_for(self.typist)
+        output = client.post(f'/backlog-work/{first.id}/sales-invoice/', self.sale_payload(),
+                             format='json').json()['output']
+        self.assertEqual(client.post(f'/backlog-work/{first.id}/submit/').status_code, 200)
+
+        owner = client_for(self.owner)
+        listed = owner.get('/backlog-entries/').json()
+        rows = listed['results'] if isinstance(listed, dict) else listed
+        self.assertNotIn(second.id, [row['id'] for row in rows])
+
+        names = [first.image.name, second.image.name]
+        self.assertEqual(owner.post(f'/backlog-entries/{first.id}/approve/').status_code, 200)
+        images = InvoiceImage.objects.filter(sales_invoice_id=output['record_id']).order_by('id')
+        self.assertEqual([image.image.name for image in images], names)
+        self.assertEqual([image.caption for image in images],
+                         [f'Backlog page #{first.id} · page 1 of 2', f'Backlog page #{first.id} · page 2 of 2'])
+        second.refresh_from_db()
+        self.assertEqual((second.status, bool(second.image)), ('joined', False))

@@ -14,7 +14,7 @@ from root.models import (
     WALK_IN_CUSTOMER_NAME, Business, BusinessConfig, City, Customer, Expense,
     Supplier,
 )
-from root.periods import period_bounds
+from root.periods import period_bounds, trend_buckets
 from sales.models import PurchaseInvoice, SalesInvoice, SalesReceipt
 
 User = get_user_model()
@@ -239,3 +239,114 @@ class PeriodSwitchTests(TestCase):
         self.assertEqual(summary['date_to'], self.today.isoformat())
 
         self.assertEqual(self.client.get('/accounting-kpis/day-book/', {'period': 'all'}).status_code, 400)
+
+
+class TrendBucketTests(TestCase):
+    """Custom ranges are cut by their length; all time goes by month."""
+
+    def test_a_short_custom_range_goes_by_day(self):
+        buckets = trend_buckets('custom', date(2026, 3, 1), date(2026, 3, 10))
+        self.assertEqual(len(buckets), 10)
+        self.assertEqual(buckets[0], ('1 Mar', date(2026, 3, 1), date(2026, 3, 1)))
+
+    def test_up_to_a_month_is_still_by_day(self):
+        start = date(2026, 1, 1)
+        self.assertEqual(len(trend_buckets('custom', start, start + timedelta(days=30))), 31)
+
+    def test_just_over_a_month_goes_by_week(self):
+        start = date(2026, 1, 1)
+        buckets = trend_buckets('custom', start, start + timedelta(days=31))
+        self.assertLess(len(buckets), 32)
+        self.assertTrue(all((last - first).days <= 6 for _, first, last in buckets))
+
+    def test_over_a_quarter_goes_by_month(self):
+        buckets = trend_buckets('custom', date(2026, 1, 1), date(2026, 4, 2))     # 92 days, then 93
+        self.assertEqual(buckets[-1][2], date(2026, 4, 2))
+        self.assertTrue(all((last - first).days <= 6 for _, first, last in buckets))
+        buckets = trend_buckets('custom', date(2026, 1, 1), date(2026, 4, 3))
+        self.assertEqual([label for label, _, _ in buckets], ['Jan 2026', 'Feb 2026', 'Mar 2026', 'Apr 2026'])
+
+    def test_a_longer_custom_range_goes_by_shop_week(self):
+        # 2026-01-01 is a Thursday: its week runs to Friday 2 January.
+        buckets = trend_buckets('custom', date(2026, 1, 1), date(2026, 3, 31))
+        self.assertEqual(buckets[0], ('1 Jan', date(2026, 1, 1), date(2026, 1, 2)))
+        self.assertEqual(buckets[1][1], date(2026, 1, 3))      # a Saturday
+        self.assertEqual(buckets[-1][2], date(2026, 3, 31))
+        self.assertTrue(all((last - first).days <= 6 for _, first, last in buckets))
+
+    def test_over_a_year_goes_by_month_with_the_year(self):
+        buckets = trend_buckets('custom', date(2025, 2, 15), date(2026, 6, 10))
+        self.assertEqual(buckets[0], ('Feb 2025', date(2025, 2, 15), date(2025, 2, 28)))
+        self.assertEqual(buckets[-1], ('Jun 2026', date(2026, 6, 1), date(2026, 6, 10)))
+        self.assertEqual(len(buckets), 17)
+
+    def test_all_time_goes_by_month(self):
+        buckets = trend_buckets('all', date(2026, 9, 20), date(2026, 11, 6))
+        self.assertEqual([label for label, _, _ in buckets], ['Sep 2026', 'Oct 2026', 'Nov 2026'])
+
+
+class CashTrendTests(TestCase):
+    """The Accounting page's Net Cash Movement follows the page's period."""
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.user = User.objects.create_user(email="cash-trend@example.com", password="pw-for-tests")
+        cls.business = Business.objects.create(
+            name="Cash Paints", owner=cls.user, phone="03001234567", is_active=True)
+        BusinessConfig.objects.create(business=cls.business, accounting=True)
+        cls.cash = MoneyAccount.objects.get_default_account(cls.business.id)
+        cls.today = timezone.localdate()
+
+    def setUp(self):
+        self.client = APIClient()
+        self.client.force_authenticate(self.user)
+
+    def money(self, kind, amount, day, status='C'):
+        return Transaction.objects.create(
+            business=self.business, account=self.cash, type=kind,
+            amount=amount, date=day, status=status)
+
+    def trend(self, **params):
+        response = self.client.get('/accounting-kpis/cash-trend/', params)
+        self.assertEqual(response.status_code, 200, response.content)
+        return response.json()
+
+    def test_in_less_out_cleared_only(self):
+        self.money('customer_receipt', 1200, self.today)
+        self.money('expense', 400, self.today)
+        self.money('customer_receipt', 5000, self.today, status='P')   # an uncleared cheque
+        self.money('cash_adjustment', -100, self.today)
+        body = self.trend(period='month')
+        self.assertEqual(body['period']['key'], 'month')
+        self.assertEqual(sum(point['value'] for point in body['trend']), 700)
+        self.assertEqual(len(body['trend']), self.today.day)
+
+    def test_each_period_has_its_buckets(self):
+        self.assertEqual(len(self.trend(period='today')['trend']), timezone.localtime().hour + 1)
+        week_start, _ = period_bounds('week', self.today)
+        self.assertEqual(len(self.trend(period='week')['trend']), (self.today - week_start).days + 1)
+        self.assertEqual(len(self.trend(period='year')['trend']), self.today.month)
+        self.assertTrue(all(p['label'].startswith('Week') for p in self.trend(period='quarter')['trend']))
+
+    def test_a_custom_range_is_cut_by_its_length(self):
+        def lengths(days):
+            first = self.today - timedelta(days=days - 1)
+            return self.trend(period='custom', date_from=first.isoformat(),
+                              date_to=self.today.isoformat())['trend']
+        self.assertEqual(len(lengths(10)), 10)
+        self.assertLess(len(lengths(90)), 16)                      # weeks
+        self.assertTrue(lengths(500)[0]['label'][-4:].isdigit())   # months, with the year
+
+    def test_all_time_runs_from_the_first_transaction_by_month(self):
+        first = (self.today.replace(day=1) - timedelta(days=40)).replace(day=5)
+        self.money('customer_receipt', 300, first)
+        self.money('expense', 50, self.today)
+        body = self.trend(period='all')
+        self.assertEqual(body['period']['date_from'], first.isoformat())
+        self.assertEqual(body['trend'][0]['value'], 300)
+        self.assertEqual(sum(point['value'] for point in body['trend']), 250)
+
+    def test_a_bad_period_is_refused(self):
+        self.assertEqual(self.client.get('/accounting-kpis/cash-trend/', {'period': 'decade'}).status_code, 400)
+        self.assertEqual(self.client.get('/accounting-kpis/cash-trend/',
+                                         {'period': 'custom', 'date_from': '2026-01-01'}).status_code, 400)

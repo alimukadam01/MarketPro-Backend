@@ -106,8 +106,10 @@ class BacklogEntryViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin,
     search_fields = ['id', 'book_label', 'notes', 'review_note']
 
     def get_queryset(self):
-        # By type (BacklogType.ORDER), newest first within each.
-        return (_entries(self.request).annotate(type_rank=BacklogType.rank())
+        # By type (BacklogType.ORDER), newest first within each. A page joined
+        # to another is shown with it, as one of its pages, not on its own.
+        return (_entries(self.request).exclude(status=BacklogEntry.JOINED)
+                .annotate(type_rank=BacklogType.rank())
                 .order_by('type_rank', '-created_at', '-id'))
 
     def get_serializer_class(self):
@@ -116,8 +118,11 @@ class BacklogEntryViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin,
         return BacklogEntrySerializer
 
     def perform_destroy(self, entry):
-        if entry.image:
-            entry.image.delete(save=False)
+        # The pages joined to it go with it: they are part of this invoice.
+        for page in entry.pages():
+            if page.image:
+                page.image.delete(save=False)
+        entry.joined_pages.all().delete()
         entry.delete()
 
     @action(['POST'], detail=False, url_path='bulk-delete', url_name='bulk-delete')
@@ -173,17 +178,27 @@ class BacklogEntryViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin,
         if error:
             return error
         with transaction.atomic():
-            if entry.image:
-                invoice_outputs = [o for o in entry.outputs.all()
-                                   if o.kind in ('sales_invoice', 'purchase_invoice')]
+            # Every page of the invoice, in reading order (BUGS #003): the
+            # photos are the record of what was entered, so all of them go
+            # onto the invoice, numbered.
+            pages = entry.pages()
+            invoice_outputs = [o for o in entry.outputs.all()
+                               if o.kind in ('sales_invoice', 'purchase_invoice')]
+            for page in pages:
+                if not page.image:
+                    continue
                 if invoice_outputs:
                     output = invoice_outputs[0]
+                    caption = (f'Backlog page #{entry.id} · page {page.page_number} of {len(pages)}'
+                               if len(pages) > 1 else f'Backlog page #{entry.id}')
                     InvoiceImage.objects.create(
-                        **{output.kind: output.record}, image=entry.image.name,
-                        caption=f'Backlog page #{entry.id}', uploaded_by=request.user)
+                        **{output.kind: output.record}, image=page.image.name,
+                        caption=caption, uploaded_by=request.user)
                 else:
-                    entry.image.delete(save=False)
-                entry.image = None
+                    page.image.delete(save=False)
+                page.image = None
+                if page is not entry:
+                    page.save(update_fields=['image', 'updated_at'])
             BacklogReview.objects.create(entry=entry, reviewer=request.user,
                                          entered_by=entry.entered_by, outcome=BacklogReview.APPROVED)
             entry.status = BacklogEntry.VERIFIED
