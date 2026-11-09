@@ -405,11 +405,12 @@ class RepeatedProductOnSalesInvoiceTests(TestCase):
         """Two identical lines are one line entered twice; the invoice screen
         merges them into a single row's quantity rather than sending both.
 
-        The view turns the constraint error into a 500, which is the shape it
-        has always had for a failed write here. Nothing is left behind.
+        Refused as a 400 naming the two lines, before anything is written - it
+        was a 500 from the UNIQUE key until sales/lines.py checked it first.
         """
         response = self.post("1306", [self.line(500), self.line(500)])
-        self.assertEqual(response.status_code, 500)
+        self.assertEqual(response.status_code, 400, response.content)
+        self.assertIn("Lines 1 and 2", str(response.content))
         self.assertFalse(
             SalesInvoice.objects.filter(
                 business=self.business, invoice_number="1306").exists()
@@ -2403,17 +2404,34 @@ class PurchaseLineStockOnUpdateTests(TestCase):
 
         self.assertEqual(self.stock(self.blue), 100)
 
-    def test_the_same_product_twice_is_a_400(self):
+    def test_the_same_line_twice_is_a_400(self):
+        # The same product, cost, extra fields and discount is one line entered
+        # twice: refused before anything is written.
+        invoice = self.received_red_and_blue()
+        red = self.line(invoice, self.red)
+
+        self.update(invoice, [
+            {"id": red.id, "product_id": self.red.id, "quantity": 50, "unit_cost": 250},
+            {"id": -5.5, "product_id": self.red.id, "quantity": 5, "unit_cost": 250},
+        ], expect=400)
+
+        self.assertEqual(invoice.invoice_items.count(), 2)
+        self.assertEqual(self.stock(self.red), 50)
+
+    def test_the_same_product_at_another_cost_is_another_line(self):
+        # Once refused (the key was invoice and product); the screens always
+        # kept it as its own line, and now the key does too
+        # (plans/product-extra-fields.md, part 02).
         invoice = self.received_red_and_blue()
         red = self.line(invoice, self.red)
 
         self.update(invoice, [
             {"id": red.id, "product_id": self.red.id, "quantity": 50, "unit_cost": 250},
             {"id": -5.5, "product_id": self.red.id, "quantity": 5, "unit_cost": 260},
-        ], expect=400)
+        ])
 
-        self.assertEqual(invoice.invoice_items.count(), 2)
-        self.assertEqual(self.stock(self.red), 50)
+        self.assertEqual(invoice.invoice_items.filter(product=self.red).count(), 2)
+        self.assertEqual(self.stock(self.red), 55)
 
     def test_payments_go_through_after_an_update_that_adds_a_line(self):
         # The page sends its held payments only once the update succeeds.

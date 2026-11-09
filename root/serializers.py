@@ -1,7 +1,10 @@
 from rest_framework import serializers
 from django.db import transaction
+from django.db.models import Q
 from django.contrib.auth import get_user_model
 from .models import (
+    ProductField,
+    ProductFieldLink,
     City,
     Category,
     Expense,
@@ -227,28 +230,120 @@ class ProductSerializer(serializers.ModelSerializer):
     code = serializers.CharField()
     unit = UnitSerializer(read_only=True)
     variants = SimpleProductVariantSerializer(many=True)
+    # What the update form's "Asked on invoices" section is filled from.
+    field_links = serializers.SerializerMethodField()
+
+    def get_field_links(self, obj):
+        return [
+            {'field': link.field_id, 'label': link.field.label,
+             'field_type': link.field.field_type, 'is_active': link.field.is_active,
+             'applies_to': link.applies_to, 'required': link.required}
+            for link in obj.field_links.select_related('field').order_by('field__label')
+        ]
 
     class Meta:
         model = Product
         fields = [
             'id', 'business', 'code', 'name', 'desc',
-            'unit', 'created_at', 'updated_at', 'variants'
+            'unit', 'created_at', 'updated_at', 'variants', 'field_links'
         ]
+
+
+def asked_fields(product):
+    """The extra fields a product asks on invoice lines, as the screens need
+    them. Through .all(), so a prefetch of field_links__field is used; retired
+    fields are left out - a new line is never asked for one."""
+    return [
+        {'id': link.field_id, 'label': link.field.label, 'key': link.field.key,
+         'field_type': link.field.field_type, 'applies_to': link.applies_to,
+         'required': link.required}
+        for link in sorted(product.field_links.all(), key=lambda link: link.field.label.lower())
+        if link.field.is_active
+    ]
 
 
 class SimpleProductSerializer(serializers.ModelSerializer):
 
     unit = UnitSerializer()
     num_variants = serializers.SerializerMethodField()
+    # The extra fields its invoice lines ask for (plans/product-extra-fields.md).
+    extra_fields = serializers.SerializerMethodField()
 
     def get_num_variants(self, obj):
         return len(obj.variants.all())
+
+    def get_extra_fields(self, obj):
+        return asked_fields(obj)
+
     class Meta:
         model = Product
         fields = [
             'id', 'business', 'code', 'name', 'desc',
-            'unit', 'created_at', 'updated_at', 'num_variants'
+            'unit', 'created_at', 'updated_at', 'num_variants', 'extra_fields'
         ]
+
+
+class ProductFieldSerializer(serializers.ModelSerializer):
+    """A business's extra field, for the product form's checklist."""
+
+    class Meta:
+        model = ProductField
+        fields = ['id', 'label', 'key', 'field_type']
+
+
+class FieldLinksMixin:
+    """field_links on the product create and update serializers: which of the
+    business's extra fields this product asks for, [{field, applies_to,
+    required}]. Sent as the whole set; leaving it out leaves the links alone,
+    so a client that does not know about them cannot wipe them."""
+
+    def validate_field_links(self, links):
+        if links is None:
+            return []
+        if not isinstance(links, list):
+            raise serializers.ValidationError('field_links must be a list.')
+        business_id = self.context.get('business_id')
+        # Active fields, and any retired one this product already asks for:
+        # saving the form must not fail over a field retired since.
+        allowed = Q(is_active=True)
+        if getattr(self, 'instance', None) is not None:
+            allowed |= Q(links__product=self.instance)
+        fields = {
+            field.id: field for field in
+            ProductField.objects.filter(allowed, business_id=business_id).distinct()
+        }
+        cleaned, seen = [], set()
+        for link in links:
+            if not isinstance(link, dict):
+                raise serializers.ValidationError('Each field link is {field, applies_to, required}.')
+            try:
+                field_id = int(link.get('field'))
+            except (TypeError, ValueError):
+                raise serializers.ValidationError('Pick an extra field.')
+            if field_id not in fields:
+                raise serializers.ValidationError('That extra field is not one of this business\'s.')
+            if field_id in seen:
+                raise serializers.ValidationError(f'{fields[field_id].label} is listed twice.')
+            seen.add(field_id)
+            applies_to = link.get('applies_to') or ProductFieldLink.SALE
+            if applies_to not in dict(ProductFieldLink.APPLIES_TO_CHOICES):
+                raise serializers.ValidationError('Ask on sales, purchases or both.')
+            cleaned.append({'field_id': field_id, 'applies_to': applies_to,
+                            'required': bool(link.get('required'))})
+        return cleaned
+
+    def save_field_links(self, product, links):
+        """Make the product's links exactly `links`."""
+        keep = {link['field_id'] for link in links}
+        ProductFieldLink.objects.filter(product=product).exclude(field_id__in=keep).delete()
+        current = {link.field_id: link for link in ProductFieldLink.objects.filter(product=product)}
+        for link in links:
+            existing = current.get(link['field_id'])
+            if existing is None:
+                ProductFieldLink.objects.create(product=product, **link)
+            elif (existing.applies_to, existing.required) != (link['applies_to'], link['required']):
+                existing.applies_to, existing.required = link['applies_to'], link['required']
+                existing.save(update_fields=['applies_to', 'required'])
 
 
 class ProductCreateUpdateSerializer(serializers.ModelSerializer):
@@ -306,14 +401,20 @@ class ProductVariantCreateSerializer(serializers.ModelSerializer):
         fields = ['id', 'name', 'attributes']
 
 
-class ProductAndVariantUpdateSerializer(serializers.ModelSerializer):
+class ProductAndVariantUpdateSerializer(FieldLinksMixin, serializers.ModelSerializer):
 
     variants = serializers.ListField()
+    field_links = serializers.ListField(required=False)
 
     def save(self, **kwargs):
 
         variants = self.validated_data.pop('variants', [])
+        field_links = self.validated_data.pop('field_links', None)
         instance = self.instance
+        # Only when sent: see FieldLinksMixin.
+        if field_links is not None:
+            with transaction.atomic():
+                self.save_field_links(instance, field_links)
 
         if variants:
             # separate new and old variants
@@ -381,12 +482,13 @@ class ProductAndVariantUpdateSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Product
-        fields = ['id', 'name', 'unit', 'desc', 'variants']
+        fields = ['id', 'name', 'unit', 'desc', 'variants', 'field_links']
 
 
-class ProductAndVariantCreateSerializer(serializers.ModelSerializer):
+class ProductAndVariantCreateSerializer(FieldLinksMixin, serializers.ModelSerializer):
 
     variants = serializers.ListField()
+    field_links = serializers.ListField(required=False)
 
     def save(self, **kwargs):
 
@@ -394,9 +496,11 @@ class ProductAndVariantCreateSerializer(serializers.ModelSerializer):
         try:
             with transaction.atomic():
                 variants = self.validated_data.pop('variants', [])
+                field_links = self.validated_data.pop('field_links', None) or []
                 product = Product.objects.create(
                     business_id=self.context['business_id'], **self.validated_data
                 )
+                self.save_field_links(product, field_links)
 
                 if variants:
                     new_variants = []
@@ -431,7 +535,7 @@ class ProductAndVariantCreateSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Product
-        fields = ['id', 'name', 'desc', 'unit', 'variants']
+        fields = ['id', 'name', 'desc', 'unit', 'variants', 'field_links']
 
 
 class SupplierSerializer(serializers.ModelSerializer):

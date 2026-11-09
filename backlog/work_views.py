@@ -25,6 +25,7 @@ from inventory.models import InventoryItem
 from root.models import Location, ProductVariant
 from root.new_records import create_customer, create_supplier, supplier_label
 from root.utils import get_active_business, local_date
+from sales.lines import display_extra_fields, field_labels
 from sales.serializers import (
     PaymentReceiptSerializer, PurchaseInvoiceAndItemsCreateSerializer,
     PurchaseInvoiceAndItemsUpdateSerializer, PurchaseReceiptCreateSerializer,
@@ -476,6 +477,7 @@ class BacklogWorkViewSet(GenericViewSet):
         sales = output.kind == 'sales_invoice'
         party = invoice.customer if sales else invoice.supplier
         lines = invoice.invoice_items.select_related('product__base')
+        labels = field_labels(invoice.business_id)
         link = invoice.projects.select_related('project').first()
         receipts = invoice.payment_receipts.select_related('transaction_record__account')
         values = {
@@ -492,7 +494,11 @@ class BacklogWorkViewSet(GenericViewSet):
             'project': {'id': link.project_id, 'label': link.project.name} if link else None,
             'lines': [{'id': line.id, 'product': line.product_id, 'label': describe_variant(line.product),
                        'quantity': line.quantity - (getattr(line, 'returned_quantity', 0) or 0),
-                       'price': line.unit_price if sales else line.unit_cost}
+                       'price': line.unit_price if sales else line.unit_cost,
+                       # Kept as they were: a saved line is not edited in place.
+                       'extra_fields': line.extra_fields or {},
+                       'extra_fields_display': display_extra_fields(line.extra_fields, labels),
+                       'discount': line.discount or {}}
                       for line in lines],
             'payments': PaymentReceiptSerializer(receipts, many=True, context={'request': self.request}).data,
             'total': invoice.total,
