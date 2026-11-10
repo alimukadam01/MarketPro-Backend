@@ -10,13 +10,15 @@ from root.utils import generateTransactionId, local_date
 from root.models import Business, BusinessConfig, Customer, BaseItem, Supplier, Location, BaseQuerySet
 from audit.helpers import audited_update
 from audit.context import automatic
-from .lines import line_total as _line_total
+from .lines import line_total as _line_total, no_discount
 
 # A database default of {} for a JSON column, for the code still live during a
 # deploy: it inserts lines without the column and would otherwise hit NOT NULL
 # (backlog/0006 learnt this). Value({}, JSONField()) adapts to jsonb on
 # PostgreSQL and to text on SQLite.
 EMPTY_JSON = models.Value({}, output_field=models.JSONField())
+# The same for a line's discount: never empty, 0% when there is none.
+NO_DISCOUNT_JSON = models.Value(no_discount(), output_field=models.JSONField())
 
 
 # Create your models here.
@@ -556,14 +558,17 @@ class SalesInvoiceItem(BaseItem):
     )
     unit_price = models.FloatField(null=True, blank=True)
     # Off this line: {"type": "percentage" | "amount", "value": n}, an amount
-    # being off the whole line. Canonical (sales/lines.py) and {} - never
-    # NULL - for none, because it is part of the UNIQUE key below: the same
+    # being off the whole line. Canonical (sales/lines.py), and 0% - never
+    # empty or NULL - for none, because it is part of the UNIQUE key below: the same
     # product at the same price with another discount is another line.
     discount = models.JSONField(
+        # blank: a form may leave it out and get the 0% default. Never NULL
+        # or empty in the table (sales/lines.py).
         blank=True,
-        default=dict,
-        db_default=EMPTY_JSON,
-        help_text='e.g., {"type": "percentage" or "amount", "value": 10.0}'
+        default=no_discount,
+        db_default=NO_DISCOUNT_JSON,
+        help_text='e.g., {"type": "percentage" or "amount", "value": 10.0}; '
+                  '{"type": "percentage", "value": 0} for none'
     )
     quantity_received = models.IntegerField(default=0)
     returned_quantity = models.PositiveIntegerField(default=0)
@@ -913,10 +918,13 @@ class PurchaseInvoiceItem(BaseItem):
     # See SalesInvoiceItem.discount. It lowers what the stock cost: morph()
     # sends the cost per unit after it.
     discount = models.JSONField(
+        # blank: a form may leave it out and get the 0% default. Never NULL
+        # or empty in the table (sales/lines.py).
         blank=True,
-        default=dict,
-        db_default=EMPTY_JSON,
-        help_text='e.g., {"type": "percentage" or "amount", "value": 10.0}'
+        default=no_discount,
+        db_default=NO_DISCOUNT_JSON,
+        help_text='e.g., {"type": "percentage" or "amount", "value": 10.0}; '
+                  '{"type": "percentage", "value": 0} for none'
     )
 
     objects = PurchaseInvoiceItemManager()
@@ -931,7 +939,10 @@ class PurchaseInvoiceItem(BaseItem):
     def net_unit_cost(self):
         """The cost of one unit after the line's discount: what the stock is
         worth, and so what profit's cost of goods uses."""
-        if not self.quantity:
+        # No discount (0%): the unit cost exactly as it was entered, so a
+        # line without one moves stock at the very figure it always did -
+        # dividing back out would round a cost like 33.333333.
+        if not self.quantity or not (self.discount or {}).get('value'):
             return self.unit_cost
         return round(self.line_total / self.quantity, 4)
 

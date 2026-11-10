@@ -5,12 +5,13 @@ Two things, both on sales and purchase lines (plans/product-extra-fields.md):
 - extra_fields: the answers to the product's extra fields, {"<field id>": value}
   - Urban Paints' colour code, {"3": "5674"}.
 - discount: off the line, {"type": "percentage" | "amount", "value": n}.
+  Never empty or NULL: no discount is 0%, {"type": "percentage", "value": 0}.
 
 Both sit in the lines' UNIQUE keys, so two gallons in different colours, or at
 different discounts, are two lines. That only works if equal values are equal
 byte for byte, so the server writes one canonical form and nothing else does:
-keys sorted, blanks dropped, numbers normalised, and {} - never NULL - for
-nothing at all.
+keys sorted, blanks dropped, numbers normalised. No answers are {}; no discount
+is NO_DISCOUNT. Neither is ever NULL.
 
 Nothing here touches stock. A line finds its stock row by (business, product),
 and neither of these takes part.
@@ -27,6 +28,15 @@ MAX_TEXT = 100
 
 PERCENTAGE = 'percentage'
 AMOUNT = 'amount'
+
+
+def no_discount():
+    """A line's discount when it has none: 0%. A function, so each line gets
+    its own dict (the model field's default)."""
+    return {'type': PERCENTAGE, 'value': 0}
+
+
+NO_DISCOUNT = no_discount()
 
 
 def _number(value):
@@ -128,21 +138,23 @@ def display_extra_fields(extra_fields, labels):
 
 def canonical_discount(raw):
     """The stored form of a discount, without checking it against a line:
-    {} for none or zero. Used by the migration over old rows."""
+    0% for none, zero or anything unreadable - one form, so the UNIQUE key
+    sees every undiscounted line alike."""
     if not raw or not isinstance(raw, dict):
-        return {}
+        return no_discount()
     kind = raw.get('type')
     value = _number(raw.get('value'))
     if kind not in (PERCENTAGE, AMOUNT) or value is None or value <= 0:
-        return {}
+        return no_discount()
     return {'type': kind, 'value': value}
 
 
 def clean_line_discount(raw, gross):
     """The canonical discount for a new line whose full amount is `gross`, or
-    a 400. A PKR discount is off the whole line."""
+    a 400. A PKR discount is off the whole line. Missing or blank is 0%: the
+    stored discount is never empty."""
     if raw in (None, '', {}):
-        return {}
+        return no_discount()
     if not isinstance(raw, dict):
         raise serializers.ValidationError('A discount is {"type": "percentage" or "amount", "value": n}.')
     kind = raw.get('type')
@@ -154,7 +166,7 @@ def clean_line_discount(raw, gross):
     if value < 0:
         raise serializers.ValidationError('The discount cannot be negative.')
     if value == 0:
-        return {}
+        return no_discount()
     if kind == PERCENTAGE and value > 100:
         raise serializers.ValidationError('A discount cannot be more than 100%.')
     if kind == AMOUNT and value > round(gross, 2):

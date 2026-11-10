@@ -325,8 +325,10 @@ class ProductFieldLinkTests(LineFixture):
 class LineDiscountRulesTests(TestCase):
 
     def test_clean(self):
-        self.assertEqual(clean_line_discount(None, 1000), {})
-        self.assertEqual(clean_line_discount({"type": "percentage", "value": 0}, 1000), {})
+        # Never empty: none, blank or zero is 0%.
+        for raw in (None, "", {}, {"type": "percentage", "value": 0}, {"type": "amount", "value": 0}):
+            with self.subTest(raw=raw):
+                self.assertEqual(clean_line_discount(raw, 1000), {"type": "percentage", "value": 0})
         self.assertEqual(clean_line_discount({"type": "percentage", "value": "10.0"}, 1000),
                          {"type": "percentage", "value": 10})
         self.assertEqual(clean_line_discount({"type": "amount", "value": 250.555}, 1000),
@@ -439,9 +441,36 @@ class LineDiscountOnPurchasesTests(LineFixture):
         self.assertEqual(profit_estimate(self.business.id, today, today)["cost_of_goods_sold"], 90)
 
 
+class NoDiscountIsZeroTests(LineFixture):
+    """A line's discount is never empty or NULL: none is 0%."""
+
+    def test_an_undiscounted_line_is_stored_as_zero(self):
+        response = self.sale([{"product_id": self.brush.id, "quantity": 1, "unit_price": 100}],
+                             number="ZERO-1")
+        self.assertEqual(response.status_code, 201, response.content)
+        line = SalesInvoiceItem.objects.get(sales_invoice__invoice_number="ZERO-1")
+        self.assertEqual(line.discount, {"type": "percentage", "value": 0})
+        # A line made without saying, as the old code during a deploy would.
+        bare = SalesInvoiceItem.objects.create(
+            business=self.business, sales_invoice=line.sales_invoice, product=self.brush,
+            quantity=1, unit_price=50)
+        self.assertEqual(bare.discount, {"type": "percentage", "value": 0})
+
+    def test_purchase_line_too(self):
+        response = self.purchase([{"product_id": self.brush.id, "quantity": 1, "unit_cost": 80}])
+        self.assertEqual(response.status_code, 201, response.content)
+        self.assertEqual(PurchaseInvoiceItem.objects.get(product=self.brush).discount,
+                         {"type": "percentage", "value": 0})
+
+
 class DiscountMigrationTests(TestCase):
 
+    def test_0035_turns_empty_into_zero(self):
+        migration = importlib.import_module("sales.migrations.0035_discount_never_empty")
+        self.assertEqual(migration.NO_DISCOUNT, {"type": "percentage", "value": 0})
+
     def test_old_discounts_become_canonical(self):
+        # 0034, frozen: its "none" was {}; 0035 then makes it 0%.
         migration = importlib.import_module("sales.migrations.0034_line_discounts")
         canonical = migration.canonical_discount
         self.assertEqual(canonical({"value": 0, "type": "percentage"}), {})

@@ -1054,4 +1054,4 @@ class LineExtrasThroughBacklogTests(BacklogFixture):
         values = client.get(f'/backlog-work/{entry.id}/outputs/{output_id}/').json()
         lines = sorted(values['values']['lines'], key=lambda line: line['extra_fields_display'][0]['value'])
         self.assertEqual([(line['extra_fields_display'][0]['value'], line['discount']) for line in lines],
-                         [('1453', {}), ('5674', {'type': 'amount', 'value': 100})])
+                         [('1453', {'type': 'percentage', 'value': 0}), ('5674', {'type': 'amount', 'value': 100})])
