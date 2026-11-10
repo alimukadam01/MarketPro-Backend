@@ -6,6 +6,7 @@ from rest_framework.response import Response
 from rest_framework.viewsets import ReadOnlyModelViewSet
 
 from root.utils import get_active_business
+from . import recorder
 from .models import AuditEvent
 
 
@@ -19,6 +20,12 @@ class IsBusinessOwner(BasePermission):
 
 class AuditEventSerializer(serializers.ModelSerializer):
     actor = serializers.SerializerMethodField()
+    changes = serializers.SerializerMethodField()
+
+    def get_changes(self, event):
+        # Events written before the recorder hid these still hold the values.
+        return {name: recorder.hide(value) if name in recorder.HIDDEN_FIELDS else value
+                for name, value in (event.changes or {}).items()}
 
     def get_actor(self, event):
         user = event.actor

@@ -95,7 +95,7 @@ def _catalogue():
             date_basis_label='Invoice date',
             # Invoices only, as for sales_revenue above.
             returns_treatment='Cancelled invoices are always excluded. '
-                              'Purchase invoices cannot record a discount. '
+                              'Net of any discount on the invoice lines. '
                               'Credit and debit notes are not counted.',
         ),
         DataPointSpec(

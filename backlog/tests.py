@@ -266,8 +266,13 @@ class VisibilityTests(BacklogFixture):
                     self.assertFalse(set(row) & self.FIGURES, row)
                     # product / product_name: a variant's product, so a stock page
                     # can offer to add variants to it - an id and a name.
+                    # extra_fields: the fields its invoice lines ask for - names and
+                    # types, no figures (plans/product-extra-fields.md).
                     self.assertLessEqual(set(row), {'id', 'label', 'unit', 'type', 'is_default',
-                                                    'product', 'product_name'})
+                                                    'product', 'product_name', 'extra_fields'})
+                    for field in row.get('extra_fields', []):
+                        self.assertLessEqual(set(field), {'id', 'label', 'key', 'field_type',
+                                                          'applies_to', 'required'})
         # On a sales page, whether a product is in stock - yes or no, no figure.
         stocked = client.get('/backlog-work/lookup/variants/', {'q': 'emulsion', 'stock': '1'}).json()
         self.assertEqual([(row['id'], row['in_stock']) for row in stocked], [(self.white.id, True)])
@@ -690,6 +695,13 @@ class NewRecordsTests(BacklogFixture):
         rows = client_for(self.owner).get(f'/backlog-entries/{entry.id}/').json()['new_records']
         self.assertEqual([(r['kind'], r['record_id'], r['label'], r['detail']) for r in rows],
                          [('variant', self.paint.id, 'Weather Emulsion (Ivory)', 'new variant')])
+        # The note tying the variant to this page is in the audit trail, under
+        # the person who added it.
+        from audit.models import AuditEvent
+        note = BacklogNewRecord.objects.get(entry=entry, variant=ivory)
+        event = AuditEvent.objects.get(model='backlog.backlognewrecord', object_id=str(note.id))
+        self.assertEqual((event.action, event.actor, event.business_id),
+                         ('bulk_create', self.typist, self.business.id))
         elsewhere = Business.objects.create(name='Elsewhere', owner=self.owner, phone='03000000000')
         theirs = Product.objects.create(business=elsewhere, name='Theirs', unit=self.unit)
         self.assertEqual(client.get(f'/backlog-work/{entry.id}/products/{theirs.id}/variants/').status_code, 404)
@@ -1006,3 +1018,40 @@ class JoinedPagesTests(BacklogFixture):
                          [f'Backlog page #{first.id} · page 1 of 2', f'Backlog page #{first.id} · page 2 of 2'])
         second.refresh_from_db()
         self.assertEqual((second.status, bool(second.image)), ('joined', False))
+
+
+class LineExtrasThroughBacklogTests(BacklogFixture):
+    """A backlog page saves its lines through the invoice serializers, so the
+    colour code and a line discount work there with no code of its own
+    (plans/product-extra-fields.md)."""
+
+    def test_colour_code_and_discount_on_a_backlog_sale(self):
+        from root.models import ProductField, ProductFieldLink
+        colour = ProductField.objects.create(business=self.business, label='Colour code')
+        ProductFieldLink.objects.create(product=self.paint, field=colour, required=True)
+        entry = self.claimed()
+        client = client_for(self.typist)
+
+        missing = client.post(f'/backlog-work/{entry.id}/sales-invoice/', self.sale_payload(), format='json')
+        self.assertEqual(missing.status_code, 400, missing.content)
+
+        payload = self.sale_payload(quantity=2, price=1000)
+        payload['items'] = [
+            {'product_id': self.white.id, 'quantity': 1, 'unit_price': 1000,
+             'extra_fields': {str(colour.id): '1453'}},
+            {'product_id': self.white.id, 'quantity': 1, 'unit_price': 1000,
+             'extra_fields': {str(colour.id): '5674'}, 'discount': {'type': 'amount', 'value': 100}},
+        ]
+        response = client.post(f'/backlog-work/{entry.id}/sales-invoice/', payload, format='json')
+        self.assertEqual(response.status_code, 201, response.content)
+        invoice = SalesInvoice.objects.get(business=self.business)
+        self.assertEqual(sorted(line.extra_fields[str(colour.id)] for line in invoice.invoice_items.all()),
+                         ['1453', '5674'])
+        self.assertEqual(invoice.total, 1900)
+
+        # The entry form reloads them as entered.
+        output_id = response.json()['output']['id']
+        values = client.get(f'/backlog-work/{entry.id}/outputs/{output_id}/').json()
+        lines = sorted(values['values']['lines'], key=lambda line: line['extra_fields_display'][0]['value'])
+        self.assertEqual([(line['extra_fields_display'][0]['value'], line['discount']) for line in lines],
+                         [('1453', {'type': 'percentage', 'value': 0}), ('5674', {'type': 'amount', 'value': 100})])

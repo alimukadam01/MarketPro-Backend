@@ -34,6 +34,36 @@ from .utils import (
 )
 from audit.helpers import audited_bulk_create, audited_bulk_update
 from .stock_rule import reconcile_purchase_invoice, reconcile_sales_invoice, stock_dates
+from .lines import (
+    PURCHASE, SALE, clean_extra_fields, clean_line_discount, clean_payload_lines,
+    display_extra_fields, field_labels,
+)
+
+
+class LineDisplayMixin:
+    """For a serializer of invoice lines: extra_fields_display and line_total,
+    declared as SerializerMethodFields on each serializer that uses it.
+
+    The field names are looked up once per business per response, and only
+    if some line has answers, so a list of lines adds no query per line."""
+
+    def _field_labels(self, line):
+        root = self.root
+        cache = getattr(root, '_extra_field_labels', None)
+        if cache is None:
+            cache = {}
+            root._extra_field_labels = cache
+        if line.business_id not in cache:
+            cache[line.business_id] = field_labels(line.business_id)
+        return cache[line.business_id]
+
+    def get_extra_fields_display(self, line):
+        if not line.extra_fields:
+            return []
+        return display_extra_fields(line.extra_fields, self._field_labels(line))
+
+    def get_line_total(self, line):
+        return round(line.line_total, 2)
 
 
 MAX_EXTRA_CHARGES = 20
@@ -277,7 +307,7 @@ class PaymentReceiptCreateSerializer(PaymentReceiptSerializer):
         return receipt
 
 
-class PurchaseInvoiceItemSerializer(BaseItemSerializer):
+class PurchaseInvoiceItemSerializer(LineDisplayMixin, BaseItemSerializer):
 
     purchase_invoice = serializers.PrimaryKeyRelatedField(read_only=True)
     product = ProductVariantSerializer()
@@ -285,6 +315,11 @@ class PurchaseInvoiceItemSerializer(BaseItemSerializer):
     quantity_received = serializers.IntegerField(default=True)
     is_restocked = serializers.BooleanField(read_only=True)
     is_partially_restocked = serializers.BooleanField(read_only=True)
+    # Set when the line is created, never edited here (sales/lines.py).
+    extra_fields = serializers.JSONField(read_only=True)
+    discount = serializers.JSONField(read_only=True)
+    extra_fields_display = serializers.SerializerMethodField()
+    line_total = serializers.SerializerMethodField()
 
     def update(self, instance, validated_data):
 
@@ -298,9 +333,16 @@ class PurchaseInvoiceItemSerializer(BaseItemSerializer):
 class PurchaseInvoiceItemCreateSerializer(BaseItemSerializer):
     unit_cost = serializers.FloatField()
     quantity_received = serializers.IntegerField(default=True)
+    extra_fields = serializers.JSONField(required=False)
+    discount = serializers.JSONField(required=False)
 
     def validate(self, attrs):
         checkPurchaseInvoiceItemFields(attrs, self.context)
+        # The same rules as a line in a whole invoice (sales/lines.py).
+        attrs['extra_fields'] = clean_extra_fields(
+            attrs.get('product'), attrs.get('extra_fields'), PURCHASE)
+        attrs['discount'] = clean_line_discount(
+            attrs.get('discount'), (attrs.get('quantity') or 0) * (attrs.get('unit_cost') or 0))
         return super().validate(attrs)
 
     def create(self, validated_data):
@@ -343,16 +385,20 @@ class PurchaseInvoiceItemUpdateSerializer(serializers.Serializer):
         return instance
 
 
-class SimplePurchaseInvoiceItemSerializer(serializers.ModelSerializer):
+class SimplePurchaseInvoiceItemSerializer(LineDisplayMixin, serializers.ModelSerializer):
 
     product = ProductVariantSerializer(read_only=True)
+    extra_fields_display = serializers.SerializerMethodField()
+    line_total = serializers.SerializerMethodField()
 
     class Meta:
         model = PurchaseInvoiceItem
         fields = [
             'id', 'purchase_invoice', 'product', 'unit_cost', 'quantity', 'track_code',
-            'notes', 'quantity_received', 'is_restocked', 'is_partially_restocked'
+            'notes', 'quantity_received', 'is_restocked', 'is_partially_restocked',
+            'discount', 'extra_fields', 'extra_fields_display', 'line_total',
         ]
+        read_only_fields = ['discount', 'extra_fields']
 
 
 class ProjectPurchaseInvoiceLinker(serializers.ModelSerializer):
@@ -481,6 +527,11 @@ class PurchaseInvoiceAndItemsCreateSerializer(serializers.ModelSerializer):
     amount_paid = serializers.FloatField(
         required=False, allow_null=True, write_only=True)
 
+    def validate_items(self, items):
+        # Each line's extra fields and discount, and no line twice
+        # (sales/lines.py). A 400 here rather than a 500 at the UNIQUE key.
+        return clean_payload_lines(items, self.context['business_id'], PURCHASE, 'unit_cost')
+
     def save(self, **kwargs):
         items = self.validated_data.pop('items')
         project_id = self.validated_data.pop('project', None)
@@ -500,7 +551,9 @@ class PurchaseInvoiceAndItemsCreateSerializer(serializers.ModelSerializer):
                     purchase_invoice_id=purchase_invoice.id,
                     product_id=item['product_id'],
                     quantity=item['quantity'],
-                    unit_cost=item['unit_cost']
+                    unit_cost=item['unit_cost'],
+                    extra_fields=item['extra_fields'],
+                    discount=item['discount'],
                 ) for item in items]
                 invoice_items = audited_bulk_create(
                     PurchaseInvoiceItem, invoice_items)
@@ -559,13 +612,12 @@ class PurchaseInvoiceAndItemsUpdateSerializer(serializers.ModelSerializer):
     project = serializers.IntegerField(required=False, allow_null=True)
 
     def validate_items(self, items):
-        # A product sits on a purchase invoice once (unique_together). Caught
-        # here as a 400 rather than at the database as a 500.
-        products = [item.get('product_id') for item in items]
-        if len(products) != len(set(products)):
-            raise serializers.ValidationError(
-                "A product can only be on a purchase invoice once - change the quantity on its line instead.")
-        return items
+        # No line twice - product, cost, extra fields and discount, the UNIQUE
+        # key - and each new line's extra fields and discount checked
+        # (sales/lines.py). A saved line keeps the ones it has.
+        saved = {line.id: line for line in PurchaseInvoiceItem.objects.filter(
+            purchase_invoice_id=self.instance.id)} if self.instance else {}
+        return clean_payload_lines(items, self.context['business_id'], PURCHASE, 'unit_cost', saved)
 
     def save(self, **kwargs):
         items = self.validated_data.pop('items')
@@ -685,6 +737,8 @@ class PurchaseInvoiceAndItemsUpdateSerializer(serializers.ModelSerializer):
                 product_id=item['product_id'],
                 quantity=item['quantity'],
                 unit_cost=item['unit_cost'],
+                extra_fields=item['extra_fields'],
+                discount=item['discount'],
             )
             for item in items if item.get('id') not in saved
         ])
@@ -749,16 +803,21 @@ class PurchaseReceiptCreateSerializer(PaymentReceiptCreateSerializer):
         return self.apply_money_details(receipt, money_details)
 
 
-class SalesInvoiceItemSerializer(serializers.ModelSerializer):
+class SalesInvoiceItemSerializer(LineDisplayMixin, serializers.ModelSerializer):
 
     product = ProductVariantSerializer(read_only=True)
+    extra_fields_display = serializers.SerializerMethodField()
+    line_total = serializers.SerializerMethodField()
 
     class Meta:
         model = SalesInvoiceItem
         fields = [
             'id', 'sales_invoice', 'product', 'unit_price', 'quantity', 'returned_quantity', 'net_quantity',
-            'track_code', 'notes', 'quantity_received', 'is_deducted', 'is_returned'
+            'track_code', 'notes', 'quantity_received', 'is_deducted', 'is_returned',
+            'discount', 'extra_fields', 'extra_fields_display', 'line_total',
         ]
+        # Set when the line is created, never edited in place (sales/lines.py).
+        read_only_fields = ['discount', 'extra_fields']
 
     def update(self, instance, validated_data):
 
@@ -769,35 +828,49 @@ class SalesInvoiceItemSerializer(serializers.ModelSerializer):
         return instance
 
 
-class SimpleSalesInvoiceItemSerializer(serializers.ModelSerializer):
+class SimpleSalesInvoiceItemSerializer(LineDisplayMixin, serializers.ModelSerializer):
 
     product = ProductVariantSerializer(read_only=True)
+    extra_fields_display = serializers.SerializerMethodField()
+    line_total = serializers.SerializerMethodField()
 
     class Meta:
         model = SalesInvoiceItem
         fields = [
             'id', 'sales_invoice', 'product', 'unit_price', 'quantity', 'returned_quantity', 'net_quantity',
-            'quantity_received', 'discount', 'is_deducted', 'is_returned'
+            'quantity_received', 'discount', 'is_deducted', 'is_returned',
+            'extra_fields', 'extra_fields_display', 'line_total',
         ]
+        read_only_fields = ['discount', 'extra_fields']
 
 
-class BasicSalesInvoiceItemSerializer(serializers.ModelSerializer):
+class BasicSalesInvoiceItemSerializer(LineDisplayMixin, serializers.ModelSerializer):
+    """The lines as the invoice PDF prints them."""
     product = ProductVariantSerializer(read_only=True)
+    extra_fields_display = serializers.SerializerMethodField()
+    line_total = serializers.SerializerMethodField()
 
     class Meta:
         model = SalesInvoiceItem
         fields = [
-            'id', 'product', 'unit_price', 'quantity', 'returned_quantity', 'net_quantity'
+            'id', 'product', 'unit_price', 'quantity', 'returned_quantity', 'net_quantity',
+            'discount', 'extra_fields_display', 'line_total',
         ]
 
 
 class SalesInvoiceItemCreateSerializer(BaseItemSerializer):
     unit_price = serializers.FloatField()
     quantity_received = serializers.IntegerField(default=True)
-    discount = serializers.JSONField(default=dict)
+    discount = serializers.JSONField(required=False)
+    extra_fields = serializers.JSONField(required=False)
 
     def validate(self, attrs):
         checkSalesInvoiceItemCreateFields(attrs)
+        # The same rules as a line in a whole invoice (sales/lines.py).
+        attrs['extra_fields'] = clean_extra_fields(
+            attrs.get('product'), attrs.get('extra_fields'), SALE)
+        attrs['discount'] = clean_line_discount(
+            attrs.get('discount'), (attrs.get('quantity') or 0) * (attrs.get('unit_price') or 0))
         return super().validate(attrs)
 
     def create(self, validated_data):
@@ -1055,6 +1128,11 @@ class SalesInvoiceAndItemsCreateSerializer(ExtraChargesValidationMixin,
     amount_paid = serializers.FloatField(
         required=False, allow_null=True, write_only=True)
 
+    def validate_items(self, items):
+        # Each line's extra fields and discount, and no line twice
+        # (sales/lines.py). A 400 here rather than a 500 at the UNIQUE key.
+        return clean_payload_lines(items, self.context['business_id'], SALE, 'unit_price')
+
     def save(self, **kwargs):
         items = self.validated_data.pop('items')
         project_id = self.validated_data.pop('project', None)
@@ -1074,7 +1152,9 @@ class SalesInvoiceAndItemsCreateSerializer(ExtraChargesValidationMixin,
                     product_id=item['product_id'],
                     quantity=item['quantity'],
                     quantity_received=item['quantity'],
-                    unit_price=item['unit_price']
+                    unit_price=item['unit_price'],
+                    extra_fields=item['extra_fields'],
+                    discount=item['discount'],
                 ) for item in items]
                 audited_bulk_create(SalesInvoiceItem, invoice_items)
 
@@ -1142,6 +1222,13 @@ class SalesInvoiceAndItemsUpdateSerializer(ExtraChargesValidationMixin,
     items = serializers.ListField()
     project = serializers.IntegerField(required=False, allow_null=True)
 
+    def validate_items(self, items):
+        # As on create. A saved line keeps its extra fields and discount: a
+        # line is not edited in place (sales/lines.py).
+        saved = {line.id: line for line in SalesInvoiceItem.objects.filter(
+            sales_invoice_id=self.instance.id)} if self.instance else {}
+        return clean_payload_lines(items, self.context['business_id'], SALE, 'unit_price', saved)
+
     def save(self, **kwargs):
         items = self.validated_data.pop('items')
         project_id = self.validated_data.pop('project', None)
@@ -1176,7 +1263,7 @@ class SalesInvoiceAndItemsUpdateSerializer(ExtraChargesValidationMixin,
                 grown = []
 
                 for item in items:
-                    if item['id'] in existing_item_ids:
+                    if item.get('id') in existing_item_ids:
                         invoice_item = existing_items_map.get(item['id'])
                         # The page shows and sends a line's NET quantity, after
                         # returns, so the returned units are added back to get
@@ -1196,7 +1283,9 @@ class SalesInvoiceAndItemsUpdateSerializer(ExtraChargesValidationMixin,
                             sales_invoice=self.instance,
                             product_id=item['product_id'],
                             quantity=item['quantity'],
-                            unit_price=item['unit_price']
+                            unit_price=item['unit_price'],
+                            extra_fields=item['extra_fields'],
+                            discount=item['discount'],
                         ))
 
                 # Lines taken off go before new ones are created: a product
