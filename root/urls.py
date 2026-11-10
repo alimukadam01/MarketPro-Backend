@@ -6,7 +6,7 @@ from .views import (
     ExpenseViewSet, LocationKPIViewSet,
     GlobalSearchView, LocationViewSet, MultiModelSearchView, ProductKPIViewSet, ProductRelatedVariantViewSet,
     SupplierKPIViewSet, SupplierViewSet, UnitViewSet,
-    ProductViewSet, EmailTestingView, ProductVariantViewSet, ProductVariantTypeViewSet,
+    ProductViewSet, EmailTestingView, ProductVariantViewSet, ProductVariantTypeViewSet, ProductFieldViewSet,
     EmployeeViewSet, EmployeePermissionsViewSet,
 )
 
@@ -22,6 +22,7 @@ router.register('customers', CustomerViewSet, basename='customers')
 router.register('expenses', ExpenseViewSet, basename='expenses')
 router.register('product-variant-types', ProductVariantTypeViewSet, basename='product-variant-types')
 router.register('product-variants', ProductVariantViewSet, basename='product-variants')
+router.register('product-fields', ProductFieldViewSet, basename='product-fields')
 
 products_router = NestedDefaultRouter(router, 'products', lookup='product')
 products_router.register('variants', ProductRelatedVariantViewSet, basename='variants')

@@ -10,6 +10,15 @@ from root.utils import generateTransactionId, local_date
 from root.models import Business, BusinessConfig, Customer, BaseItem, Supplier, Location, BaseQuerySet
 from audit.helpers import audited_update
 from audit.context import automatic
+from .lines import line_total as _line_total, no_discount
+
+# A database default of {} for a JSON column, for the code still live during a
+# deploy: it inserts lines without the column and would otherwise hit NOT NULL
+# (backlog/0006 learnt this). Value({}, JSONField()) adapts to jsonb on
+# PostgreSQL and to text on SQLite.
+EMPTY_JSON = models.Value({}, output_field=models.JSONField())
+# The same for a line's discount: never empty, 0% when there is none.
+NO_DISCOUNT_JSON = models.Value(no_discount(), output_field=models.JSONField())
 
 
 # Create your models here.
@@ -420,9 +429,17 @@ class SalesInvoice(SettledInvoiceMixin, models.Model):
             # with nothing being delivered is an invoice still being written.
             return
 
-        subtotal = sum(item.net_quantity * item.unit_price for item in items)
+        # Each line after its own discount (sales/lines.py: line_total). So
+        # sub_total is after line discounts, and the invoice's discount and tax
+        # below work on it - Invoice.jsx recomputes them from sub_total too.
+        #
+        # This replaces a line-discount loop that never worked: it only ran
+        # when the invoice had no discount at all (the screens always send one,
+        # even 0), took a percentage off one unit rather than the line, and
+        # read item.tax - which a line does not have - for an amount.
+        subtotal = sum(item.line_total for item in items)
 
-        # Calculate total discount on the order.
+        # The invoice's own discount, on top of the lines'.
         discount = 0
         if self.discount:
             if self.discount["type"] == "percentage":
@@ -433,20 +450,6 @@ class SalesInvoice(SettledInvoiceMixin, models.Model):
 
             else:
                 raise Exception("incorrect value")
-
-        else:
-            for item in items:
-                if not item.discount:
-                    continue
-
-                if item.discount["type"] == "percentage":
-                    discount += item.unit_price * (item.discount["value"]/100)
-
-                elif item.tax["type"] == "amount":
-                    discount += item.discount["value"]
-
-                else:
-                    raise Exception("incorrect value")
 
         # Calculate tax on the Invoice
         tax = 0
@@ -554,11 +557,18 @@ class SalesInvoiceItem(BaseItem):
         SalesInvoice, models.CASCADE, related_name='invoice_items'
     )
     unit_price = models.FloatField(null=True, blank=True)
+    # Off this line: {"type": "percentage" | "amount", "value": n}, an amount
+    # being off the whole line. Canonical (sales/lines.py), and 0% - never
+    # empty or NULL - for none, because it is part of the UNIQUE key below: the same
+    # product at the same price with another discount is another line.
     discount = models.JSONField(
-        null=True,
+        # blank: a form may leave it out and get the 0% default. Never NULL
+        # or empty in the table (sales/lines.py).
         blank=True,
-        default=dict,
-        help_text='e.g., {"value": 10.0, "type": "percentage" or "amount"}'
+        default=no_discount,
+        db_default=NO_DISCOUNT_JSON,
+        help_text='e.g., {"type": "percentage" or "amount", "value": 10.0}; '
+                  '{"type": "percentage", "value": 0} for none'
     )
     quantity_received = models.IntegerField(default=0)
     returned_quantity = models.PositiveIntegerField(default=0)
@@ -566,12 +576,23 @@ class SalesInvoiceItem(BaseItem):
     # Dated on or before its product's stock count, so the count already
     # includes it: marked done without moving stock (sales/stock_rule.py).
     stock_skipped = models.BooleanField(default=False)
+    # The answers to the product's extra fields, {"<field id>": value} - the
+    # colour code. Written only in the canonical form of sales/lines.py, and
+    # {} rather than NULL, because it is part of the UNIQUE key below.
+    # db_default so the code still live during a deploy can insert lines.
+    extra_fields = models.JSONField(default=dict, db_default=EMPTY_JSON, blank=True)
 
     objects = SalesInvoiceItemManager()
 
     @property
     def net_quantity(self):
         return self.quantity - self.returned_quantity
+
+    @property
+    def line_total(self):
+        """What this line bills: its net quantity at its price, less its
+        discount (sales/lines.py: line_total)."""
+        return _line_total(self.unit_price, self.quantity, self.net_quantity, self.discount)
 
     @property
     def is_returned(self):
@@ -619,7 +640,10 @@ class SalesInvoiceItem(BaseItem):
         # the key was (invoice, product) alone. Billing it twice at the SAME
         # price is still refused, because that is a double-entered line: the
         # invoice screen merges it into the existing row's quantity instead.
-        unique_together = [('sales_invoice', 'product', 'unit_price')]
+        # extra_fields and discount join the key: a gallon in colour 1453 and
+        # one in 5674, or one at 10% off, at the same price are separate
+        # lines (sales/lines.py).
+        unique_together = [('sales_invoice', 'product', 'unit_price', 'extra_fields', 'discount')]
 
 
 class SalesReceipt(PaymentReceipt):
@@ -649,10 +673,9 @@ class PurchaseInvoiceManager(models.Manager):
         """
         Invoiced purchase value over an absolute window, dated on the invoice.
 
-        Gross of any negotiated discount: PurchaseInvoice has no discount
-        field, so a discount only shows here if the user lowered unit_cost by
-        hand. The catalogue label says so; nothing in the UI may call this
-        figure net.
+        Net of line discounts: it adds up invoice totals, and a purchase
+        line's discount comes off its line (sales/lines.py). A purchase invoice
+        has no discount of its own, only its lines do.
         """
         return (
             self.get_queryset()
@@ -785,7 +808,8 @@ class PurchaseInvoice(SettledInvoiceMixin, models.Model):
         .exclude().
         """
         items = PurchaseInvoiceItem.objects.filter(purchase_invoice_id=self.pk)
-        subtotal = sum(item.quantity * item.unit_cost for item in items)
+        # Each line after its own discount (sales/lines.py: line_total).
+        subtotal = sum(item.line_total for item in items)
 
         tax = 0
         if self.tax:
@@ -889,8 +913,38 @@ class PurchaseInvoiceItem(BaseItem):
     # See SalesInvoiceItem.stock_skipped.
     stock_skipped = models.BooleanField(default=False)
     is_partially_restocked = models.BooleanField(default=False)
+    # See SalesInvoiceItem.extra_fields.
+    extra_fields = models.JSONField(default=dict, db_default=EMPTY_JSON, blank=True)
+    # See SalesInvoiceItem.discount. It lowers what the stock cost: morph()
+    # sends the cost per unit after it.
+    discount = models.JSONField(
+        # blank: a form may leave it out and get the 0% default. Never NULL
+        # or empty in the table (sales/lines.py).
+        blank=True,
+        default=no_discount,
+        db_default=NO_DISCOUNT_JSON,
+        help_text='e.g., {"type": "percentage" or "amount", "value": 10.0}; '
+                  '{"type": "percentage", "value": 0} for none'
+    )
 
     objects = PurchaseInvoiceItemManager()
+
+    @property
+    def line_total(self):
+        """What this line costs: quantity at unit cost, less its discount.
+        A purchase line has no returns, so its net quantity is its quantity."""
+        return _line_total(self.unit_cost, self.quantity, self.quantity, self.discount)
+
+    @property
+    def net_unit_cost(self):
+        """The cost of one unit after the line's discount: what the stock is
+        worth, and so what profit's cost of goods uses."""
+        # No discount (0%): the unit cost exactly as it was entered, so a
+        # line without one moves stock at the very figure it always did -
+        # dividing back out would round a cost like 33.333333.
+        if not self.quantity or not (self.discount or {}).get('value'):
+            return self.unit_cost
+        return round(self.line_total / self.quantity, 4)
 
     def clean(self):
         super().clean()
@@ -922,7 +976,9 @@ class PurchaseInvoiceItem(BaseItem):
             "track_code": self.track_code,
             "notes": self.notes,
             "last_transaction": generateTransactionId(self),
-            "unit_cost": self.unit_cost,
+            # After the line's discount: a discount on the purchase lowers
+            # what the stock cost.
+            "unit_cost": self.net_unit_cost,
             "quantity_received": self.quantity_received
         }
 
@@ -945,7 +1001,10 @@ class PurchaseInvoiceItem(BaseItem):
         self.save(update_fields=['is_restocked', 'is_partially_restocked'])
 
     class Meta:
-        unique_together = [('purchase_invoice', 'product')]
+        # As on SalesInvoiceItem, with unit_cost too: the screens merge lines
+        # on product and cost, and a key of product alone refused a second
+        # line at another cost only when it reached the database.
+        unique_together = [('purchase_invoice', 'product', 'unit_cost', 'extra_fields', 'discount')]
         # constraints = [
             
         #     models.CheckConstraint(

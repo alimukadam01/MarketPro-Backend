@@ -4,6 +4,7 @@ from calendar import monthrange
 from datetime import date, datetime, timedelta
 from django.conf import settings
 from django.utils import timezone
+from django.utils.text import slugify
 
 # Create your models here.
 
@@ -380,6 +381,76 @@ class ProductVariant(models.Model):
 
     def __str__(self):
         return f"{self.base.name} - {self.name}"
+
+
+class ProductField(models.Model):
+    """An extra detail some products ask for on every invoice line: Urban
+    Paints' colour code. It describes the sale, not the stock - a detail that
+    changes what is stocked is a variant instead.
+
+    Defined once per business in Django admin; the shop ticks it on the
+    products that need it (ProductFieldLink). Never deleted once in use, only
+    retired with is_active, so old invoice lines keep their meaning.
+    """
+
+    TEXT = 'text'
+    NUMBER = 'number'
+    TYPE_CHOICES = [(TEXT, 'Text'), (NUMBER, 'Number')]
+
+    business = models.ForeignKey(
+        Business, models.CASCADE, related_name='product_fields')
+    label = models.CharField(max_length=64)
+    # Stable name for code and imports. Filled from the label when left blank.
+    key = models.SlugField(max_length=64, blank=True)
+    field_type = models.CharField(max_length=16, choices=TYPE_CHOICES, default=TEXT)
+    is_active = models.BooleanField(
+        default=True,
+        help_text='Untick to retire the field. It cannot be deleted while a '
+                  'product asks for it.')
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        unique_together = [('business', 'key')]
+        ordering = ['label']
+
+    def save(self, *args, **kwargs):
+        if not self.key:
+            self.key = slugify(self.label).replace('-', '_')[:64]
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return f"{self.label} ({self.business})"
+
+
+class ProductFieldLink(models.Model):
+    """A product asking for an extra field. On the base product, so every
+    variant of it - the quarter and the gallon - asks."""
+
+    SALE = 'sale'
+    PURCHASE = 'purchase'
+    BOTH = 'both'
+    APPLIES_TO_CHOICES = [(SALE, 'Sales'), (PURCHASE, 'Purchases'), (BOTH, 'Both')]
+
+    product = models.ForeignKey(
+        Product, models.CASCADE, related_name='field_links')
+    # PROTECT: a field some product asks for cannot be deleted; retire it.
+    field = models.ForeignKey(
+        ProductField, models.PROTECT, related_name='links')
+    applies_to = models.CharField(
+        max_length=16, choices=APPLIES_TO_CHOICES, default=SALE)
+    required = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        unique_together = [('product', 'field')]
+
+    def asks_on(self, side):
+        """side is 'sale' or 'purchase'."""
+        return self.applies_to in (side, self.BOTH)
+
+    def __str__(self):
+        return f"{self.product} asks {self.field.label}"
 
 
 class BaseItem(models.Model):

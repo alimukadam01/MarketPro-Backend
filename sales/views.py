@@ -3,6 +3,7 @@ from datetime import datetime
 
 from django.db import transaction
 from django.db.models import Avg, Count, F, Sum
+from django.db.models.functions import Length, TruncDate
 from django.utils import timezone
 
 from rest_framework import exceptions, status
@@ -69,6 +70,39 @@ from .stock_rule import return_applies
 
 # Create your views here.
 
+
+
+def by_date_then_number(queryset):
+    """Invoices newest day first, then highest invoice number first.
+
+    The day, not the timestamp: date_issued holds no real time - the screens
+    send a date, stored as midnight (Create, backlog entry) or noon (Update) -
+    so ordering by it would put every invoice last saved on Update above the
+    rest of its day, whatever the numbers. TruncDate takes the day in the
+    business timezone (TIME_ZONE).
+
+    Numbers are text, and plain text order puts "10" before "9". Within one
+    prefix a longer number is a bigger one, so length first, then the text:
+    SAL-100 before SAL-099, 1453 before 999. Blank or missing numbers come
+    last in their day, newest first.
+    """
+    return queryset.annotate(
+        issued_day=TruncDate('date_issued'),
+        number_length=Length('invoice_number'),
+    ).order_by(
+        F('issued_day').desc(nulls_last=True),
+        F('number_length').desc(nulls_last=True),
+        F('invoice_number').desc(nulls_last=True),
+        '-id',
+    )
+
+
+# What an invoice's lines need of their product (see get_queryset below).
+LINE_PRODUCT_PREFETCH = (
+    'invoice_items__product__base__unit',
+    'invoice_items__product__base__variants',
+    'invoice_items__product__base__field_links__field',
+)
 
 class SettledInvoiceViewMixin:
     """
@@ -201,7 +235,9 @@ class PurchaseInvoiceViewSet(PeriodFilterMixin, SettledInvoiceViewMixin, ModelVi
     filterset_class = PurchaseInvoiceFilter
     search_fields = [
         'id', 'invoice_number', 'supplier__name', 'status',
-        'sub_total', 'total', 'goods_received', 'delivery', 'notes'
+        'sub_total', 'total', 'goods_received', 'delivery', 'notes',
+        # A line's extra-field answers find its invoice.
+        'invoice_items__extra_fields',
     ]
 
     def get_queryset(self):
@@ -209,11 +245,17 @@ class PurchaseInvoiceViewSet(PeriodFilterMixin, SettledInvoiceViewMixin, ModelVi
         if not business:
             return []
 
-        return PurchaseInvoice.objects.filter(
+        queryset = by_date_then_number(PurchaseInvoice.objects.filter(
             business_id=business.id
         ).prefetch_related(
             'payment_receipts__transaction_record', 'invoice_items'
-        ).order_by('-created_at')
+        ))
+        if self.action == 'retrieve':
+            # The detail lists every line with its product, the product's unit
+            # and variants, and the extra fields it asks for: fetched once for
+            # all the lines, not once per line.
+            queryset = queryset.prefetch_related(*LINE_PRODUCT_PREFETCH)
+        return queryset
 
     # The page's period switch narrows the table on the invoice date.
     period_lookup = 'date_issued__date'
@@ -435,7 +477,8 @@ class PurchaseInvoiceItemViewSet(ModelViewSet):
     ]
     search_fields = [
         'id', 'purchase_invoice__id', 'purchase_invoice__invoice_number', 'product__name',
-        'product__base__name', 'track_code', 'notes', 'unit_cost', 'quantity_received'
+        'product__base__name', 'track_code', 'notes', 'unit_cost', 'quantity_received',
+        'extra_fields',
     ]
 
     def get_serializer_class(self):
@@ -623,7 +666,9 @@ class SalesInvoiceViewSet(PeriodFilterMixin, SettledInvoiceViewMixin, ModelViewS
     # anything with a "c" in it matched every completed invoice, and a search
     # for a customer called Dawood matched every draft.
     search_fields = [
-        'id', 'invoice_number', 'customer__name', 'sub_total', 'total', 'discount', 'tax', 'notes', 'created_by__email'
+        'id', 'invoice_number', 'customer__name', 'sub_total', 'total', 'discount', 'tax', 'notes', 'created_by__email',
+        # A line's extra-field answers - the colour code - find its invoice.
+        'invoice_items__extra_fields',
     ]
 
     def get_queryset(self):
@@ -631,11 +676,17 @@ class SalesInvoiceViewSet(PeriodFilterMixin, SettledInvoiceViewMixin, ModelViewS
         if not business:
             return []
 
-        return SalesInvoice.objects.filter(
+        queryset = by_date_then_number(SalesInvoice.objects.filter(
             business_id=business.id
         ).prefetch_related(
             'payment_receipts__transaction_record', 'invoice_items'
-        ).order_by("-created_at")
+        ))
+        if self.action == 'retrieve':
+            # The detail lists every line with its product, the product's unit
+            # and variants, and the extra fields it asks for: fetched once for
+            # all the lines, not once per line.
+            queryset = queryset.prefetch_related(*LINE_PRODUCT_PREFETCH)
+        return queryset
 
     # The page's period switch narrows the table on the invoice date.
     period_lookup = 'date_issued__date'
@@ -972,7 +1023,8 @@ class SalesInvoiceItemViewSet(ModelViewSet):
         'product__name', 'product__base__name', 'track_code', 'unit_price', 'quantity_received'
     ]
     search_fields = [
-        'id', 'sales_invoice__id', 'sales_invoice__invoice_number', 'product__name', 'product__base__name', 'track_code', 'quantity_received', 'unit_price', 'discount'
+        'id', 'sales_invoice__id', 'sales_invoice__invoice_number', 'product__name', 'product__base__name', 'track_code', 'quantity_received', 'unit_price', 'discount',
+        'extra_fields',
     ]
 
     def get_queryset(self):

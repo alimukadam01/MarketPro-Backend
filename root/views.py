@@ -1,7 +1,7 @@
 from datetime import datetime
 from django.db.models import Count, Exists, OuterRef, QuerySet, Sum
 from django.utils import timezone
-from rest_framework import status
+from rest_framework import exceptions, status
 from rest_framework.views import APIView
 from rest_framework.viewsets import ReadOnlyModelViewSet, ModelViewSet, GenericViewSet, ViewSet
 from rest_framework.response import Response
@@ -23,7 +23,7 @@ from .periods import (
 from .utils import get_active_business, whatsapp_number
 from .serializers import (
     BusinessCreateSerializer, CategorySerializer, CitySerializer, CustomerSerializer, EmployeeAndUserCreateSerializer, ExpenseSerializer, LocationSerializer,
-    BusinessSerializer, ProductAndVariantCreateSerializer, ProductAndVariantUpdateSerializer, ProductVariantTypeSerializer, SimpleCustomerSerializer, SimpleProductSerializer, SupplierSerializer, UnitSerializer,
+    BusinessSerializer, ProductAndVariantCreateSerializer, ProductAndVariantUpdateSerializer, ProductFieldSerializer, ProductVariantTypeSerializer, SimpleCustomerSerializer, SimpleProductSerializer, SupplierSerializer, UnitSerializer,
     ProductCreateUpdateSerializer, ProductSerializer, ProductVariantCreateSerializer, ProductVariantSerializer,
     EmployeeSerializer, EmployeeCreateSerializer, EmployeeUpdateSerializer,
     EmployeeAccessSerializer, EmployeeAccessCreateSerializer, EmployeeAccessUpdateSerializer,
@@ -32,7 +32,7 @@ from .serializers import (
 from .models import (
     Business, BusinessConfig, Category, City,
     Customer, Employee, EmployeeAccess, Expense, Location,
-    Product, ProductVariant, ProductVariantType, Supplier, Unit,
+    Product, ProductField, ProductVariant, ProductVariantType, Supplier, Unit,
 )
 from .filters import GlobalSearch
 from .list_filters import CustomerFilter, ExpenseFilter, ProductFilter
@@ -121,6 +121,20 @@ class BusinessViewSet(ModelViewSet):
             }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
+class ProductFieldViewSet(ReadOnlyModelViewSet):
+    """GET /product-fields/: the active business's extra fields, for the
+    product form. Made in Django admin; read-only here."""
+
+    serializer_class = ProductFieldSerializer
+    pagination_class = None
+
+    def get_queryset(self):
+        business = get_active_business(self.request)
+        if not business:
+            return ProductField.objects.none()
+        return ProductField.objects.filter(business_id=business.id, is_active=True).order_by('label')
+
+
 class ProductVariantTypeViewSet(ReadOnlyModelViewSet):
 
     queryset = ProductVariantType.objects.all()
@@ -144,7 +158,8 @@ class ProductViewSet(ModelViewSet):
         if not business:
             return []
 
-        return Product.objects.filter(business_id=business.id).order_by('name')
+        return (Product.objects.filter(business_id=business.id)
+                .prefetch_related('variants', 'field_links__field').order_by('name'))
 
     def get_serializer_class(self):
         
@@ -219,6 +234,11 @@ class ProductViewSet(ModelViewSet):
             res_serializer = ProductSerializer(product)
             return Response(res_serializer.data, status=status.HTTP_201_CREATED)
 
+        except exceptions.APIException:
+            # A validation error - a field link that is not the business's -
+            # is a 400 with its reason, not the 500 below.
+            raise
+
         except Exception as error:
             print(error)
             return Response({
@@ -255,6 +275,11 @@ class ProductViewSet(ModelViewSet):
             res_serializer = ProductSerializer(product)
             return Response(res_serializer.data, status=status.HTTP_201_CREATED)
 
+        except exceptions.APIException:
+            # A validation error - a field link that is not the business's -
+            # is a 400 with its reason, not the 500 below.
+            raise
+
         except Exception as error:
             print(error)
             return Response({
@@ -272,8 +297,10 @@ class ProductVariantViewSet(ModelViewSet):
             # empty list.
             return ProductVariant.objects.none()
 
-        queryset = ProductVariant.objects.filter(
-            base__business=business).order_by('base__name')
+        queryset = (ProductVariant.objects.filter(base__business=business)
+                    .select_related('base__unit')
+                    .prefetch_related('base__variants', 'base__field_links__field')
+                    .order_by('base__name'))
 
         # ?has_inventory_item=false lists only variants that are not stocked
         # yet. The create-inventory-item screen offers exactly those: picking a

@@ -104,13 +104,17 @@ class InventoryItemsViewSet(ModelViewSet):
                 return Response({'detail': 'No active business exists. Please contact admin.'},
                                 status=status.HTTP_400_BAD_REQUEST)
             rows = (InventoryItem.objects.filter(inventory__business_id=business.id)
-                    .select_related('product__base__unit'))
+                    .select_related('product__base__unit')
+                    # Each product carries the extra fields its lines ask for.
+                    .prefetch_related('product__base__variants', 'product__base__field_links__field'))
 
             if request.query_params.get('include_out_of_stock') in ('1', 'true'):
                 stock = {row.product_id: row for row in rows}
                 variants = (ProductVariant.objects
                             .filter(base__business_id=business.id, is_active=True, base__is_active=True)
-                            .select_related('base__unit').order_by('base__name', 'name'))
+                            .select_related('base__unit')
+                            .prefetch_related('base__variants', 'base__field_links__field')
+                            .order_by('base__name', 'name'))
                 available_products = [{
                     "product": variant,
                     "available_quantity": max(stock[variant.id].quantity_on_hand, 0) if variant.id in stock else 0,
