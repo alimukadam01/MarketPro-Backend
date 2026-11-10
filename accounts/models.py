@@ -3,7 +3,7 @@ from datetime import date as date_cls
 
 from django.conf import settings
 from django.db import models
-from django.db.models import Q
+from django.db.models import Case, F, IntegerField, OuterRef, Q, Subquery, Value, When
 from django.db.models.functions import Coalesce
 from django.utils import timezone
 
@@ -17,6 +17,44 @@ class MoneyAccountQuerySet(models.QuerySet):
 
     def active(self):
         return self.filter(is_active=True)
+
+    def with_balance(self, as_of=None):
+        """
+        Each account's balance as `balance_value`, worked out in the same query
+        that loads the accounts - one query for any number of them, where
+        MoneyAccount.balance() used to cost five per account.
+
+        The figure is the one balance() has always given: the opening balance,
+        plus every cleared movement on or before `as_of`. Money in adds, money
+        out and transfers away subtract, cash adjustments add with their sign,
+        and transfers into the account add. The type lists are disjoint, so each
+        transaction counts once, exactly as in the five separate sums.
+        """
+        outgoing = Transaction.objects.filter(account=OuterRef('pk'), status='C')
+        incoming = Transaction.objects.filter(
+            transfer_account=OuterRef('pk'), status='C', type='transfer')
+        if as_of:
+            outgoing = outgoing.filter(date__lte=as_of)
+            incoming = incoming.filter(date__lte=as_of)
+
+        signed = Case(
+            When(type__in=Transaction.IN_TYPES, then=F('amount')),
+            When(type__in=Transaction.OUT_TYPES, then=-F('amount')),
+            When(type='transfer', then=-F('amount')),
+            When(type='cash_adjustment', then=F('amount')),
+            default=Value(0),
+            output_field=IntegerField(),
+        )
+        outgoing_net = (outgoing.order_by().values('account')
+                        .annotate(total=models.Sum(signed)).values('total'))
+        incoming_net = (incoming.order_by().values('transfer_account')
+                        .annotate(total=models.Sum('amount')).values('total'))
+
+        return self.annotate(balance_value=(
+            F('opening_balance')
+            + Coalesce(Subquery(outgoing_net, output_field=IntegerField()), Value(0))
+            + Coalesce(Subquery(incoming_net, output_field=IntegerField()), Value(0))
+        ))
 
 
 class MoneyAccountManager(models.Manager):
@@ -76,12 +114,13 @@ class MoneyAccountManager(models.Manager):
         """
         Per-account balances plus the total across every active account.
         """
-        accounts = self.get_queryset().for_business(business_id).active()
+        accounts = (self.get_queryset().for_business(business_id).active()
+                    .with_balance(as_of))
 
         rows = []
         total = 0
         for account in accounts:
-            balance = account.balance(as_of)
+            balance = account.balance_value
             total += balance
             rows.append({
                 'id': account.id,
@@ -123,43 +162,12 @@ class MoneyAccount(models.Model):
         """
         Opening balance plus every cleared movement touching this account.
         Never stored — always computed on read (BRD rule 3).
+
+        Read fresh, in one query (MoneyAccountQuerySet.with_balance has the
+        rule). Lists annotate it instead, so they cost one query in all.
         """
-        outgoing = self.transactions.filter(status='C')
-        incoming = self.incoming_transfers.filter(status='C')
-
-        if as_of:
-            outgoing = outgoing.filter(date__lte=as_of)
-            incoming = incoming.filter(date__lte=as_of)
-
-        money_in = outgoing.filter(
-            type__in=Transaction.IN_TYPES
-        ).aggregate(total=models.Sum('amount'))['total'] or 0
-
-        money_out = outgoing.filter(
-            type__in=Transaction.OUT_TYPES
-        ).aggregate(total=models.Sum('amount'))['total'] or 0
-
-        # Transfers leave this account when it is the source.
-        transferred_out = outgoing.filter(
-            type='transfer'
-        ).aggregate(total=models.Sum('amount'))['total'] or 0
-
-        # ... and enter it when it is the destination.
-        transferred_in = incoming.filter(
-            type='transfer'
-        ).aggregate(total=models.Sum('amount'))['total'] or 0
-
-        # Adjustments are signed — they may be positive or negative.
-        adjustments = outgoing.filter(
-            type='cash_adjustment'
-        ).aggregate(total=models.Sum('amount'))['total'] or 0
-
-        return (
-            self.opening_balance
-            + money_in - money_out
-            - transferred_out + transferred_in
-            + adjustments
-        )
+        return (MoneyAccount.objects.filter(pk=self.pk).with_balance(as_of)
+                .values_list('balance_value', flat=True).get())
 
     def has_transactions(self):
         return self.transactions.exists() or self.incoming_transfers.exists()

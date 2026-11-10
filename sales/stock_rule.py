@@ -50,10 +50,17 @@ def stock_dates(invoice):
     return (issued, getattr(invoice, 'delivery', None))
 
 
-def stock_applies(line):
+_UNREAD = object()
+
+
+def stock_applies(line, counted=_UNREAD):
     """Whether this line should move stock: no count yet, no date to judge
-    it by, or dated after the count."""
-    counted = counted_at(line.business_id, line.product_id)
+    it by, or dated after the count.
+
+    Pass `counted` - the stock row's stock_counted_at, or None when the
+    product has no stock row - when the row is already loaded."""
+    if counted is _UNREAD:
+        counted = counted_at(line.business_id, line.product_id)
     day = line_date(line)
     return counted is None or day is None or day > counted
 

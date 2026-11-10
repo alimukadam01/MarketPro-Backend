@@ -247,8 +247,8 @@ class PurchaseInvoiceViewSet(PeriodFilterMixin, SettledInvoiceViewMixin, ModelVi
 
         queryset = by_date_then_number(PurchaseInvoice.objects.filter(
             business_id=business.id
-        ).prefetch_related(
-            'payment_receipts__transaction_record', 'invoice_items'
+        ).select_related('supplier').prefetch_related(
+            'payment_receipts__transaction_record', 'invoice_items', 'projects'
         ))
         if self.action == 'retrieve':
             # The detail lists every line with its product, the product's unit
@@ -495,9 +495,10 @@ class PurchaseInvoiceItemViewSet(ModelViewSet):
         return PurchaseInvoiceItemSerializer
 
     def get_queryset(self):
-        return PurchaseInvoiceItem.objects.filter(
-            purchase_invoice_id=self.kwargs['purchase_invoice_pk']
-        )
+        return (PurchaseInvoiceItem.objects
+                .filter(purchase_invoice_id=self.kwargs['purchase_invoice_pk'])
+                .select_related('business', 'product__base__unit')
+                .prefetch_related('product__base__variants', 'product__base__field_links__field'))
 
     def get_serializer_context(self):
 
@@ -678,8 +679,8 @@ class SalesInvoiceViewSet(PeriodFilterMixin, SettledInvoiceViewMixin, ModelViewS
 
         queryset = by_date_then_number(SalesInvoice.objects.filter(
             business_id=business.id
-        ).prefetch_related(
-            'payment_receipts__transaction_record', 'invoice_items'
+        ).select_related('customer__city').prefetch_related(
+            'payment_receipts__transaction_record', 'invoice_items', 'projects'
         ))
         if self.action == 'retrieve':
             # The detail lists every line with its product, the product's unit
@@ -1032,7 +1033,10 @@ class SalesInvoiceItemViewSet(ModelViewSet):
         if not business:
             return []
 
-        return SalesInvoiceItem.objects.filter(business_id=business.id, sales_invoice_id=self.kwargs['sales_invoice_pk'])
+        return (SalesInvoiceItem.objects
+                .filter(business_id=business.id, sales_invoice_id=self.kwargs['sales_invoice_pk'])
+                .select_related('product__base__unit')
+                .prefetch_related('product__base__variants', 'product__base__field_links__field'))
 
     def get_serializer_class(self):
         method = self.request.method
@@ -1495,7 +1499,11 @@ class PurchaseQuotationViewSet(ModelViewSet):
     def get_queryset(self):
 
         business = get_active_business(self.request)
-        return PurchaseQuotation.objects.filter(business_id=business.id)
+        return (PurchaseQuotation.objects.filter(business_id=business.id)
+                .select_related('created_by')
+                .prefetch_related('items__supplier', 'items__product__base__unit',
+                                  'items__product__base__variants',
+                                  'items__product__base__field_links__field'))
 
     def get_serializer_class(self):
 

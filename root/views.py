@@ -20,7 +20,7 @@ from .periods import (
     TREND_PERIODS, PeriodFilterMixin, daily_trend, hourly_trend, in_period,
     is_filtered, period_from_params, period_payload,
 )
-from .utils import get_active_business, whatsapp_number
+from .utils import forget_active_business, get_active_business, whatsapp_number
 from .serializers import (
     BusinessCreateSerializer, CategorySerializer, CitySerializer, CustomerSerializer, EmployeeAndUserCreateSerializer, ExpenseSerializer, LocationSerializer,
     BusinessSerializer, ProductAndVariantCreateSerializer, ProductAndVariantUpdateSerializer, ProductFieldSerializer, ProductVariantTypeSerializer, SimpleCustomerSerializer, SimpleProductSerializer, SupplierSerializer, UnitSerializer,
@@ -109,6 +109,8 @@ class BusinessViewSet(ModelViewSet):
                 business.is_active = (business.id == int(self.kwargs['pk']))
 
             audited_bulk_update(Business, businesses, ['is_active'])
+            # The active business just changed: a cached one is stale.
+            forget_active_business(request)
 
             return Response({
                 "detail": "OK"
@@ -159,6 +161,7 @@ class ProductViewSet(ModelViewSet):
             return []
 
         return (Product.objects.filter(business_id=business.id)
+                .select_related('unit')
                 .prefetch_related('variants', 'field_links__field').order_by('name'))
 
     def get_serializer_class(self):
@@ -409,7 +412,9 @@ class SupplierViewSet(ModelViewSet):
         if not business:
             return []
 
-        return Supplier.objects.filter(business_id=business.id).order_by('name')
+        # select_related: the serializer nests each supplier's business.
+        return (Supplier.objects.filter(business_id=business.id)
+                .select_related('business').order_by('name'))
 
     def get_serializer_context(self):
         business = get_active_business(self.request)
@@ -598,7 +603,9 @@ class CustomerViewSet(ModelViewSet):
         if not business:
             return []
 
-        return Customer.objects.filter(business_id=business.id).order_by('name')
+        # select_related: the serializer nests each customer's city.
+        return (Customer.objects.filter(business_id=business.id)
+                .select_related('city').order_by('name'))
 
     def get_serializer_class(self):
         if self.action == 'list':
@@ -1000,7 +1007,7 @@ class EmployeeViewSet(ModelViewSet):
     def get_queryset(self):
         return Employee.objects.filter(
             business_id=self.kwargs['business_pk']
-        ).order_by('-created_at')
+        ).select_related('user', 'business', 'created_by', 'access').order_by('-created_at')
 
     def get_serializer_class(self):
         method = self.request.method

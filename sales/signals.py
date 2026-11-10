@@ -9,11 +9,25 @@ from .utils import (
 from audit.context import automatic
 
 
+# Written by stock processing alone. A line's money (quantity, price,
+# discount, returns) is none of them, so a save of only these leaves the
+# invoice's totals, status and charges as they were.
+STOCK_FLAG_FIELDS = frozenset({
+    'is_deducted', 'is_restocked', 'is_partially_restocked', 'stock_skipped',
+})
+
+
+def only_stock_flags(update_fields):
+    return bool(update_fields) and set(update_fields) <= STOCK_FLAG_FIELDS
+
+
 ### update invoice totals
 @receiver(post_save, sender=SalesInvoiceItem)
 @receiver(post_delete, sender=SalesInvoiceItem)
 @automatic('signal:update_totals_after_sales_invoice_item')
 def updateTotalsAfterSalesInvoiceItem(sender, instance, **kwargs):
+    if only_stock_flags(kwargs.get('update_fields')):
+        return
     if instance.sales_invoice:
         instance.sales_invoice.adjust_totals()
         # Gaining or losing a line is what moves an invoice between Draft and
@@ -42,6 +56,8 @@ def updateInventoryOnPurchase(sender, instance: PurchaseInvoice, **kwargs):
 @receiver(post_delete, sender=PurchaseInvoiceItem)
 @automatic('signal:update_totals_after_purchase_invoice_item')
 def updateTotalsAfterPurchaseInvoiceItem(sender, instance, **kwargs):
+    if only_stock_flags(kwargs.get('update_fields')):
+        return
     if instance.purchase_invoice:
         instance.purchase_invoice.adjust_totals()
 

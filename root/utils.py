@@ -9,18 +9,38 @@ from rest_framework.viewsets import ModelViewSet
 from .models import Business, Employee
 
 def get_active_business(request):
+    """The business the signed-in user is working in: the active one they
+    own, else the one they are employed by.
 
+    Looked up once per request and kept on it. A single request asks for it
+    from its permission check, its queryset, its serializer context and the
+    audit trail - each a query or two - so the lookups added up to most of
+    some endpoints' queries (plans/performance.md, part 01). The cache is
+    keyed by the user, and `forget_active_business` clears it for the one
+    request that changes which business is active.
+    """
     user = request.user
-    business = None
-    
-    if user and user.is_authenticated:
-        try:
-            business = Business.objects.get(owner_id = user.id, is_active=True)
-        except Business.DoesNotExist as error:
-            print(error)
-            business = Employee.objects.get(user = user).business
-            return business
+    if not (user and user.is_authenticated):
+        return None
+
+    holder = getattr(request, '_request', request)  # DRF wraps the HttpRequest
+    cached = getattr(holder, '_active_business', None)
+    if cached is not None and cached[0] == user.id:
+        return cached[1]
+
+    try:
+        business = Business.objects.get(owner_id=user.id, is_active=True)
+    except Business.DoesNotExist:
+        business = Employee.objects.select_related('business').get(user=user).business
+    holder._active_business = (user.id, business)
     return business
+
+
+def forget_active_business(request):
+    """Drop the cached active business, after the request switches it."""
+    holder = getattr(request, '_request', request)
+    if hasattr(holder, '_active_business'):
+        del holder._active_business
 
 def local_date(value=None):
     """

@@ -831,8 +831,6 @@ class EmployeeAccessCreateSerializer(serializers.ModelSerializer):
     def create(self, validated_data):
 
         employee_id=self.context['employee_id']
-        print(validated_data)
-        print(employee_id)
 
         return EmployeeAccess.objects.create(
             employee_id= employee_id,
