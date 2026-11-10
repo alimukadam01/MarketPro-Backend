@@ -67,7 +67,11 @@ def products(business, query):
 
 def customers(business, query):
     qs = _match(Customer.objects.filter(business_id=business.id), query, ['name', 'phone'])
-    return [{'id': c.id, 'label': c.name} for c in qs.order_by('name')[:LIMIT]]
+    # "Wajid Ali · 03313689402": the phone beside the name, as everywhere a
+    # customer is named (plans part 03, 3.1). Just the name without one. The
+    # name on its own too, for a glossary term that means this customer.
+    return [{'id': c.id, 'label': f'{c.name} · {c.phone}' if c.phone else c.name, 'name': c.name}
+            for c in qs.order_by('name')[:LIMIT]]
 
 
 def suppliers(business, query):

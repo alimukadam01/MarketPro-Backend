@@ -268,8 +268,9 @@ class VisibilityTests(BacklogFixture):
                     # can offer to add variants to it - an id and a name.
                     # extra_fields: the fields its invoice lines ask for - names and
                     # types, no figures (plans/product-extra-fields.md).
+                    # name: a customer's name without the phone its label carries.
                     self.assertLessEqual(set(row), {'id', 'label', 'unit', 'type', 'is_default',
-                                                    'product', 'product_name', 'extra_fields'})
+                                                    'product', 'product_name', 'extra_fields', 'name'})
                     for field in row.get('extra_fields', []):
                         self.assertLessEqual(set(field), {'id', 'label', 'key', 'field_type',
                                                           'applies_to', 'required'})
@@ -1055,3 +1056,15 @@ class LineExtrasThroughBacklogTests(BacklogFixture):
         lines = sorted(values['values']['lines'], key=lambda line: line['extra_fields_display'][0]['value'])
         self.assertEqual([(line['extra_fields_display'][0]['value'], line['discount']) for line in lines],
                          [('1453', {'type': 'percentage', 'value': 0}), ('5674', {'type': 'amount', 'value': 100})])
+
+
+class CustomerLookupPhoneTests(BacklogFixture):
+    """A customer reads "Name · phone" in the entry pickers (plans part 03, 3.1)."""
+
+    def test_label_has_the_phone_and_name_does_not(self):
+        Customer.objects.filter(pk=self.customer.pk).update(phone='03313689402')
+        Customer.objects.create(business=self.business, name='No Phone Traders', city=self.city)
+        rows = client_for(self.typist).get('/backlog-work/lookup/customers/', {'q': ''}).json()
+        by_name = {row['name']: row['label'] for row in rows}
+        self.assertEqual(by_name['Hassan Builders'], 'Hassan Builders · 03313689402')
+        self.assertEqual(by_name['No Phone Traders'], 'No Phone Traders')
