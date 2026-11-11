@@ -269,8 +269,10 @@ class VisibilityTests(BacklogFixture):
                     # extra_fields: the fields its invoice lines ask for - names and
                     # types, no figures (plans/product-extra-fields.md).
                     # name: a customer's name without the phone its label carries.
+                    # keywords: a SKU or product code to search by.
                     self.assertLessEqual(set(row), {'id', 'label', 'unit', 'type', 'is_default',
-                                                    'product', 'product_name', 'extra_fields', 'name'})
+                                                    'product', 'product_name', 'extra_fields', 'name',
+                                                    'keywords'})
                     for field in row.get('extra_fields', []):
                         self.assertLessEqual(set(field), {'id', 'label', 'key', 'field_type',
                                                           'applies_to', 'required'})
@@ -283,6 +285,22 @@ class VisibilityTests(BacklogFixture):
         self.assertFalse(set(stocked[0]) & self.FIGURES)
         found = client.get('/backlog-work/lookup/variants/', {'q': 'emulsion white'}).json()
         self.assertEqual([row['id'] for row in found], [self.white.id])
+
+    def test_the_whole_list_for_a_picker_that_filters_on_the_page(self):
+        """?all=1 lifts the cap: the entry pickers load every record once and
+        filter it themselves, as the invoice screens do. Still names only."""
+        Customer.objects.bulk_create([Customer(business=self.business, name=f'Buyer {n:02}', city=self.city)
+                                      for n in range(30)])
+        client = client_for(self.typist)
+        capped = client.get('/backlog-work/lookup/customers/', {'q': ''}).json()
+        everyone = client.get('/backlog-work/lookup/customers/', {'q': '', 'all': '1'}).json()
+        self.assertEqual(len(capped), 25)
+        self.assertEqual(len(everyone), 31)
+        for row in everyone:
+            self.assertFalse(set(row) & self.FIGURES, row)
+        # The SKU travels with a variant, so the page can still search by it.
+        [white] = client.get('/backlog-work/lookup/variants/', {'q': '', 'all': '1', 'stock': '1'}).json()
+        self.assertEqual((white['keywords'], white['in_stock']), (['BL-1'], True))
 
     def test_an_entered_invoice_answers_with_the_bill_only(self):
         entry = self.claimed()
