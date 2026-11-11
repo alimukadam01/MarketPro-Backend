@@ -11,7 +11,7 @@ from sales.models import (
     SalesReceipt
 )
 from .models import MoneyAccount, PartyOpeningBalance, PartyPayment, Transaction
-from .settlement import settle_parties, settle_party
+from .settlement import Settlement, settle_parties, settle_party
 
 
 MODULE = 'accounting'
@@ -323,7 +323,8 @@ def payables(business_id):
 
 
 def opening_balance_remaining(business_id, party, party_id, opening=None,
-                              include_pending=False):
+                              include_pending=False, settlement=None,
+                              pending=None):
     """
     What is still unsettled on ONE party's opening balance.
 
@@ -344,7 +345,9 @@ def opening_balance_remaining(business_id, party, party_id, opening=None,
 
     uncleared_opening_balances below calls this, and so does settleable_items,
     so the party page and the dialog can never disagree. Pass `opening` when
-    the row is already in hand to save a query.
+    the row is already in hand to save a query, and likewise `settlement` (the
+    party's settle_party result) and `pending` (its pending on-account money):
+    a list works them out for every party at once.
     """
     if opening is None:
         opening = (
@@ -360,13 +363,16 @@ def opening_balance_remaining(business_id, party, party_id, opening=None,
     if opening_amount <= 0:
         return opening_amount, 0, 0
 
-    remaining = settle_party(business_id, party, party_id).opening_remaining()
+    if settlement is None:
+        settlement = settle_party(business_id, party, party_id)
+    remaining = settlement.opening_remaining()
     settled = opening_amount - remaining
     if include_pending:
-        pending, _ = on_account_totals(
-            business_id, {f'{party}_id': party_id}, PARTY_ON_ACCOUNT[party],
-            statuses=('PEN',),
-        )
+        if pending is None:
+            pending, _ = on_account_totals(
+                business_id, {f'{party}_id': party_id}, PARTY_ON_ACCOUNT[party],
+                statuses=('PEN',),
+            )
         settled += min(pending, remaining)
         remaining = max(remaining - pending, 0)
 
@@ -397,17 +403,30 @@ def uncleared_opening_balances(business_id, party):
         .exclude(**{f'{party}__isnull': True})
         .select_related(party)
     )
+    party_ids = [getattr(opening, f'{party}_id') for opening in openings]
+    settlements = settle_parties(business_id, party, party_ids)
+    pending_payment = {
+        row[f'{party}_id']: row['total'] or 0
+        for row in PartyPayment.objects
+        .filter(business_id=business_id, transaction__status='PEN',
+                transaction__type=PARTY_ON_ACCOUNT[party]['payment'],
+                **{f'{party}_id__in': party_ids})
+        .values(f'{party}_id')
+        .annotate(total=Sum('transaction__amount'))
+    }
 
     for opening in openings:
         who = getattr(opening, party)
+        settlement = settlements.get(who.id) or Settlement(party, who.id)
 
         # This is a payment PICKER, so `balance` is what can still be
         # allocated, not what is still owed. A pending cheque has claimed its
         # share already; offering it again would settle the same debt twice.
         opening_amount, settled, owed = opening_balance_remaining(
-            business_id, party, who.id, opening=opening)
+            business_id, party, who.id, opening=opening, settlement=settlement)
         _, claimed, remaining = opening_balance_remaining(
-            business_id, party, who.id, opening=opening, include_pending=True)
+            business_id, party, who.id, opening=opening, include_pending=True,
+            settlement=settlement, pending=pending_payment.get(who.id, 0))
 
         if remaining <= 0:
             continue
@@ -598,7 +617,8 @@ def day_book(business_id, day, date_to=None):
     previous_day = day - timedelta(days=1)
     transactions = Transaction.objects.day_book(business_id, day, date_to)
 
-    accounts = MoneyAccount.objects.for_business(business_id).active()
+    accounts = (MoneyAccount.objects.for_business(business_id).active()
+                .with_balance(previous_day))
     sections = []
     total_in = 0
     total_out = 0
@@ -644,7 +664,7 @@ def day_book(business_id, day, date_to=None):
                 'money_out': outflow,
             })
 
-        opening = account.balance(previous_day)
+        opening = account.balance_value
         sections.append({
             'account_id': account.id,
             'account_name': account.name,
@@ -679,6 +699,9 @@ def daily_summary(business_id, day, date_to=None):
     """
     date_to = date_to or day
     book = day_book(business_id, day, date_to)
+    # The receivable and payable totals of receivables() and payables(), from
+    # one settlement of every khaata rather than one each.
+    receivable_rows, payable_rows = _khaata_sides(business_id)
     totals = Transaction.objects.totals_by_type(business_id, day, date_to)
     salary_expenses = Transaction.objects.salary_expense_total(
         business_id, day, date_to)
@@ -745,8 +768,8 @@ def daily_summary(business_id, day, date_to=None):
             'total': book['total_money_out'],
         },
         'credit_extended': round(max(credit_extended - cash_sales, 0)),
-        'total_receivable': receivables(business_id)['total'],
-        'total_payable': payables(business_id)['total'],
+        'total_receivable': sum(row['balance'] for row in receivable_rows),
+        'total_payable': sum(row['balance'] for row in payable_rows),
         'pending_cheques': cheques_due,
         'profit': profit_estimate(business_id, day, date_to),
     }

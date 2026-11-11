@@ -243,14 +243,16 @@ def updateInventoryOnSale(instance: SalesInvoice):
                 continue
             # Dated on or before this product's stock count: the count
             # already has it (sales/stock_rule.py).
-            if not stock_applies(item):
+            if not stock_applies(item, inventory_item.stock_counted_at):
                 skip_sales_line(item)
                 continue
             delta = item.compute_restock_delta()
             if delta > 0:
                 inventory_item.apply_restock_delta(True, delta, generateTransactionId(instance))
                 logRestockEvent(item, delta, instance)
-                item.update_restock_flags()
+                # The ledger now holds what it held before plus delta, which
+                # is the line's quantity.
+                item.update_restock_flags(deducted=item.quantity)
 
     instance.update_deduction_flags()
     # Narrowed from a bare save(): this instance may predate adjust_totals, so
@@ -384,12 +386,12 @@ def receive_into_stock(line, units, invoice):
         return
     # Delivered on or before this product's stock count: the count already
     # has it (sales/stock_rule.py).
-    if not stock_applies(line):
+    stock = InventoryItem.objects.filter(
+        business_id=line.business_id, product_id=line.product_id).first()
+    if not stock_applies(line, stock.stock_counted_at if stock else None):
         skip_purchase_line(line)
         return
     data = line.morph()
-    stock = InventoryItem.objects.filter(
-        business_id=line.business_id, product_id=line.product_id).first()
     if stock:
         stock.apply_restock_delta(
             False, units, data['last_transaction'], data['unit_cost'])
@@ -457,7 +459,8 @@ def restock_purchase(invoice):
 
     with restock_held(invoice.pk):
         lines = PurchaseInvoiceItem.objects.filter(
-            purchase_invoice_id=invoice.pk).select_related('product')
+            purchase_invoice_id=invoice.pk).select_related(
+                'product', 'purchase_invoice', 'business__inventory_glance')
         for line in lines:
             if line.stock_skipped:
                 continue

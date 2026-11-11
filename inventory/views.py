@@ -57,7 +57,12 @@ class InventoryItemsViewSet(ModelViewSet):
         return (
             InventoryItem.objects
             .filter(inventory__business_id=business.id)
-            .select_related('product__base', 'location')
+            # Everything a row shows, fetched with the rows rather than once
+            # per row: its business (BaseItemSerializer nests it), its
+            # product's base and unit, and - prefetched - the base's variants
+            # and the extra fields it asks for.
+            .select_related('business', 'product__base__unit', 'location')
+            .prefetch_related('product__base__variants', 'product__base__field_links__field')
             .order_by('product__base__name', 'product__name')
         )
     
@@ -139,7 +144,6 @@ class InventoryItemsViewSet(ModelViewSet):
     @action(['POST'], detail=False, url_path='bulk-delete', url_name='bulk-delete')
     def bulk_delete(self, request, inventory_pk=None):
         item_ids = request.data.get('item_ids', [])
-        print(item_ids)
         if not item_ids:
             return Response({
                 'detail': 'Bad Request.'

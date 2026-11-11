@@ -29,10 +29,14 @@ SETTLING_TYPES = (
 
 # ── MoneyAccount ──────────────────────────────────────────────────────────────
 
-class SystemAccountMixin:
+class SystemAccountMixin(serializers.Serializer):
     """
     Flags the account the business was created with. The lookup is cached per
     serializer instance so a list does not repeat it for every row.
+
+    A Serializer, so DRF collects the field below. As a plain mixin it was
+    never declared: 'is_system' in Meta.fields fell through to the model
+    property, which looks the system account up again for every row.
     """
 
     is_system = serializers.SerializerMethodField()
@@ -56,6 +60,9 @@ class SimpleMoneyAccountSerializer(SystemAccountMixin, serializers.ModelSerializ
         ]
 
     def get_balance(self, account):
+        # The list annotates every balance in its one query.
+        if hasattr(account, 'balance_value'):
+            return account.balance_value
         return account.balance()
 
 

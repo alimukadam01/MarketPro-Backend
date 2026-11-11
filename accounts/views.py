@@ -55,8 +55,11 @@ class MoneyAccountViewSet(ModelViewSet):
         business = get_active_business(self.request)
         if not business:
             return MoneyAccount.objects.none()
-        return MoneyAccount.objects.filter(
+        queryset = MoneyAccount.objects.filter(
             business_id=business.id).order_by('-is_default', 'name')
+        if self.action == 'list':
+            queryset = queryset.with_balance()
+        return queryset
 
     def get_serializer_class(self):
         method = self.request.method

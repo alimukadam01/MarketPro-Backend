@@ -7,6 +7,8 @@ anything else unusual as text, files as their stored name.
 import datetime
 import decimal
 import uuid
+from contextlib import contextmanager
+from contextvars import ContextVar
 
 from django.contrib.auth import get_user_model
 from django.core.exceptions import ObjectDoesNotExist
@@ -170,6 +172,42 @@ def _related(obj):
                 continue
 
 
+# The events of a batched() block, waiting to be written together.
+_pending = ContextVar('audit_pending', default=None)
+
+
+@contextmanager
+def batched():
+    """Write the events recorded inside this block in one INSERT at its end.
+
+    A 20-line invoice records some 80 events, one INSERT each. They are the
+    same events, in the same order, with the same values; only their
+    created_at is the end of the block rather than the moment of each write,
+    a few milliseconds later (ordering ties fall to the id, which keeps the
+    order they were recorded in).
+
+    Use it INSIDE the transaction.atomic() of the save, so the events are
+    written in that transaction: if the block raises they are dropped, just as
+    the rolled-back writes they describe. Not around code that swallows an
+    exception from an inner savepoint - those writes are rolled back, but
+    their events would still be written. Nested blocks write at the
+    outermost one's end.
+    """
+    if _pending.get() is not None:
+        yield
+        return
+    pending = []
+    token = _pending.set(pending)
+    try:
+        yield
+    finally:
+        _pending.reset(token)
+    # Reached only when the block did not raise.
+    if pending:
+        from .models import AuditEvent
+        AuditEvent.objects.bulk_create(pending)
+
+
 def record(model, object_id, action, changes, business_id=None):
     """Write one event. Returns it, or None when there is nothing to say.
 
@@ -188,7 +226,7 @@ def record(model, object_id, action, changes, business_id=None):
         # A request with nobody signed in writing a user: someone signing up,
         # or resetting their own password. They are the one acting.
         actor_id = object_id
-    return AuditEvent.objects.create(
+    event = AuditEvent(
         business_id=business_id or context.business_id(),
         actor_id=actor_id,
         source=context.source(),
@@ -198,3 +236,9 @@ def record(model, object_id, action, changes, business_id=None):
         changes=changes,
         request_id=context.request_id(),
     )
+    pending = _pending.get()
+    if pending is not None:
+        pending.append(event)
+    else:
+        event.save(force_insert=True)
+    return event

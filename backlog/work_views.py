@@ -608,9 +608,11 @@ class BacklogWorkViewSet(GenericViewSet):
         if not finder:
             raise exceptions.NotFound()
         query = request.query_params.get('q', '')
+        # ?all=1: every record, for a picker that filters on the page.
+        limit = None if request.query_params.get('all') == '1' else lookups.LIMIT
         if kind == 'variants' and request.query_params.get('stock') == '1':
-            return Response(lookups.variants(self.business(), query, with_stock=True))
-        return Response(finder(self.business(), query))
+            return Response(lookups.variants(self.business(), query, with_stock=True, limit=limit))
+        return Response(finder(self.business(), query, limit=limit))
 
     @action(['GET'], detail=False, url_path='glossary', url_name='glossary')
     def glossary(self, request):

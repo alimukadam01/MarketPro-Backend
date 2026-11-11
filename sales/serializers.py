@@ -33,6 +33,8 @@ from .utils import (
     updateInventoryOnSale
 )
 from audit.helpers import audited_bulk_create, audited_bulk_update
+# The audit events of a whole save in one INSERT, inside its transaction.
+from audit.recorder import batched as audit_batched
 from .stock_rule import reconcile_purchase_invoice, reconcile_sales_invoice, stock_dates
 from .lines import (
     PURCHASE, SALE, clean_extra_fields, clean_line_discount, clean_payload_lines,
@@ -539,7 +541,7 @@ class PurchaseInvoiceAndItemsCreateSerializer(serializers.ModelSerializer):
         amount_paid = self.validated_data.pop('amount_paid', None)
 
         try:
-            with transaction.atomic():
+            with transaction.atomic(), audit_batched():
                 purchase_invoice = PurchaseInvoice.objects.create(
                     business_id=self.context['business_id'],
                     created_by_id=self.context['user_id'],
@@ -632,7 +634,7 @@ class PurchaseInvoiceAndItemsUpdateSerializer(serializers.ModelSerializer):
             # All of it in one transaction, totals and refund included: a
             # failure part-way used to keep the lines and lose the rest, and
             # the page, told the update failed, never sent its held payments.
-            with transaction.atomic():
+            with transaction.atomic(), audit_batched():
                 # Stock moves line by line below; the invoice's own restock
                 # pass waits until the lines are final.
                 with restock_held(self.instance.pk):
@@ -659,13 +661,9 @@ class PurchaseInvoiceAndItemsUpdateSerializer(serializers.ModelSerializer):
 
                 # Handle Projects Addition/Updation/Deletion Logic
                 if not project_id:
-                    print(
-                        "printing from ProjectPurchaseInvoice deletion block. Project ID is: ", project_id)
                     ProjectPurchaseInvoice.objects.filter(
                         purchase_invoice=self.instance).delete()
                 else:
-                    print(
-                        "printing from ProjectPurchaseInvoice creation block. Project ID is: ", project_id)
                     ProjectPurchaseInvoice.objects.filter(
                         purchase_invoice=self.instance).delete()
                     ProjectPurchaseInvoice.objects.get_or_create(
@@ -1139,7 +1137,7 @@ class SalesInvoiceAndItemsCreateSerializer(ExtraChargesValidationMixin,
         amount_paid = self.validated_data.pop('amount_paid', None)
 
         try:
-            with transaction.atomic():
+            with transaction.atomic(), audit_batched():
                 sales_invoice = SalesInvoice.objects.create(
                     business_id=self.context['business_id'],
                     created_by_id=self.context['user_id'],
@@ -1239,7 +1237,7 @@ class SalesInvoiceAndItemsUpdateSerializer(ExtraChargesValidationMixin,
         dated_before = stock_dates(self.instance)
 
         try:
-            with transaction.atomic():
+            with transaction.atomic(), audit_batched():
                 for attr, value in self.validated_data.items():
                     setattr(self.instance, attr, value)
                 self.instance.save()
@@ -1334,13 +1332,9 @@ class SalesInvoiceAndItemsUpdateSerializer(ExtraChargesValidationMixin,
 
                 # Handle Projects Addition/Updation/Deletion Logic
                 if not project_id:
-                    print(
-                        "printing from ProjectPurchaseInvoice deletion block. Project ID is: ", project_id)
                     ProjectSalesInvoice.objects.filter(
                         sales_invoice=self.instance).delete()
                 else:
-                    print(
-                        "printing from ProjectPurchaseInvoice updation/creation block. Project ID is: ", project_id)
                     ProjectSalesInvoice.objects.filter(
                         sales_invoice=self.instance).exclude(project_id=project_id).delete()
                     ProjectSalesInvoice.objects.get_or_create(

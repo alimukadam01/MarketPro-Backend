@@ -26,7 +26,14 @@ class ProjectViewSet(ModelViewSet):
         if not business:
             return []
 
-        return Project.objects.filter(business_id=business.id)
+        queryset = Project.objects.filter(business_id=business.id)
+        if self.action == 'list':
+            # Each row nests its customer (and the customer's city) and counts
+            # its invoices and tasks; fetched with the rows, not once per row.
+            # The counts read the prefetched rows (RelatedManager.count does).
+            queryset = (queryset.select_related('customer__city')
+                        .prefetch_related('sales_invoices', 'purchase_invoices', 'tasks'))
+        return queryset
 
     def get_serializer_class(self):
         method = self.request.method

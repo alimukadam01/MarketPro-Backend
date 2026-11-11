@@ -160,8 +160,9 @@ class SalesInvoiceManager(models.Manager):
         return self.get_queryset().monthly_trend(business_id, 'total')
 
     def recent_sales(self, business_id):
-        queryset = self.get_queryset().for_business(
-            business_id).order_by('-created_at')[:4]
+        queryset = (self.get_queryset().for_business(business_id)
+                    .prefetch_related('invoice_items__product__base')
+                    .order_by('-created_at')[:4])
 
         res = []
         for sale in queryset:
@@ -610,7 +611,7 @@ class SalesInvoiceItem(BaseItem):
         prev = agg.get('total') or 0
         return getattr(self, 'quantity') - prev
 
-    def update_restock_flags(self):
+    def update_restock_flags(self, deducted=None):
         """
         Whether this line has fully left stock.
 
@@ -623,10 +624,12 @@ class SalesInvoiceItem(BaseItem):
         PARTIALLY COMPLETED.
 
         Only ever called right after a deduction is logged, so the ledger is
-        current when it runs.
+        current when it runs. Pass `deducted` when the caller knows the
+        ledger's total already.
         """
-        deducted = self.restocks.aggregate(
-            total=models.Sum('quantity'))['total'] or 0
+        if deducted is None:
+            deducted = self.restocks.aggregate(
+                total=models.Sum('quantity'))['total'] or 0
         self.is_deducted = deducted >= self.quantity
         self.save(update_fields=['is_deducted'])
     
