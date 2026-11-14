@@ -93,6 +93,36 @@ class SettledInvoiceMixin:
         return total
 
     @property
+    def receipts_live(self):
+        """
+        receipts_paid plus what pending cheques have claimed on this invoice.
+        The same rule as sales.utils.LIVE_RECEIPT, summed in Python so the
+        prefetched receipts are reused: a bounced cheque frees its share.
+        """
+        total = 0
+        for receipt in self.payment_receipts.all():
+            transaction = getattr(receipt, 'transaction_record', None)
+            if transaction and transaction.status not in ('C', 'PEN'):
+                continue
+            total += receipt.amount or 0
+        return total
+
+    @property
+    def reserved_pool_applied(self):
+        """
+        pool_applied as it will be once every pending on-account cheque
+        clears. Only invoice_room reads it: a cheque that has not cleared
+        settles nothing, but the invoices it will settle must not be offered
+        for payment again meanwhile.
+        """
+        cached = getattr(self, '_reserved_pool_applied', None)
+        if cached is None:
+            from accounts.settlement import attach_settlement
+            attach_settlement([self], include_pending=True)
+            cached = self._reserved_pool_applied
+        return cached
+
+    @property
     def pool_applied(self):
         """
         Cached on the instance: accounts.settlement.attach_settlement sets it

@@ -566,15 +566,21 @@ def invoice_room(invoice):
     Never negative.
 
     Less what its own payments have claimed (pending cheques included) AND
-    what the party's khaata has already settled onto it - otherwise an
-    invoice the pool covers would still take a payment, and the party would
-    pay the same debt twice. This cap is what keeps named payments and the
-    pool from contradicting each other (credit-debit-notes plan, section 4).
+    what the party's khaata has settled onto it - otherwise an invoice the
+    pool covers would still take a payment, and the party would pay the same
+    debt twice. This cap is what keeps named payments and the pool from
+    contradicting each other (credit-debit-notes plan, section 4).
+
+    The khaata share is the RESERVED one: it counts on-account cheques that
+    are still pending, as if they had cleared. Such a cheque will settle the
+    oldest invoices when it clears, so until then they cannot be offered for
+    payment again - the same hold a pending named cheque already places on
+    its own invoice through live_receipt_total.
     """
     return max(
         float(invoice.total or 0)
         - float(live_receipt_total(invoice))
-        - float(invoice.pool_applied or 0),
+        - float(invoice.reserved_pool_applied or 0),
         0.0,
     )
 

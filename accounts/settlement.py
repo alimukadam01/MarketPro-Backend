@@ -36,6 +36,7 @@ from dataclasses import dataclass, field
 from datetime import date as date_cls
 from typing import Optional
 
+from django.db.models import Q
 from django.utils import timezone
 
 from root.models import Customer, Supplier
@@ -215,13 +216,21 @@ def _match(settlement):
     return settlement
 
 
-def settle_parties(business_id, party_kind, party_ids=None):
+def settle_parties(business_id, party_kind, party_ids=None,
+                   include_pending=False):
     """
     Settle every party of one kind in one business - or only `party_ids`.
 
     Three queries whatever the number of parties (openings, invoices with
     their receipts, on-account rows), grouped in Python. Returns
     {party_id: Settlement}; a party with nothing on its khaata is absent.
+
+    include_pending=True settles the khaata as it will stand once every
+    pending cheque clears: each invoice is reduced by its pending named
+    cheques too, and pending on-account cheques join the pool. Pending DEBITS
+    (a refund cheque not yet cleared) stay out, so this view can only ever
+    hold back more, never offer more. It is for payment pickers (invoice_room)
+    only; anything that reports what a party owes uses the default.
     """
     spec = PARTY_SPEC[party_kind]
     Invoice = spec['invoice_model']
@@ -259,7 +268,8 @@ def settle_parties(business_id, party_kind, party_ids=None):
         # against one is still the party's money, though - the balance formula
         # counts every cleared receipt - so it stays on the khaata as credit.
         billed = 0.0 if invoice.status in excluded else float(invoice.total or 0)
-        unpaid = billed - float(invoice.receipts_paid or 0)
+        paid = invoice.receipts_live if include_pending else invoice.receipts_paid
+        unpaid = billed - float(paid or 0)
         if abs(unpaid) <= EPSILON:
             continue
         issued = (local_date(invoice.date_issued)
@@ -282,10 +292,13 @@ def settle_parties(business_id, party_kind, party_ids=None):
                 date=issued, amount=-unpaid, seq=seq))
 
     pool_types = {**spec['credit_types'], **spec['debit_types']}
+    counted = Q(transaction__status='C')
+    if include_pending:
+        counted |= Q(transaction__status='PEN',
+                     transaction__type__in=list(spec['credit_types']))
     rows = (
         PartyPayment.objects
-        .filter(**scope, transaction__status='C',
-                transaction__type__in=list(pool_types))
+        .filter(counted, **scope, transaction__type__in=list(pool_types))
         .select_related('transaction')
     )
     for row in rows:
@@ -312,11 +325,52 @@ def settle_party(business_id, party_kind, party_id):
             .get(party_id) or Settlement(party_kind, party_id))
 
 
+def on_account_paid_on_issue_date(business_id, party_kind, date_from, date_to):
+    """
+    How much on-account money paid in the period the khaata settles onto an
+    invoice issued the same day the money was paid.
+
+    The daily summary counts that as a cash sale: it is the same money as a
+    payment naming the invoice that day, only recorded without the tick. It
+    is read from the khaata as it settles now, oldest first, so a same-day
+    payment counts here only once the party's older debts are clear - exactly
+    when it actually reaches that day's invoice.
+
+    Only payments (customer_receipt / supplier_payment) count; a credit note
+    or an overpayment is not money received that day.
+    """
+    spec = PARTY_SPEC[party_kind]
+    payment_types = [code for code, kind in spec['credit_types'].items()
+                     if kind == 'payment']
+    party_field = f'{party_kind}_id'
+    party_ids = set(
+        PartyPayment.objects
+        .filter(business_id=business_id, transaction__status='C',
+                transaction__type__in=payment_types,
+                transaction__date__gte=date_from,
+                transaction__date__lte=date_to)
+        .exclude(**{f'{party_field}__isnull': True})
+        .values_list(party_field, flat=True)
+    )
+    if not party_ids:
+        return 0
+
+    total = 0.0
+    for settlement in settle_parties(business_id, party_kind, party_ids).values():
+        for credit, debt, applied in settlement.matches:
+            if (credit.kind == 'payment' and debt.kind == 'invoice'
+                    and credit.date is not None
+                    and date_from <= credit.date <= date_to
+                    and debt.date == credit.date):
+                total += applied
+    return round(total)
+
+
 def _kind_of(invoice):
     return 'customer' if isinstance(invoice, SalesInvoice) else 'supplier'
 
 
-def attach_settlement(invoices):
+def attach_settlement(invoices, include_pending=False):
     """
     Set `_pool_applied` on each invoice - one khaata pass per party, however
     many of that party's invoices are on the page. Drafts and cancelled
@@ -324,6 +378,9 @@ def attach_settlement(invoices):
 
     Also sets `_settlement` so a caller can ask what settled the invoice
     without another pass.
+
+    include_pending=True runs the reserving pass instead (see settle_parties)
+    and sets only `_reserved_pool_applied`, which invoice_room reads.
     """
     groups = {}
     for invoice in invoices:
@@ -333,12 +390,17 @@ def attach_settlement(invoices):
             party_id, []).append(invoice)
 
     for (business_id, kind), by_party in groups.items():
-        settled = settle_parties(business_id, kind, list(by_party))
+        settled = settle_parties(business_id, kind, list(by_party),
+                                 include_pending=include_pending)
         for party_id, party_invoices in by_party.items():
             settlement = settled.get(party_id) or Settlement(kind, party_id)
             for invoice in party_invoices:
+                applied = settlement.applied_to_invoice(invoice.id)
+                if include_pending:
+                    invoice._reserved_pool_applied = applied
+                    continue
                 invoice._settlement = settlement
-                invoice._pool_applied = settlement.applied_to_invoice(invoice.id)
+                invoice._pool_applied = applied
     return invoices
 
 

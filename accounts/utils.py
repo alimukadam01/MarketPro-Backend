@@ -11,7 +11,9 @@ from sales.models import (
     SalesReceipt
 )
 from .models import MoneyAccount, PartyOpeningBalance, PartyPayment, Transaction
-from .settlement import Settlement, settle_parties, settle_party
+from .settlement import (
+    Settlement, on_account_paid_on_issue_date, settle_parties, settle_party,
+)
 
 
 MODULE = 'accounting'
@@ -714,7 +716,20 @@ def daily_summary(business_id, day, date_to=None):
         .exclude(status__in=NOT_A_DEBT_SALES_STATUSES)
         .aggregate(total=Sum('total'))['total'] or 0
     )
-    cash_sales = totals.get('sale_payment', 0)
+    # Cash sales are money that pays an invoice on its issue date: a payment
+    # naming it that day, or on-account money the khaata settles onto it from
+    # the same day. Whatever an invoice is not paid that day is credit
+    # extended, and anything paid on it later is udhaar recovered - otherwise
+    # it read as a sale and, subtracted from credit_extended, hid the credit
+    # actually given.
+    named_later = Transaction.objects.sale_payments_after_issue(
+        business_id, day, date_to)
+    on_account_same_day = on_account_paid_on_issue_date(
+        business_id, 'customer', day, date_to)
+    cash_sales = (totals.get('sale_payment', 0) - named_later
+                  + on_account_same_day)
+    udhaar_recovered = (totals.get('customer_receipt', 0) - on_account_same_day
+                        + named_later)
 
     cheques_due = [
         {
@@ -743,7 +758,7 @@ def daily_summary(business_id, day, date_to=None):
         ],
         'money_in': {
             'cash_sales': cash_sales,
-            'udhaar_recovered': totals.get('customer_receipt', 0),
+            'udhaar_recovered': udhaar_recovered,
             'other_income': (
                 totals.get('other_income', 0)
                 + totals.get('owner_capital', 0)

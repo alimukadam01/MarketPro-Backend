@@ -19,7 +19,7 @@ from .models import (
 )
 # payments.py imports TransactionCreateSerializer lazily, inside the function
 # that needs it, so this direction is safe.
-from .payments import INVOICE, OPENING_BALANCE, allocate, settleable_items
+from .payments import INVOICE, allocate, settleable_items
 from .settlement import settlement_for_transaction
 
 # Pool credit: the types whose `settles` list means something.
@@ -765,7 +765,9 @@ class PartyOpeningBalanceSerializer(serializers.ModelSerializer):
 
 class RecordPartyPaymentSerializer(serializers.Serializer):
     """
-    One amount, several ticked items, one atomic write.
+    One amount, any number of ticked invoices (none is fine), one atomic
+    write. What the ticked invoices do not take goes on account
+    (accounts/payments.py).
 
     Validates the whole payload up front so a bad account or date is a clean
     400 on the request rather than an error raised mid-allocation. The per-item
@@ -779,7 +781,7 @@ class RecordPartyPaymentSerializer(serializers.Serializer):
         queryset=Supplier.objects.none(), required=False, allow_null=True)
 
     amount = serializers.IntegerField(min_value=1)
-    items = serializers.JSONField()
+    items = serializers.JSONField(required=False, default=list)
     order = serializers.ChoiceField(
         choices=['oldest', 'newest'], required=False, default='oldest')
 
@@ -817,18 +819,24 @@ class RecordPartyPaymentSerializer(serializers.Serializer):
     def validate_items(self, value):
         """
         A multipart request carries `items` as a JSON string; a JSON request
-        carries it as a real list. Accept both.
+        carries it as a real list. Accept both. An empty list is valid: the
+        whole amount then goes on account.
+
+        Only invoices can be ticked. The opening balance is settled by the
+        on-account part, which reaches it first.
         """
         if isinstance(value, str):
             try:
-                value = json.loads(value)
+                value = json.loads(value) if value.strip() else []
             except (TypeError, ValueError):
                 raise serializers.ValidationError(
                     'items must be a JSON list of {kind, id}.')
 
-        if not isinstance(value, list) or not value:
+        if value is None:
+            value = []
+        if not isinstance(value, list):
             raise serializers.ValidationError(
-                'Tick at least one item for this payment to settle.')
+                'items must be a JSON list of {kind, id}.')
 
         cleaned = []
         for entry in value:
@@ -837,9 +845,10 @@ class RecordPartyPaymentSerializer(serializers.Serializer):
                     'Each item must be an object of {kind, id}.')
 
             kind = entry.get('kind')
-            if kind not in (OPENING_BALANCE, INVOICE):
+            if kind != INVOICE:
                 raise serializers.ValidationError(
-                    f'Unknown item kind: {kind}.')
+                    f'Unknown item kind: {kind}. Only invoices can be '
+                    'selected; the rest of the payment goes on account.')
 
             try:
                 item_id = int(entry.get('id'))
@@ -894,17 +903,10 @@ class RecordPartyPaymentSerializer(serializers.Serializer):
                 })
             chosen.append(item)
 
-        applied_rows, left = allocate(chosen, attrs['amount'], attrs['order'])
+        applied_rows, _ = allocate(chosen, attrs['amount'], attrs['order'])
 
-        # The entered amount must land somewhere in full. Same contract as the
-        # dialog's Record button, restated because the API is reachable
-        # without it.
-        if left > 0:
-            raise serializers.ValidationError({
-                'amount':
-                    f'PKR {left} of this payment is not applied to anything. '
-                    'Select another item or lower the amount.'
-            })
+        # Whatever the ticked invoices do not take is not an error: it goes on
+        # account (record_party_payment).
 
         # An item that would receive nothing is not a valid selection: the
         # dialog stops it being ticked, and dropping it silently here would

@@ -1,22 +1,26 @@
 """
-Recording one payment against several settleable items.
+Recording one payment from the party screen.
 
-The party detail screen lets the user enter an amount, tick what it settles,
-and have the system work out which payments to create. Two rules shape this
-module, both from the BRD and both deliberate:
+The user enters an amount and may tick invoices. Two rules shape this module:
 
-1. The user chooses every target. The system never picks which invoices get
-   paid - it only divides the entered amount across the items the user ticked
-   (§6.4).
-2. Each payment type settles exactly one kind of thing. On-account money
-   settles the opening balance carried over from the paper khaata, and nothing
-   else; an invoice is settled only by a payment that names it (§6.6).
+1. Ticking is optional. A ticked invoice is settled by a payment that names
+   it: a sale_payment or purchase_payment, filled up to its room in the order
+   the user chose.
+2. Whatever is not applied to a ticked invoice - all of it, when nothing is
+   ticked - goes on account as one customer_receipt or supplier_payment. The
+   khaata settles that the way it settles all unnamed money
+   (accounts/settlement.py): the opening balance first, then the oldest
+   invoices. Anything beyond what the party owes stays on the khaata as
+   credit and settles their next invoice.
 
-So an allocation becomes one transaction per item: a customer_receipt or
-supplier_payment for the opening-balance row, and a sale_payment or
-purchase_payment for each invoice row. They are written together or not at
-all, and they share a payment_group so the rest of the system can treat them
-as the single payment they are.
+The opening balance is therefore never ticked: on-account money reaches it
+first anyway.
+
+So one payment becomes one transaction per ticked invoice plus at most one
+on-account transaction. They are written together or not at all, named
+payments first - each is checked against its invoice's room, which the
+on-account part would otherwise shrink - and they share a payment_group so the
+rest of the system can treat them as the single payment they are.
 """
 
 import uuid
@@ -25,24 +29,21 @@ from django.db import transaction as db_transaction
 
 from root.models import Customer, Supplier
 from sales.models import PurchaseInvoice, SalesInvoice
-from sales.utils import invoice_room, live_receipt_total
+from sales.utils import invoice_room
 
 from .settlement import attach_settlement
-from .utils import (
-    NOT_A_DEBT_PURCHASE_STATUSES, NOT_A_DEBT_SALES_STATUSES,
-    opening_balance_remaining,
-)
+from .utils import NOT_A_DEBT_PURCHASE_STATUSES, NOT_A_DEBT_SALES_STATUSES
 
 
-OPENING_BALANCE = 'opening_balance'
+ON_ACCOUNT = 'on_account'
 INVOICE = 'invoice'
 
-# Which transaction type each item kind mints, per party. The split is the
-# whole point: on-account money and invoice money are summed independently by
-# customer_balance/supplier_balance, so writing the wrong one double-counts.
+# Which transaction type each part of a payment mints, per party. The split is
+# the whole point: on-account money and invoice money are summed independently
+# by customer_balance/supplier_balance, so writing the wrong one double-counts.
 ITEM_TYPES = {
-    'customer': {OPENING_BALANCE: 'customer_receipt', INVOICE: 'sale_payment'},
-    'supplier': {OPENING_BALANCE: 'supplier_payment', INVOICE: 'purchase_payment'},
+    'customer': {ON_ACCOUNT: 'customer_receipt', INVOICE: 'sale_payment'},
+    'supplier': {ON_ACCOUNT: 'supplier_payment', INVOICE: 'purchase_payment'},
 }
 
 # The write-only picker field on TransactionCreateSerializer for each party's
@@ -71,52 +72,35 @@ def _invoice_queryset(business_id, party, party_id):
 
 def settleable_items(business_id, party, party_id):
     """
-    Everything this party's money could settle, oldest first.
+    The invoices this party's money could be named against, oldest first.
 
-    The opening balance leads, because it predates every invoice by
-    definition. `room` is what the item can still take and is authoritative:
-    it comes from invoice_room(), the same helper TransactionCreateSerializer
-    validates against, so the dialog can never offer more than the server will
-    accept. `reserved` is money already held by a pending cheque - counted
-    against room, but settling nothing until it clears.
+    The opening balance is not listed: on-account money settles it first
+    anyway (see the module docstring), and the dialog reads what is left on it
+    from the endpoint's opening_balance block.
+
+    `room` is what the invoice can still take and is authoritative: it comes
+    from invoice_room(), the same helper TransactionCreateSerializer validates
+    against, so the dialog can never offer more than the server will accept.
+    `reserved` is what pending cheques hold on it - its own, and on-account
+    ones that will reach it when they clear - counted against room, but
+    settling nothing yet.
 
     party is 'customer' or 'supplier'.
     """
     items = []
 
-    # Two different figures: `owed` is what the party still owes on the
-    # balance, `room` is what can still be allocated to it. A pending cheque
-    # separates them - it has claimed the money without settling anything -
-    # and offering claimed money again would settle the same debt twice.
-    _, _, owed = opening_balance_remaining(business_id, party, party_id)
-    _, _, room = opening_balance_remaining(
-        business_id, party, party_id, include_pending=True)
-
-    if room > 0:
-        opening = _opening_row(business_id, party, party_id)
-        items.append({
-            'kind': OPENING_BALANCE,
-            'id': party_id,
-            'label': 'Outstanding balance',
-            'sub': 'On account · settles the opening balance, then pending invoices',
-            'date': opening.as_of_date.isoformat() if opening else None,
-            'total': owed,
-            'room': room,
-            'reserved': max(owed - room, 0),
-        })
-
-    # One khaata pass for the party, not one per invoice: invoice_room reads
-    # each invoice's pool share, which attach_settlement fills in.
-    invoices = attach_settlement(
-        list(_invoice_queryset(business_id, party, party_id)))
+    # Two khaata passes for the party, not two per invoice: the settled one
+    # for what is still owed, the reserving one that invoice_room reads.
+    invoices = list(_invoice_queryset(business_id, party, party_id))
+    attach_settlement(invoices)
+    attach_settlement(invoices, include_pending=True)
     for invoice in invoices:
         room = int(invoice_room(invoice))
         if room <= 0:
             continue
 
         total = float(invoice.total or 0)
-        reserved = round(float(live_receipt_total(invoice))
-                         - float(invoice.receipts_paid or 0))
+        owed = total - float(invoice.amount_paid or 0)
 
         items.append({
             'kind': INVOICE,
@@ -127,19 +111,10 @@ def settleable_items(business_id, party, party_id):
             if invoice.date_issued else None,
             'total': round(total),
             'room': room,
-            'reserved': max(reserved, 0),
+            'reserved': max(round(owed - room), 0),
         })
 
     return items
-
-
-def _opening_row(business_id, party, party_id):
-    from .models import PartyOpeningBalance
-    return (
-        PartyOpeningBalance.objects
-        .filter(business_id=business_id, **{f'{party}_id': party_id})
-        .first()
-    )
 
 
 def allocate(items, amount, order='oldest'):
@@ -178,15 +153,17 @@ def allocate(items, amount, order='oldest'):
 def record_party_payment(business_id, user_id, party, party_id, amount,
                          item_ids, money_details, context, order='oldest'):
     """
-    Write one payment as one transaction per settled item, atomically.
+    Write one payment atomically: one transaction per ticked invoice it
+    reaches, then one on-account transaction for whatever is left.
 
     Delegates every write to TransactionCreateSerializer, which already owns
     the type/source rules, the invoice-room check and the delegation to
     SalesReceipt / PurchaseReceipt / PartyPayment. This function owns only the
     split, the group id and the all-or-nothing boundary.
 
-    `item_ids` is the list of {kind, id} the user ticked. Returns the created
-    transactions in allocation order.
+    `item_ids` is the list of {kind, id} the user ticked, possibly empty.
+    Returns the created transactions, named ones in allocation order, the
+    on-account one last.
     """
     from .serializers import TransactionCreateSerializer
 
@@ -200,7 +177,14 @@ def record_party_payment(business_id, user_id, party, party_id, amount,
         if item is not None:
             chosen.append(item)
 
-    applied_rows, _ = allocate(chosen, amount, order)
+    applied_rows, left = allocate(chosen, amount, order)
+
+    # Named payments first: each is validated against its invoice's room,
+    # and the on-account part, once written, would reach the oldest invoices
+    # and shrink that room.
+    parts = [(INVOICE, item['id'], applied) for item, applied in applied_rows]
+    if left > 0:
+        parts.append((ON_ACCOUNT, party_id, left))
 
     group = uuid.uuid4()
     types = ITEM_TYPES[party]
@@ -208,15 +192,15 @@ def record_party_payment(business_id, user_id, party, party_id, amount,
     created = []
 
     with db_transaction.atomic():
-        for item, applied in applied_rows:
+        for kind, target_id, applied in parts:
             payload = dict(money_details)
             payload['amount'] = applied
-            payload['type'] = types[item['kind']]
+            payload['type'] = types[kind]
 
-            if item['kind'] == OPENING_BALANCE:
-                payload[party] = party_id
+            if kind == ON_ACCOUNT:
+                payload[party] = target_id
             else:
-                payload[invoice_field] = item['id']
+                payload[invoice_field] = target_id
 
             serializer = TransactionCreateSerializer(
                 data=payload, context=context)

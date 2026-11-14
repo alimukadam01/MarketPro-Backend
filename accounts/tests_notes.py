@@ -274,17 +274,6 @@ class NotesAPITests(TestCase):
         self.assertEqual(response.status_code, 400)
         self.assertIn('15,000', response.json()['amount'][0])
 
-    def test_the_on_account_row_names_where_it_goes(self):
-        PartyOpeningBalance.objects.create(
-            business=self.business, supplier=self.jotun, amount=10000,
-            as_of_date=datetime.date(2025, 12, 31))
-        items = self.client.get(
-            f'/accounting-kpis/settleable-items/?supplier_id={self.jotun.id}'
-        ).json()['items']
-        self.assertEqual(
-            items[0]['sub'],
-            'On account · settles the opening balance, then pending invoices')
-
     # -- the invoice side -------------------------------------------------
 
     def test_invoice_settlement_endpoint_feeds_the_payments_dialog(self):
