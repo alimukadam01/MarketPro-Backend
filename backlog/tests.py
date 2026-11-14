@@ -1086,3 +1086,232 @@ class CustomerLookupPhoneTests(BacklogFixture):
         by_name = {row['name']: row['label'] for row in rows}
         self.assertEqual(by_name['Hassan Builders'], 'Hassan Builders · 03313689402')
         self.assertEqual(by_name['No Phone Traders'], 'No Phone Traders')
+
+
+class CountDateTests(BacklogFixture):
+    """
+    The inventory edit screen's count date: today or earlier, only with a new
+    quantity, and optionally carrying forward what has moved since that day.
+    """
+
+    def setUp(self):
+        self.today = timezone.localdate()
+        self.yesterday = self.today - timedelta(days=1)
+        self.owner_client = client_for(self.owner)
+        self.url = f'/inventory/{self.business.inventory_glance.id}/items/{self.stock.id}/'
+
+    def sale(self, day, quantity):
+        when = timezone.make_aware(timezone.datetime(day.year, day.month, day.day, 12, 0))
+        response = self.owner_client.post('/sales-invoices/create-with-items/', {
+            'customer': self.customer.id, 'date_issued': when.isoformat(),
+            'invoice_number': f'S-{day}-{quantity}',
+            'items': [{'product_id': self.white.id, 'quantity': quantity, 'unit_price': 100}]},
+            format='json')
+        self.assertEqual(response.status_code, 201, response.content)
+
+    def purchase(self, day, quantity):
+        response = self.owner_client.post('/purchase-invoices/create-with-items/', {
+            'supplier': self.supplier.id, 'status': 'R', 'date_issued': timezone.now().isoformat(),
+            'delivery': day.isoformat(), 'invoice_number': f'P-{day}-{quantity}',
+            'items': [{'product_id': self.white.id, 'quantity': quantity, 'unit_cost': 10}]},
+            format='json')
+        self.assertEqual(response.status_code, 201, response.content)
+
+    def count(self, quantity, day=None, carry=None):
+        body = {'quantity': quantity, 'quantity_on_hand': quantity}
+        if day is not None:
+            body['stock_counted_at'] = day.isoformat()
+        if carry is not None:
+            body['carry_forward'] = carry
+        return self.owner_client.patch(self.url, body, format='json')
+
+    def row(self):
+        row = InventoryItem.objects.get(pk=self.stock.pk)
+        return row.quantity_on_hand, row.quantity, row.stock_counted_at
+
+    # -- the two safeguards -------------------------------------------------
+
+    def test_a_count_cannot_be_dated_in_the_future(self):
+        response = self.count(60, self.today + timedelta(days=1))
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('stock_counted_at', response.json())
+        self.assertEqual(self.row(), (50, 50, None))
+
+    def test_the_date_cannot_move_without_a_new_quantity(self):
+        response = self.owner_client.patch(
+            self.url, {'stock_counted_at': self.yesterday.isoformat()}, format='json')
+        self.assertEqual(response.status_code, 400)
+        # Re-sending the same figure is not a new count either.
+        self.assertEqual(self.count(50, self.yesterday).status_code, 400)
+        self.assertEqual(self.row(), (50, 50, None))
+
+    def test_a_count_on_create_needs_a_quantity_and_no_future_date(self):
+        other = ProductVariant.objects.create(base=self.paint, name='Off White', sku='BL-2')
+        url = f'/inventory/{self.business.inventory_glance.id}/items/'
+        tomorrow = (self.today + timedelta(days=1)).isoformat()
+        response = self.owner_client.post(url, {
+            'product': other.id, 'quantity': 5, 'quantity_on_hand': 5,
+            'stock_counted_at': tomorrow}, format='json')
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('stock_counted_at', response.json())
+
+    def test_a_backlog_count_cannot_be_dated_in_the_future(self):
+        entry = self.claimed(type='stock_list')
+        response = client_for(self.typist).post(f'/backlog-work/{entry.id}/inventory/', {
+            'product': self.white.id, 'quantity': 42,
+            'counted_at': (self.today + timedelta(days=1)).isoformat()}, format='json')
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(self.row(), (50, 50, None))
+
+    # -- a count typed in after the day it was taken ------------------------
+
+    def test_a_backdated_count_without_carry_forward_saves_the_typed_figure(self):
+        self.sale(self.today, 5)
+        self.assertEqual(self.row()[0], 45)
+        response = self.count(80, self.yesterday, carry=False)
+        self.assertEqual(response.status_code, 200, response.content)
+        self.assertEqual(self.row(), (80, 80, self.yesterday))
+
+    def test_carry_forward_takes_off_what_was_sold_since(self):
+        self.sale(self.today, 5)
+        response = self.count(80, self.yesterday, carry=True)
+        self.assertEqual(response.status_code, 200, response.content)
+        self.assertEqual(self.row(), (75, 75, self.yesterday))
+
+    def test_carry_forward_adds_what_was_received_since(self):
+        self.purchase(self.today, 7)
+        self.sale(self.today, 2)
+        self.count(80, self.yesterday, carry=True)
+        self.assertEqual(self.row()[0], 85)
+
+    def test_a_line_dated_on_the_count_day_is_already_in_the_count(self):
+        self.sale(self.yesterday, 4)
+        self.sale(self.today, 3)
+        self.count(80, self.yesterday, carry=True)
+        self.assertEqual(self.row()[0], 77)
+
+    def test_carry_forward_does_nothing_for_a_count_dated_today(self):
+        self.sale(self.today, 5)
+        self.count(80, self.today, carry=True)
+        self.assertEqual(self.row(), (80, 80, self.today))
+
+    def test_after_a_backdated_count_later_lines_move_stock_once(self):
+        self.count(80, self.yesterday)
+        self.sale(self.today, 6)
+        self.assertEqual(self.row()[0], 74)
+
+    def test_the_preview_shows_what_moved_since_the_date(self):
+        self.sale(self.today, 5)
+        self.purchase(self.today, 2)
+        response = self.owner_client.get(
+            f'{self.url}movements-after/', {'date': self.yesterday.isoformat()})
+        self.assertEqual(response.status_code, 200, response.content)
+        body = response.json()
+        self.assertEqual((body['sold'], body['received'], body['returned'], body['net']),
+                         (5, 2, 0, -3))
+
+        future = (self.today + timedelta(days=1)).isoformat()
+        self.assertEqual(self.owner_client.get(
+            f'{self.url}movements-after/', {'date': future}).status_code, 400)
+        self.assertEqual(self.owner_client.get(
+            f'{self.url}movements-after/', {'date': 'not-a-date'}).status_code, 400)
+
+    def test_a_count_on_create_keeps_the_date_it_was_taken(self):
+        other = ProductVariant.objects.create(base=self.paint, name='Off White', sku='BL-3')
+        url = f'/inventory/{self.business.inventory_glance.id}/items/'
+        response = self.owner_client.post(url, {
+            'product': other.id, 'quantity': 5, 'quantity_on_hand': 5,
+            'stock_counted_at': self.yesterday.isoformat()}, format='json')
+        self.assertEqual(response.status_code, 201, response.content)
+        self.assertEqual(InventoryItem.objects.get(product=other).stock_counted_at, self.yesterday)
+
+
+class DerivedStockFieldsTests(BacklogFixture):
+    """
+    Only the quantity is typed. On hand = quantity - reserved, reserved is
+    never taken from the client (inventory.serializers.DERIVED_STOCK_FIELDS).
+    """
+
+    def setUp(self):
+        self.owner_client = client_for(self.owner)
+        self.items_url = f'/inventory/{self.business.inventory_glance.id}/items/'
+        self.url = f'{self.items_url}{self.stock.id}/'
+
+    def row(self, pk=None):
+        row = InventoryItem.objects.get(pk=pk or self.stock.pk)
+        return row.quantity, row.quantity_on_hand, row.quantity_reserved
+
+    def new_variant(self, sku):
+        return ProductVariant.objects.create(base=self.paint, name=f'Shade {sku}', sku=sku)
+
+    def test_create_with_only_a_quantity_sets_on_hand(self):
+        variant = self.new_variant('DS-1')
+        response = self.owner_client.post(self.items_url, {
+            'product': variant.id, 'quantity': 12}, format='json')
+        self.assertEqual(response.status_code, 201, response.content)
+        row = InventoryItem.objects.get(product=variant)
+        self.assertEqual(self.row(row.pk), (12, 12, 0))
+        self.assertEqual(row.stock_counted_at, timezone.localdate())
+
+    def test_create_ignores_on_hand_and_reserved_from_the_client(self):
+        variant = self.new_variant('DS-2')
+        response = self.owner_client.post(self.items_url, {
+            'product': variant.id, 'quantity': 12, 'quantity_on_hand': 99,
+            'quantity_reserved': 5}, format='json')
+        self.assertEqual(response.status_code, 201, response.content)
+        row = InventoryItem.objects.get(product=variant)
+        self.assertEqual(self.row(row.pk), (12, 12, 0))
+        body = response.json()
+        self.assertEqual((body['quantity_on_hand'], body['quantity_reserved']), (12, 0))
+
+    def test_editing_the_quantity_moves_on_hand_with_it(self):
+        response = self.owner_client.patch(self.url, {
+            'quantity': 60, 'quantity_on_hand': 1, 'quantity_reserved': 9}, format='json')
+        self.assertEqual(response.status_code, 200, response.content)
+        self.assertEqual(self.row(), (60, 60, 0))
+
+    def test_on_hand_alone_is_not_a_count(self):
+        response = self.owner_client.patch(self.url, {'quantity_on_hand': 10}, format='json')
+        self.assertEqual(response.status_code, 200, response.content)
+        row = InventoryItem.objects.get(pk=self.stock.pk)
+        self.assertEqual(self.row(), (50, 50, 0))
+        self.assertIsNone(row.stock_counted_at)
+
+    def test_a_price_edit_leaves_on_hand_as_it_was(self):
+        InventoryItem.objects.filter(pk=self.stock.pk).update(quantity_on_hand=40)
+        self.owner_client.patch(self.url, {'quantity': 50, 'unit_price': 999}, format='json')
+        self.assertEqual(self.row(), (50, 40, 0))
+
+    def test_reserved_stock_is_held_back_from_on_hand(self):
+        InventoryItem.objects.filter(pk=self.stock.pk).update(quantity_reserved=2)
+        self.owner_client.patch(self.url, {'quantity': 30}, format='json')
+        self.assertEqual(self.row(), (30, 28, 2))
+
+    def test_the_backlog_count_follows_the_same_rule(self):
+        InventoryItem.objects.filter(pk=self.stock.pk).update(quantity_reserved=3)
+        entry = self.claimed(type='stock_list')
+        response = client_for(self.typist).post(f'/backlog-work/{entry.id}/inventory/', {
+            'product': self.white.id, 'quantity': 20}, format='json')
+        self.assertEqual(response.status_code, 201, response.content)
+        self.assertEqual(self.row(), (20, 17, 3))
+
+    def test_sales_and_purchases_keep_on_hand_equal_to_quantity(self):
+        # The fixture row (50) has never been counted, so today's lines move it.
+        when = timezone.now().isoformat()
+        response = self.owner_client.post('/sales-invoices/create-with-items/', {
+            'customer': self.customer.id, 'date_issued': when, 'invoice_number': 'DS-S1',
+            'items': [{'product_id': self.white.id, 'quantity': 4, 'unit_price': 100}]},
+            format='json')
+        self.assertEqual(response.status_code, 201, response.content)
+        response = self.owner_client.post('/purchase-invoices/create-with-items/', {
+            'supplier': self.supplier.id, 'status': 'R', 'date_issued': when,
+            'invoice_number': 'DS-P1',
+            'items': [{'product_id': self.white.id, 'quantity': 10, 'unit_cost': 10}]},
+            format='json')
+        self.assertEqual(response.status_code, 201, response.content)
+        self.assertEqual(self.row(), (56, 56, 0))
+
+        sale = SalesInvoice.objects.get(invoice_number='DS-S1')
+        response = self.owner_client.post(f'/sales-invoices/{sale.id}/cancel/')
+        self.assertIn(response.status_code, (200, 204), response.content)
+        self.assertEqual(self.row(), (60, 60, 0))

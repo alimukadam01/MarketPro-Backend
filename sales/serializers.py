@@ -1087,6 +1087,9 @@ class RestockSerializer(serializers.Serializer):
             inventory_items.values_list('product_id', flat=True))
         new_inventory_products = product_ids - existing_products
 
+        # Quantity and on hand move together here, as everywhere stock moves
+        # (inventory.serializers.DERIVED_STOCK_FIELDS): these rows reserve
+        # nothing, so on hand is the quantity.
         new_inventory_items = [InventoryItem(
             inventory_id=self.context['inventory_id'],
             business_id=self.context['business_id'],

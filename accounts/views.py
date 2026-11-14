@@ -325,7 +325,8 @@ class TransactionViewSet(PeriodFilterMixin, ModelViewSet):
             url_name='record-payment')
     def record_payment(self, request):
         """
-        One amount, several ticked items, one atomic write.
+        One amount, any ticked invoices, one atomic write; what they do not
+        take goes on account.
 
         Lives here rather than on CustomerViewSet because recording a payment
         is accounting: this viewset already carries HasAccountingAccess, while
@@ -748,9 +749,13 @@ class AccountingKPIViewSet(GenericViewSet):
             url_name='settleable-items')
     def settleable_items(self, request):
         """
-        Everything one party's money could settle, oldest first:
-        their uncleared opening balance, then every invoice with room left.
-        ?customer_id= or ?supplier_id=.
+        The invoices one party's money could be named against, oldest first,
+        and their opening balance. ?customer_id= or ?supplier_id=.
+
+        The opening balance is not an item: the on-account part of a payment
+        settles it first. Its `room` is what on-account money can still reach
+        on it with pending cheques held back, which the payment dialog uses to
+        tell what will settle dues from what will stay as credit.
 
         `room` here is authoritative - it comes from the same invoice_room()
         the write path validates against, so the dialog can never offer more
@@ -774,6 +779,8 @@ class AccountingKPIViewSet(GenericViewSet):
         try:
             opening, settled, remaining = opening_balance_remaining(
                 business.id, party, party_id)
+            _, _, room = opening_balance_remaining(
+                business.id, party, party_id, include_pending=True)
 
             # as_of_date rides along: the party page needs the STORED date, not
             # today. Without it the form fell back to today's date, so the card
@@ -789,6 +796,7 @@ class AccountingKPIViewSet(GenericViewSet):
                     'amount': opening,
                     'settled': settled,
                     'remaining': remaining,
+                    'room': room,
                     'as_of_date': row.as_of_date.isoformat() if row else None,
                 },
             }, status=status.HTTP_200_OK)

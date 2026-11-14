@@ -20,7 +20,8 @@ right: a skipped line now after the count is unmarked so the normal path
 moves its stock; a line that had moved stock and is now on or before the
 count has exactly its ledger taken back.
 """
-from django.db.models import Sum
+from django.db.models import DateField, Sum
+from django.db.models.functions import Coalesce, TruncDate
 
 from inventory.models import InventoryItem
 from root.utils import local_date
@@ -71,6 +72,66 @@ def return_applies(returned):
     line = returned.invoice_item
     counted = counted_at(line.business_id, line.product_id)
     return counted is None or local_date(returned.created_at) > counted
+
+
+def movements_after(business_id, product_id, day, counted=None):
+    """
+    What has already moved this product's stock and is dated AFTER `day`:
+    units sold, received and returned to inventory, and the net of the three.
+
+    A count entered late (counted at closing, typed in next morning) is
+    dated `day`, but anything recorded since has already moved the old
+    figure. The user can carry these forward onto the count, so stock reads
+    count + received + returned - sold (the "Include these" tick on the
+    inventory edit screen).
+
+    Judged by each line's own date, as stock_applies judges it. Sales and
+    purchases are read from their stock ledgers, so a line held back by an
+    earlier count, or a cancelled one, contributes nothing. Returns have no
+    ledger: one recorded on or before the stock row's current count
+    (`counted`) was held back by it, so only those after both dates count.
+
+    It cannot see lines that an earlier count LATER than `day` held back -
+    the reason a count should not be dated before the previous one (parked).
+    """
+    from sales.models import (
+        PurchaseInvoiceItemRestock, ReturnedItem, SalesInvoiceItemDeduction,
+    )
+
+    sold = (
+        SalesInvoiceItemDeduction.objects
+        .filter(sales_invoice__business_id=business_id,
+                sales_invoice_item__product_id=product_id)
+        .annotate(line_day=TruncDate('sales_invoice__date_issued'))
+        .filter(line_day__gt=day)
+        .aggregate(total=Sum('quantity'))['total'] or 0
+    )
+    received = (
+        PurchaseInvoiceItemRestock.objects
+        .filter(purchase_invoice__business_id=business_id,
+                purchase_invoice_item__product_id=product_id)
+        .annotate(line_day=Coalesce(
+            'purchase_invoice__delivery',
+            TruncDate('purchase_invoice__date_issued'),
+            output_field=DateField()))
+        .filter(line_day__gt=day)
+        .aggregate(total=Sum('quantity'))['total'] or 0
+    )
+    returned_after = max(day, counted) if counted else day
+    returned = (
+        ReturnedItem.objects
+        .filter(business_id=business_id, return_type='to_inventory',
+                invoice_item__product_id=product_id)
+        .annotate(line_day=TruncDate('created_at'))
+        .filter(line_day__gt=returned_after)
+        .aggregate(total=Sum('quantity'))['total'] or 0
+    )
+    return {
+        'sold': sold,
+        'received': received,
+        'returned': returned,
+        'net': received + returned - sold,
+    }
 
 
 def skip_sales_line(line):

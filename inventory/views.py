@@ -1,3 +1,6 @@
+from datetime import date
+
+from django.utils import timezone
 from rest_framework.viewsets import ModelViewSet, GenericViewSet, ReadOnlyModelViewSet
 from rest_framework.response import Response
 from rest_framework.decorators import action
@@ -6,6 +9,7 @@ from django_filters.rest_framework import DjangoFilterBackend
 from rest_framework import status
 from root.utils import get_active_business
 from root.models import BaseQuerySet, ProductVariant
+from sales.stock_rule import movements_after as stock_movements_after
 from .filters import InventoryItemFilter
 from .models import Inventory, InventoryItem
 from .serializers import AvailableProductSerializer, InventoryItemCreateSerializer, InventoryItemSerializer, InventoryItemUpdateSerializer, InventorySerializer
@@ -88,6 +92,37 @@ class InventoryItemsViewSet(ModelViewSet):
             'inventory_id': self.kwargs['inventory_pk']
         }
     
+    @action(['GET'], detail=True, url_path='movements-after', url_name='movements-after')
+    def movements_after(self, request, inventory_pk=None, pk=None):
+        """
+        What has already moved this stock and is dated after ?date= - the
+        figures the edit screen shows before the user decides whether to
+        carry them forward onto a count dated that day. The save recomputes
+        them, so this is a preview only.
+        """
+        business = get_active_business(request)
+        if not business:
+            return Response({'detail': 'No active business exists. Please contact admin.'},
+                            status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            day = date.fromisoformat(request.query_params.get('date') or '')
+        except ValueError:
+            return Response({'detail': 'Bad Request.'}, status=status.HTTP_400_BAD_REQUEST)
+        if day > timezone.localdate():
+            return Response({'detail': 'A stock count cannot be dated in the future.'},
+                            status=status.HTTP_400_BAD_REQUEST)
+
+        item = self.get_object()
+        try:
+            moved = stock_movements_after(
+                business.id, item.product_id, day, counted=item.stock_counted_at)
+            return Response({'date': day.isoformat(), **moved}, status=status.HTTP_200_OK)
+        except Exception as error:
+            print(error)
+            return Response({'detail': 'Internal Server Error.'},
+                            status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
     @action(['GET'], False)
     def get_available_items(self, request, inventory_pk=None):
         """What a sale can be made from: each product with what is on hand

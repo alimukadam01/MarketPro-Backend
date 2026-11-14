@@ -22,6 +22,7 @@ from rest_framework.viewsets import GenericViewSet
 
 from audit.helpers import audited_bulk_create, audited_update
 from inventory.models import InventoryItem
+from inventory.serializers import derive_on_hand, validate_count_date
 from root.models import Location, ProductVariant
 from root.new_records import create_customer, create_supplier, supplier_label
 from root.utils import get_active_business, local_date
@@ -55,6 +56,9 @@ class StockLineSerializer(serializers.Serializer):
     unit_price = serializers.FloatField(required=False, allow_null=True, min_value=0)
     unit_cost = serializers.FloatField(required=False, allow_null=True, min_value=0)
     reorder_level = serializers.IntegerField(required=False, allow_null=True, min_value=0)
+
+    def validate_counted_at(self, value):
+        return validate_count_date(value)
 
 
 class BacklogWorkViewSet(GenericViewSet):
@@ -395,7 +399,7 @@ class BacklogWorkViewSet(GenericViewSet):
         with transaction.atomic():
             row = InventoryItem.objects.select_for_update().filter(
                 business_id=business.id, product=variant).first()
-            changes = self._row_changes(values)
+            changes = self._row_changes(values, row.quantity_reserved if row else 0)
             if row:
                 previous = {field: getattr(row, field) for field in changes}
                 previous = {k: (v.isoformat() if isinstance(v, date) else v) for k, v in previous.items()}
@@ -424,15 +428,16 @@ class BacklogWorkViewSet(GenericViewSet):
             raise exceptions.ValidationError({'location': ['Pick a location from the list.']})
         return values
 
-    def _row_changes(self, values):
-        """Stock row fields from a list line. A count sets both the quantity
-        and what is on hand, and dates the count (§8)."""
+    def _row_changes(self, values, reserved=0):
+        """Stock row fields from a list line. A count sets the quantity, on
+        hand follows it (inventory.serializers.DERIVED_STOCK_FIELDS), and the
+        count is dated (§8). `reserved` is the existing row's."""
         changes = {}
         if 'location' in values:
             changes['location_id'] = values['location']
         if values.get('quantity') is not None:
             changes['quantity'] = values['quantity']
-            changes['quantity_on_hand'] = values['quantity']
+            derive_on_hand(changes, reserved)
             changes['stock_counted_at'] = values.get('counted_at') or timezone.localdate()
         for field in ('unit_price', 'unit_cost', 'reorder_level'):
             if values.get(field) is not None:
@@ -515,7 +520,7 @@ class BacklogWorkViewSet(GenericViewSet):
             values = self._stock_values({**request.data, 'product': output.inventory_item.product_id})
             values.pop('product')
             row = output.inventory_item
-            changes = self._row_changes(values)
+            changes = self._row_changes(values, row.quantity_reserved)
             if not output.created:
                 # A field set for the first time on a correction: what the row
                 # had before goes into `previous` too, so deleting the line

@@ -4,7 +4,7 @@ from datetime import date as date_cls
 from django.conf import settings
 from django.db import models
 from django.db.models import Case, F, IntegerField, OuterRef, Q, Subquery, Value, When
-from django.db.models.functions import Coalesce
+from django.db.models.functions import Coalesce, TruncDate
 from django.utils import timezone
 
 from root.models import Business, Customer, Expense, Supplier
@@ -233,6 +233,35 @@ class TransactionManager(models.Manager):
             .annotate(total=models.Sum('amount'))
         )
         return {row['type']: row['total'] or 0 for row in rows}
+
+    def sale_payments_after_issue(self, business_id, date_from, date_to):
+        """
+        Cleared sale payments in the period NOT made on their invoice's issue
+        date.
+
+        Only money taken the day the invoice is issued is a cash sale. The
+        rest of the invoice is credit extended on that day, and whatever is
+        paid on it later is udhaar recovered - whatever range the report
+        covers. Counting a later payment as cash sales made the summary report
+        sales that did not happen that day, and hid the credit that did.
+
+        The issue date is the local date (TruncDate follows the active
+        timezone), matching how credit_extended dates the invoice. A payment
+        with no dated invoice behind it (pre-accounting rows) is left out, so
+        it stays a cash sale as it always was.
+        """
+        return (
+            self.get_queryset()
+            .for_business(business_id)
+            .cleared()
+            .in_period(date_from, date_to)
+            .filter(type='sale_payment',
+                    sales_receipt__sales_invoice__date_issued__isnull=False)
+            .annotate(issued_on=TruncDate(
+                'sales_receipt__sales_invoice__date_issued'))
+            .exclude(date=F('issued_on'))
+            .aggregate(total=models.Sum('amount'))['total'] or 0
+        )
 
     def salary_expense_total(self, business_id, date_from, date_to):
         """
