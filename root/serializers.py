@@ -186,10 +186,11 @@ class CustomerSerializer(RoleDetailsMixin, serializers.ModelSerializer):
     class Meta:
         model = Customer
         fields = [
-            'id', 'name', 'business', 'phone', 'email',
+            'id', 'person_id', 'is_active', 'name', 'business', 'phone', 'email',
             'address', 'city', 'created_at', 'updated_at',
             'notes'
         ]
+        read_only_fields = ['person_id', 'is_active']
 
 
 class CaptureCustomerSerializer(CustomerSerializer):
@@ -216,7 +217,7 @@ class SimpleCustomerSerializer(serializers.ModelSerializer):
     class Meta:
         model = Customer
         fields = [
-            'id', 'name', 'phone',
+            'id', 'person_id', 'is_active', 'name', 'phone',
             'email', 'address', 'city'
         ]
 
@@ -588,8 +589,10 @@ class SupplierSerializer(RoleDetailsMixin, serializers.ModelSerializer):
     class Meta:
         model = Supplier
         fields = [
-            'id', 'business', 'name', 'business_name', 'phone', 'email', 'notes'
+            'id', 'person_id', 'is_active', 'business', 'name', 'business_name',
+            'phone', 'email', 'notes'
         ]
+        read_only_fields = ['person_id', 'is_active']
 
 
 class SimpleSupplierSerializer(serializers.ModelSerializer):
@@ -601,7 +604,7 @@ class SimpleSupplierSerializer(serializers.ModelSerializer):
     class Meta:
         model = Supplier
         fields = [
-            'id', 'name', 'business_name',
+            'id', 'person_id', 'is_active', 'name', 'business_name',
         ]
 
 
