@@ -5,7 +5,7 @@ from django.db.models import Q
 from rest_framework import serializers
 
 from core.serializers import SimpleUserSerializer
-from root.models import Customer, Expense, Supplier
+from root.models import Customer, Expense, Person, Supplier
 from root.serializers import SimpleCustomerSerializer, SimpleSupplierSerializer
 # accounts -> sales only. accounts/utils.py and accounts/signals.py already
 # import sales, and nothing under sales/ imports accounts, so there is no
@@ -19,7 +19,7 @@ from .models import (
 )
 # payments.py imports TransactionCreateSerializer lazily, inside the function
 # that needs it, so this direction is safe.
-from .payments import INVOICE, allocate, settleable_items
+from .payments import INVOICE, LOAN, allocate, settleable_items
 from .settlement import settlement_for_transaction
 
 # Pool credit: the types whose `settles` list means something.
@@ -133,10 +133,16 @@ class SimplePartyPaymentSerializer(serializers.ModelSerializer):
 
     customer = SimpleCustomerSerializer(read_only=True)
     supplier = SimpleSupplierSerializer(read_only=True)
+    # The person always; for a loan or a set-off, the only party named.
+    person = serializers.SerializerMethodField()
 
     class Meta:
         model = PartyPayment
-        fields = ['id', 'customer', 'supplier']
+        fields = ['id', 'customer', 'supplier', 'person', 'loan']
+
+    def get_person(self, party_payment):
+        person = party_payment.person
+        return {'id': person.id, 'name': person.name} if person else None
 
 
 class SimpleTransactionSerializer(serializers.ModelSerializer):
@@ -241,6 +247,15 @@ class BaseTransactionWriteSerializer(serializers.ModelSerializer):
     supplier = serializers.PrimaryKeyRelatedField(
         queryset=Supplier.objects.none(), required=False,
         allow_null=True, write_only=True)
+    # A loan names the person, whatever roles they have (register #28).
+    # Optional here; the screens require it for new loans and on edit (R16, S9).
+    person = serializers.PrimaryKeyRelatedField(
+        queryset=Person.objects.none(), required=False,
+        allow_null=True, write_only=True)
+    # On a repayment: the loan it repays (R18).
+    loan = serializers.PrimaryKeyRelatedField(
+        queryset=Transaction.objects.none(), required=False,
+        allow_null=True, write_only=True)
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -266,6 +281,10 @@ class BaseTransactionWriteSerializer(serializers.ModelSerializer):
                 business_id=business_id)
             self.fields['supplier'].queryset = Supplier.objects.filter(
                 business_id=business_id)
+            self.fields['person'].queryset = Person.objects.filter(
+                business_id=business_id)
+            self.fields['loan'].queryset = Transaction.objects.filter(
+                business_id=business_id, type__in=list(Transaction.LOAN_REPAID_BY))
 
             # Source pickers, present only on the create serializer. Scoped
             # here so a foreign business's invoice is a 400, not a leak.
@@ -330,6 +349,12 @@ class BaseTransactionWriteSerializer(serializers.ModelSerializer):
     def validate(self, attrs):
         txn_type = attrs.get('type') or getattr(self.instance, 'type', None)
         amount = attrs.get('amount', getattr(self.instance, 'amount', 0))
+
+        if txn_type in Transaction.SET_OFF_TYPES:
+            raise serializers.ValidationError({
+                'type': "Record a set-off from the person's page: it settles "
+                        'both sides at once.'
+            })
 
         if txn_type in Transaction.NOTE_TYPES:
             if amount is not None and amount <= 0:
@@ -401,6 +426,8 @@ class BaseTransactionWriteSerializer(serializers.ModelSerializer):
                 'customer': 'Name either a customer or a supplier, not both.'
             })
 
+        self._validate_loan(attrs, txn_type)
+
         # On-account money must name its party. It used to be optional, and
         # the create screen listed only parties with an opening balance, so a
         # supplier payment to anyone else was saved with no supplier at all:
@@ -416,11 +443,50 @@ class BaseTransactionWriteSerializer(serializers.ModelSerializer):
 
         return attrs
 
+    def _validate_loan(self, attrs, txn_type):
+        """
+        A loan names a person, not a customer or supplier. A repayment may
+        name the loan it repays: a loan of the matching kind, of that person.
+        """
+        person = attrs.get('person')
+        loan = attrs.get('loan')
+        if txn_type not in Transaction.LOAN_TYPES:
+            if person or loan:
+                raise serializers.ValidationError({
+                    'person': 'Only a loan names a person here; this type names '
+                              'a customer or supplier.'
+                })
+            return
+        if attrs.get('customer') or attrs.get('supplier'):
+            raise serializers.ValidationError({
+                'person': 'A loan names the person, not a customer or supplier.'
+            })
+        if loan is None:
+            return
+        if txn_type not in Transaction.LOAN_REPAID_BY.values():
+            raise serializers.ValidationError({
+                'loan': 'Only a loan repayment or recovery names a loan.'
+            })
+        if Transaction.LOAN_REPAID_BY.get(loan.type) != txn_type:
+            raise serializers.ValidationError({
+                'loan': 'That loan is not repaid by this type.'
+            })
+        if person is None:
+            existing = getattr(self.instance, 'party_payment', None) \
+                if self.instance is not None else None
+            person = getattr(existing, 'person', None)
+        loan_person = getattr(getattr(loan, 'party_payment', None), 'person_id', None)
+        if person is None or loan_person != person.id:
+            raise serializers.ValidationError({
+                'loan': 'That loan is not with this person.'
+            })
+
     # Which party each on-account money type names. Notes are checked in
-    # _validate_note.
+    # _validate_note; loans name a person (_validate_loan).
     ON_ACCOUNT_PARTY = {
         t: Transaction.PARTY_EFFECTS[t][0]
         for t in Transaction.party_types(money_only=True)
+        if t not in Transaction.PERSON_TYPES
     }
 
 
@@ -470,6 +536,7 @@ class TransactionCreateSerializer(BaseTransactionWriteSerializer):
             'type', 'amount', 'date', 'account', 'transfer_account',
             'payment_method', 'status', 'reference', 'notes', 'image',
             'cheque_number', 'cheque_due_date', 'customer', 'supplier',
+            'person', 'loan',
             'sales_invoice', 'purchase_invoice',
             'expense_name', 'expense_category',
         ]
@@ -643,6 +710,8 @@ class TransactionCreateSerializer(BaseTransactionWriteSerializer):
         """
         customer = data.pop('customer', None)
         supplier = data.pop('supplier', None)
+        person = data.pop('person', None)
+        loan = data.pop('loan', None)
 
         # A cheque is pending until it clears, so it stays financially inert.
         if data.get('payment_method') == 'cheque' and not data.get('status'):
@@ -660,7 +729,13 @@ class TransactionCreateSerializer(BaseTransactionWriteSerializer):
         # purchase_payment must NEVER be added to that list: customer_balance
         # sums invoice receipts and on-account payments independently, so a row
         # in both would credit the party twice for the same money.
-        if (customer or supplier) and instance.type in Transaction.PARTY_TYPES:
+        if instance.type in Transaction.PERSON_TYPES:
+            if person:
+                PartyPayment.objects.create(
+                    business_id=business_id, person=person, loan=loan,
+                    transaction=instance,
+                )
+        elif (customer or supplier) and instance.type in Transaction.PARTY_TYPES:
             PartyPayment.objects.create(
                 business_id=business_id,
                 customer=customer,
@@ -679,6 +754,7 @@ class TransactionUpdateSerializer(BaseTransactionWriteSerializer):
             'type', 'amount', 'date', 'account', 'transfer_account',
             'payment_method', 'status', 'reference', 'notes', 'image',
             'cheque_number', 'cheque_due_date', 'customer', 'supplier',
+            'person', 'loan',
         ]
         extra_kwargs = {'image': {'required': False}}
 
@@ -697,6 +773,8 @@ class TransactionUpdateSerializer(BaseTransactionWriteSerializer):
     def update(self, instance, validated_data):
         customer = validated_data.pop('customer', None)
         supplier = validated_data.pop('supplier', None)
+        person = validated_data.pop('person', None)
+        loan = validated_data.pop('loan', None)
 
         for attr, value in validated_data.items():
             setattr(instance, attr, value)
@@ -707,6 +785,16 @@ class TransactionUpdateSerializer(BaseTransactionWriteSerializer):
             # PartyPayment behind, because the branch below only ever ran when
             # a party was supplied - there was no way to clear one.
             PartyPayment.objects.filter(transaction=instance).delete()
+        elif instance.type in Transaction.PERSON_TYPES:
+            if person:
+                PartyPayment.objects.update_or_create(
+                    transaction=instance,
+                    defaults={
+                        'business_id': instance.business_id,
+                        'person': person, 'loan': loan,
+                        'customer': None, 'supplier': None,
+                    },
+                )
         elif customer or supplier:
             PartyPayment.objects.update_or_create(
                 transaction=instance,
@@ -819,8 +907,8 @@ class RecordPartyPaymentSerializer(serializers.Serializer):
         carries it as a real list. Accept both. An empty list is valid: the
         whole amount then goes on account.
 
-        Only invoices can be ticked. The opening balance is settled by the
-        on-account part, which reaches it first.
+        Invoices and loans can be ticked (register #21). The opening
+        balance is settled by the on-account part, which reaches it first.
         """
         if isinstance(value, str):
             try:
@@ -842,10 +930,10 @@ class RecordPartyPaymentSerializer(serializers.Serializer):
                     'Each item must be an object of {kind, id}.')
 
             kind = entry.get('kind')
-            if kind != INVOICE:
+            if kind not in (INVOICE, LOAN):
                 raise serializers.ValidationError(
-                    f'Unknown item kind: {kind}. Only invoices can be '
-                    'selected; the rest of the payment goes on account.')
+                    f'Unknown item kind: {kind}. Only invoices and loans can '
+                    'be selected; the rest of the payment goes on account.')
 
             try:
                 item_id = int(entry.get('id'))

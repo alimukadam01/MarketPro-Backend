@@ -20,7 +20,7 @@ from django.db.models.deletion import Collector
 from rest_framework.permissions import BasePermission
 
 from accounts.models import MoneyAccount, PartyPayment, Transaction
-from accounts.settlement import settle_parties, settle_party
+from accounts.settlement import settle_party, settle_person_sides
 from audit.helpers import audited_update
 from sales.models import PurchaseInvoice, SalesInvoice
 
@@ -128,21 +128,20 @@ def change_role(person, kind, action):
 # ── Balances ──────────────────────────────────────────────────────────────────
 
 def side_balances(business_id, person_ids=None):
-    """{person_id: {'receivable': x, 'payable': y}} from one settlement pass."""
+    """
+    {person_id: {'receivable': x, 'payable': y}}: each person's two sides,
+    from their roles and from loans and set-offs, which need no role.
+    """
     result = defaultdict(lambda: {'receivable': 0, 'payable': 0})
-    for kind, Role in ROLES.items():
-        roles = Role.objects.filter(business_id=business_id)
-        if person_ids is not None:
-            roles = roles.filter(person_id__in=person_ids)
-        person_of = dict(roles.values_list('id', 'person_id'))
-        if not person_of:
-            continue
-        for role_id, khaata in settle_parties(business_id, kind, list(person_of)).items():
+    for person_id, sides in settle_person_sides(business_id, person_ids).items():
+        for kind, khaata in sides.items():
+            if khaata is None:
+                continue
             balance = round(khaata.balance)
             if not balance:
                 continue
             owes_business = balance > 0 if kind == 'customer' else balance < 0
-            result[person_of[role_id]]['receivable' if owes_business else 'payable'] += abs(balance)
+            result[person_id]['receivable' if owes_business else 'payable'] += abs(balance)
     return result
 
 
@@ -164,10 +163,9 @@ def last_activity(business_id, person_ids):
     for row in (PurchaseInvoice.objects.filter(business_id=business_id, supplier__person_id__in=person_ids)
                 .values('supplier__person_id').annotate(last=Max('date_issued'))):
         keep(row['supplier__person_id'], row['last'])
-    for field in ('customer__person_id', 'supplier__person_id'):
-        for row in (PartyPayment.objects.filter(business_id=business_id, **{f'{field}__in': person_ids})
-                    .values(field).annotate(last=Max('transaction__date'))):
-            keep(row[field], row['last'])
+    for row in (PartyPayment.objects.filter(business_id=business_id, person_id__in=person_ids)
+                .values('person_id').annotate(last=Max('transaction__date'))):
+        keep(row['person_id'], row['last'])
     return latest
 
 
@@ -196,13 +194,12 @@ DELETE_LABELS = {
 
 def _party_transactions(person):
     """
-    On-account money, notes and refunds that name this person's roles. Their
-    PartyPayment link cascades, but the Transaction it points to would not, so
-    these are deleted explicitly - nothing about the person is left behind
-    (register S1).
+    On-account money, notes, refunds, loans and set-offs that name this
+    person. Their PartyPayment link cascades, but the Transaction it points to
+    would not, so these are deleted explicitly - nothing about the person is
+    left behind (register S1).
     """
-    return Transaction.objects.filter(
-        Q(party_payment__customer__person=person) | Q(party_payment__supplier__person=person))
+    return Transaction.objects.filter(party_payment__person=person)
 
 
 def _collect(person):

@@ -9,7 +9,7 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.viewsets import GenericViewSet, ModelViewSet
 
-from root.models import Customer, Expense, Supplier
+from root.models import Customer, Expense, Person, Supplier
 from root.periods import (
     PERIODS, PeriodFilterMixin, daily_trend, hourly_trend, in_period, is_filtered,
     period_from_params, period_payload,
@@ -24,6 +24,9 @@ from .payments import (
     settleable_items as party_settleable_items,
 )
 from .permissions import HasAccountingAccess
+from .set_offs import (
+    SetOffError, delete_set_off, record_set_off, set_off_group, update_set_off,
+)
 from .serializers import (
     MoneyAccountCreateSerializer, MoneyAccountSerializer,
     MoneyAccountUpdateSerializer, PartyOpeningBalanceSerializer,
@@ -33,7 +36,7 @@ from .serializers import (
 )
 from .utils import (
     daily_summary, day_book, has_accounting_access, month_bounds,
-    opening_balance_remaining, parse_date, party_ledger, payables,
+    opening_balance_remaining, parse_date, party_ledger, payables, person_ledger,
     previous_month_bounds, profit_estimate, receivables,
     uncleared_opening_balances,
 )
@@ -362,6 +365,78 @@ class TransactionViewSet(PeriodFilterMixin, ModelViewSet):
             TransactionSerializer(created, many=True, context=context).data,
             status=status.HTTP_201_CREATED,
         )
+
+    # ── Set-offs (register #20, R25-R28) ─────────────────────────────────────
+
+    def _set_off_payload(self, halves):
+        receivable, payable = halves
+        return {
+            'group': str(receivable.payment_group),
+            'reference': receivable.set_off_reference,
+            'person': {'id': receivable.party_payment.person_id,
+                       'name': receivable.party_payment.person.name},
+            'amount': receivable.amount,
+            'date': receivable.date.isoformat(),
+            'notes': receivable.notes,
+            'transactions': [receivable.id, payable.id],
+        }
+
+    @action(['POST'], detail=False, url_path='set-off', url_name='set-off')
+    def set_off(self, request):
+        """
+        {"person_id", "amount", "date", "notes"?}: settles the same amount off
+        both sides of one person, oldest first, moving no money.
+        """
+        business = get_active_business(request)
+        if not business:
+            return Response(NO_BUSINESS, status=status.HTTP_400_BAD_REQUEST)
+        person = Person.objects.filter(
+            pk=request.data.get('person_id'), business_id=business.id).first()
+        if person is None:
+            return Response({'detail': 'Not Found'}, status=status.HTTP_404_NOT_FOUND)
+        when = parse_date(request.data.get('date'))
+        try:
+            amount = int(request.data.get('amount') or 0)
+        except (TypeError, ValueError):
+            amount = 0
+        if when is None:
+            return Response({'date': ['A date is required.']}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            halves = record_set_off(business.id, request.user.id, person, amount,
+                                    when, request.data.get('notes'))
+        except SetOffError as error:
+            return Response({'detail': str(error)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(self._set_off_payload(halves), status=status.HTTP_201_CREATED)
+
+    @action(['GET', 'PATCH', 'DELETE'], detail=False,
+            url_path=r'set-off/(?P<group>[0-9a-fA-F-]{32,36})', url_name='set-off-detail')
+    def set_off_detail(self, request, group=None):
+        """One set-off by its group: read it, change it, or delete both halves."""
+        business = get_active_business(request)
+        if not business:
+            return Response(NO_BUSINESS, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            if request.method == 'DELETE':
+                delete_set_off(business.id, group)
+                return Response({'detail': 'Success.'}, status=status.HTTP_200_OK)
+            if request.method == 'PATCH':
+                amount = request.data.get('amount')
+                halves = update_set_off(
+                    business.id, group,
+                    amount=int(amount) if amount not in (None, '') else None,
+                    date=parse_date(request.data.get('date')),
+                    notes=request.data.get('notes'))
+            else:
+                halves = set_off_group(business.id, group)
+                if not halves:
+                    return Response({'detail': 'Not Found'}, status=status.HTTP_404_NOT_FOUND)
+        except SetOffError as error:
+            code = (status.HTTP_404_NOT_FOUND if 'not found' in str(error).lower()
+                    else status.HTTP_400_BAD_REQUEST)
+            return Response({'detail': str(error)}, status=code)
+        except (TypeError, ValueError):
+            return Response({'detail': 'Bad Request.'}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(self._set_off_payload(halves), status=status.HTTP_200_OK)
 
     @staticmethod
     def _with_payment_group(transactions, business_id):
@@ -815,6 +890,10 @@ class AccountingKPIViewSet(GenericViewSet):
 
         customer_id = request.query_params.get('customer_id')
         supplier_id = request.query_params.get('supplier_id')
+        person_id = request.query_params.get('person_id')
+
+        if person_id:
+            return self._person_ledger(request, business, person_id)
 
         if not customer_id and not supplier_id:
             return Response(
@@ -852,6 +931,39 @@ class AccountingKPIViewSet(GenericViewSet):
                 # one place.
                 'whatsapp': whatsapp_number(party.phone),
                 'is_customer': bool(customer),
+            }
+            return Response({'party_ledger': ledger}, status=status.HTTP_200_OK)
+        except Exception as error:
+            print(error)
+            return Response(
+                {'detail': 'Internal Server Error.'},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
+    def _person_ledger(self, request, business, person_id):
+        """
+        ?person_id=&side=both|receivable|payable (register #25, R24): one
+        side with one running balance, or both sides with one each.
+        """
+        side = request.query_params.get('side') or 'both'
+        if side not in ('both', 'receivable', 'payable'):
+            return Response({'detail': 'Bad Request.'}, status=status.HTTP_400_BAD_REQUEST)
+        person = Person.objects.filter(pk=person_id, business_id=business.id).first()
+        if person is None:
+            return Response({'detail': 'Not Found'}, status=status.HTTP_404_NOT_FOUND)
+        try:
+            ledger = person_ledger(
+                business.id, person, side,
+                date_from=parse_date(request.query_params.get('date_from')),
+                date_to=parse_date(request.query_params.get('date_to')),
+            )
+            ledger['side'] = side
+            ledger['party'] = {
+                'id': person.id,
+                'person_id': person.id,
+                'name': person.name,
+                'phone': person.phone,
+                'whatsapp': whatsapp_number(person.phone),
             }
             return Response({'party_ledger': ledger}, status=status.HTTP_200_OK)
         except Exception as error:

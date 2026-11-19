@@ -3,7 +3,7 @@ from django.test import TestCase
 from django.urls import reverse
 
 from core.admin_masking import MASK
-from root.models import Business
+from root.models import Business, Person
 
 from .models import MoneyAccount, PartyPayment, Transaction
 
@@ -95,8 +95,10 @@ class MaskedAmountAdminTests(TestCase):
         self.assertContains(response, MASK)
 
     def test_amount_absent_from_fk_changelist_column(self):
+        # Every party link names a person (People).
+        person = Person.objects.create(business=self.business, name='Masked')
         PartyPayment.objects.create(
-            business=self.business, transaction=self.transaction
+            business=self.business, transaction=self.transaction, person=person
         )
         response = self.client.get(reverse("admin:accounts_partypayment_changelist"))
         self.assertNotContains(response, str(CANARY))

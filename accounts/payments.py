@@ -31,12 +31,19 @@ from root.models import Customer, Supplier
 from sales.models import PurchaseInvoice, SalesInvoice
 from sales.utils import invoice_room
 
-from .settlement import attach_settlement
+from .models import Transaction
+from .settlement import LABELS, attach_settlement, settle_parties
 from .utils import NOT_A_DEBT_PURCHASE_STATUSES, NOT_A_DEBT_SALES_STATUSES
 
 
 ON_ACCOUNT = 'on_account'
 INVOICE = 'invoice'
+# A loan on this side of the person's khaata (register #21, R18). A ticked
+# loan is repaid by a repayment that names it (PartyPayment.loan).
+LOAN = 'loan'
+# The loan each side can carry: one the business gave (the person owes it
+# back) or one it received (the business owes it back).
+LOAN_TYPE = {'customer': 'loan_given', 'supplier': 'loan_received'}
 
 # Which transaction type each part of a payment mints, per party. The split is
 # the whole point: on-account money and invoice money are summed independently
@@ -114,6 +121,45 @@ def settleable_items(business_id, party, party_id):
             'reserved': max(round(owed - room), 0),
         })
 
+    items.extend(_loan_items(business_id, party, party_id))
+    return items
+
+
+def _loan_items(business_id, party, party_id):
+    """
+    The person's open loans on this side, oldest first. `room` is what is
+    left on each once every pending cheque clears, as for invoices: the
+    reserving settlement is what a payment may still take.
+    """
+    Role = Customer if party == 'customer' else Supplier
+    person_id = Role.objects.filter(pk=party_id).values_list('person_id', flat=True).first()
+    loans = list(
+        Transaction.objects
+        .filter(business_id=business_id, type=LOAN_TYPE[party], status='C',
+                party_payment__person_id=person_id)
+        .order_by('date', 'created_at')
+    )
+    if not loans:
+        return []
+    cleared = settle_parties(business_id, party, [party_id]).get(party_id)
+    reserving = settle_parties(business_id, party, [party_id], include_pending=True).get(party_id)
+    items = []
+    for loan in loans:
+        held = reserving.loan_status(loan.id) if reserving else None
+        owed = cleared.loan_status(loan.id) if cleared else None
+        room = int(held['remaining']) if held else 0
+        if room <= 0:
+            continue
+        items.append({
+            'kind': LOAN,
+            'id': loan.id,
+            'label': f"{LABELS[LOAN_TYPE[party]]}{f' {loan.reference}' if loan.reference else ''}",
+            'sub': None,
+            'date': loan.date.isoformat(),
+            'total': loan.amount,
+            'room': room,
+            'reserved': max((owed['remaining'] if owed else 0) - room, 0),
+        })
     return items
 
 
@@ -182,9 +228,13 @@ def record_party_payment(business_id, user_id, party, party_id, amount,
     # Named payments first: each is validated against its invoice's room,
     # and the on-account part, once written, would reach the oldest invoices
     # and shrink that room.
-    parts = [(INVOICE, item['id'], applied) for item, applied in applied_rows]
+    parts = [(item['kind'], item['id'], applied) for item, applied in applied_rows]
     if left > 0:
         parts.append((ON_ACCOUNT, party_id, left))
+    person_id = None
+    if any(kind == LOAN for kind, _, _ in parts):
+        Role = Customer if party == 'customer' else Supplier
+        person_id = Role.objects.filter(pk=party_id).values_list('person_id', flat=True).first()
 
     group = uuid.uuid4()
     types = ITEM_TYPES[party]
@@ -195,11 +245,17 @@ def record_party_payment(business_id, user_id, party, party_id, amount,
         for kind, target_id, applied in parts:
             payload = dict(money_details)
             payload['amount'] = applied
-            payload['type'] = types[kind]
 
-            if kind == ON_ACCOUNT:
+            if kind == LOAN:
+                # A repayment naming its loan; a loan names the person.
+                payload['type'] = Transaction.LOAN_REPAID_BY[LOAN_TYPE[party]]
+                payload['person'] = person_id
+                payload['loan'] = target_id
+            elif kind == ON_ACCOUNT:
+                payload['type'] = types[kind]
                 payload[party] = target_id
             else:
+                payload['type'] = types[kind]
                 payload[invoice_field] = target_id
 
             serializer = TransactionCreateSerializer(

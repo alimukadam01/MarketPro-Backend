@@ -565,6 +565,7 @@ class Transaction(models.Model):
         'purchase_return_refund',
         'owner_capital',
         'loan_received',
+        'loan_recovered',
         'other_income',
     ]
 
@@ -576,6 +577,7 @@ class Transaction(models.Model):
         'salary_payment',
         'owner_drawings',
         'loan_repayment',
+        'loan_given',
         'other_payment',
     ]
 
@@ -603,6 +605,15 @@ class Transaction(models.Model):
         'supplier_credit_note':   ('supplier', 'settles', 'credit_note'),
         'purchase_return_refund': ('supplier', 'adds',    'refund'),
         'supplier_debit_note':    ('supplier', 'adds',    'debit_note'),
+        # Loans and set-offs name the person, not a role: anyone can lend or
+        # borrow (register #28). 'customer' is the Receivable side, 'supplier'
+        # the Payable side.
+        'loan_given':             ('customer', 'adds',    'loan_given'),
+        'loan_recovered':         ('customer', 'settles', 'loan_recovered'),
+        'set_off_receivable':     ('customer', 'settles', 'set_off'),
+        'loan_received':          ('supplier', 'adds',    'loan_received'),
+        'loan_repayment':         ('supplier', 'settles', 'loan_repayment'),
+        'set_off_payable':        ('supplier', 'settles', 'set_off'),
     }
 
     # Notes move no money. A credit note lowers what the party owes (or what
@@ -615,6 +626,19 @@ class Transaction(models.Model):
     NOTE_TYPES = CREDIT_NOTE_TYPES + DEBIT_NOTE_TYPES
     NOTE_PARTY = {t: party for t, (party, _, kind) in PARTY_EFFECTS.items()
                   if kind in ('credit_note', 'debit_note')}
+
+    # A loan names the person, whatever roles they have. A repayment may
+    # also name the loan it repays (PartyPayment.loan).
+    LOAN_TYPES = ['loan_given', 'loan_recovered', 'loan_received', 'loan_repayment']
+    # What a repayment of each loan type is.
+    LOAN_REPAID_BY = {'loan_given': 'loan_recovered', 'loan_received': 'loan_repayment'}
+    # A set-off settles both sides of one person by the same amount and moves
+    # no money (register #20): two of these share a payment_group.
+    SET_OFF_TYPES = ['set_off_receivable', 'set_off_payable']
+    # Named by the person, not by a customer or supplier record.
+    PERSON_TYPES = LOAN_TYPES + SET_OFF_TYPES
+    # No account, no payment method: never in a cash figure.
+    NO_MONEY_TYPES = NOTE_TYPES + SET_OFF_TYPES
 
     # Money that counts toward sales / purchase KPIs (every rupee actually
     # received from customers, and every rupee actually paid to suppliers).
@@ -630,14 +654,14 @@ class Transaction(models.Model):
     def party_types(cls, party=None, effect=None, money_only=False):
         """
         The PARTY_EFFECTS types for one party kind and/or one effect
-        ('settles' or 'adds'). money_only leaves out the notes, which move no
-        money and so are never pending.
+        ('settles' or 'adds'). money_only leaves out the notes and set-offs,
+        which move no money and so are never pending.
         """
         return [
             t for t, (p, e, _) in cls.PARTY_EFFECTS.items()
             if (party is None or p == party)
             and (effect is None or e == effect)
-            and not (money_only and t in cls.NOTE_TYPES)
+            and not (money_only and t in cls.NO_MONEY_TYPES)
         ]
 
     TYPE_CHOICES = [
@@ -664,6 +688,10 @@ class Transaction(models.Model):
         ('customer_debit_note', 'Customer Debit Note'),
         ('supplier_credit_note', 'Supplier Credit Note'),
         ('supplier_debit_note', 'Supplier Debit Note'),
+        ('loan_given', 'Loan Given'),
+        ('loan_recovered', 'Loan Recovered'),
+        ('set_off_receivable', 'Set-off (Receivable)'),
+        ('set_off_payable', 'Set-off (Payable)'),
     ]
 
     PAYMENT_METHOD_CHOICES = [
@@ -752,13 +780,24 @@ class Transaction(models.Model):
             return 'in'
         if self.type in self.OUT_TYPES:
             return 'out'
-        if self.type in self.NOTE_TYPES:
+        if self.type in self.NO_MONEY_TYPES:
             return 'none'
         return 'neutral'
 
     @property
     def is_note(self):
         return self.type in self.NOTE_TYPES
+
+    @property
+    def is_set_off(self):
+        return self.type in self.SET_OFF_TYPES
+
+    @property
+    def set_off_reference(self):
+        """SO-<date>-<id>, built when shown; nothing extra is stored (R27)."""
+        if not self.is_set_off:
+            return None
+        return f"SO-{self.date:%Y%m%d}-{self.id}"
 
     @property
     def is_source_linked(self):
@@ -789,6 +828,19 @@ class PartyPayment(models.Model):
         Supplier, on_delete=models.CASCADE,
         null=True, blank=True, related_name='party_payments'
     )
+    # The person behind the row, always set. Loans and set-offs name only the
+    # person (they need no role); everything else names a customer or
+    # supplier as well, and save() fills this in from it. The khaata reads
+    # by person and side (accounts/settlement.py).
+    person = models.ForeignKey(
+        'root.Person', on_delete=models.CASCADE, related_name='party_payments'
+    )
+    # Set on a loan repayment that says which loan it repays (register R18).
+    # SET_NULL: deleting the loan leaves the repayment as money on the khaata.
+    loan = models.ForeignKey(
+        Transaction, on_delete=models.SET_NULL,
+        null=True, blank=True, related_name='repayments'
+    )
     transaction = models.OneToOneField(
         Transaction, on_delete=models.CASCADE, related_name='party_payment')
     # Set only on an automatic refund: the invoice whose edit left it paid for
@@ -805,8 +857,14 @@ class PartyPayment(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
+    def save(self, *args, **kwargs):
+        role = self.customer or self.supplier
+        if role is not None:
+            self.person_id = role.person_id
+        super().save(*args, **kwargs)
+
     def __str__(self):
-        party = self.customer or self.supplier
+        party = self.customer or self.supplier or self.person
         return f"{self.id}-{party}-{self.transaction.amount}"
 
 
