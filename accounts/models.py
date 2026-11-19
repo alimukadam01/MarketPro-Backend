@@ -584,18 +584,37 @@ class Transaction(models.Model):
         'cash_adjustment',
     ]
 
+    # The khaata rules, in one place. Every type that sits on a party's khaata
+    # without naming an invoice: which party it names, which way it moves
+    # their balance, and what kind of entry it is. Every other list of party
+    # types (here, in settlement, utils and serializers) is read from this.
+    #
+    #   settles  takes debt off (jama): on-account payments, credit notes
+    #   adds     puts debt back on (naam): refunds paid out, debit notes
+    #
+    # The kind names the entry on the khaata (settlement.LABELS). Notes move
+    # no money; everything else here does.
+    PARTY_EFFECTS = {
+        'customer_receipt':       ('customer', 'settles', 'payment'),
+        'customer_credit_note':   ('customer', 'settles', 'credit_note'),
+        'sales_return_refund':    ('customer', 'adds',    'refund'),
+        'customer_debit_note':    ('customer', 'adds',    'debit_note'),
+        'supplier_payment':       ('supplier', 'settles', 'payment'),
+        'supplier_credit_note':   ('supplier', 'settles', 'credit_note'),
+        'purchase_return_refund': ('supplier', 'adds',    'refund'),
+        'supplier_debit_note':    ('supplier', 'adds',    'debit_note'),
+    }
+
     # Notes move no money. A credit note lowers what the party owes (or what
     # the business owes them); a debit note raises it. One type per party kind
     # keeps the one-type-one-reference rule the type picker relies on.
-    CREDIT_NOTE_TYPES = ['customer_credit_note', 'supplier_credit_note']
-    DEBIT_NOTE_TYPES = ['customer_debit_note', 'supplier_debit_note']
+    CREDIT_NOTE_TYPES = [t for t, (_, _, kind) in PARTY_EFFECTS.items()
+                         if kind == 'credit_note']
+    DEBIT_NOTE_TYPES = [t for t, (_, _, kind) in PARTY_EFFECTS.items()
+                        if kind == 'debit_note']
     NOTE_TYPES = CREDIT_NOTE_TYPES + DEBIT_NOTE_TYPES
-    NOTE_PARTY = {
-        'customer_credit_note': 'customer',
-        'customer_debit_note': 'customer',
-        'supplier_credit_note': 'supplier',
-        'supplier_debit_note': 'supplier',
-    }
+    NOTE_PARTY = {t: party for t, (party, _, kind) in PARTY_EFFECTS.items()
+                  if kind in ('credit_note', 'debit_note')}
 
     # Money that counts toward sales / purchase KPIs (every rupee actually
     # received from customers, and every rupee actually paid to suppliers).
@@ -605,17 +624,26 @@ class Transaction(models.Model):
     # Types that name a customer or supplier when recorded on account. Notes
     # always name one: a note never names an invoice, so the party is the
     # only thing it settles against.
-    PARTY_TYPES = [
-        'customer_receipt',
-        'supplier_payment',
-        'sales_return_refund',
-        'purchase_return_refund',
-    ] + NOTE_TYPES
+    PARTY_TYPES = list(PARTY_EFFECTS)
+
+    @classmethod
+    def party_types(cls, party=None, effect=None, money_only=False):
+        """
+        The PARTY_EFFECTS types for one party kind and/or one effect
+        ('settles' or 'adds'). money_only leaves out the notes, which move no
+        money and so are never pending.
+        """
+        return [
+            t for t, (p, e, _) in cls.PARTY_EFFECTS.items()
+            if (party is None or p == party)
+            and (effect is None or e == effect)
+            and not (money_only and t in cls.NOTE_TYPES)
+        ]
 
     TYPE_CHOICES = [
         ('sale_payment', 'Sale Payment'),
         # Label only. The code stays customer_receipt so existing rows,
-        # filters and PARTY_ON_ACCOUNT keep working; renaming it would
+        # filters and PARTY_EFFECTS keep working; renaming it would
         # need a data migration for no user-visible gain.
         ('customer_receipt', 'Customer Payment'),
         ('purchase_return_refund', 'Purchase Return Refund'),

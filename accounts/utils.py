@@ -12,7 +12,8 @@ from sales.models import (
 )
 from .models import MoneyAccount, PartyOpeningBalance, PartyPayment, Transaction
 from .settlement import (
-    Settlement, on_account_paid_on_issue_date, settle_parties, settle_party,
+    LABELS, Settlement, on_account_paid_on_issue_date, settle_parties,
+    settle_party,
 )
 
 
@@ -31,45 +32,12 @@ CLEARED_RECEIPT = (
 CLEARED_ONLY = ('C',)
 LIVE_ON_ACCOUNT = ('C', 'PEN')
 
-# On-account money and which way it moves a party's balance. A payment settles
-# what they owe; a refund is money going back out, so it puts the debt back on.
-PARTY_ON_ACCOUNT = {
-    'customer': {
-        'payment': 'customer_receipt',
-        'refund': 'sales_return_refund',
-        'credit_note': 'customer_credit_note',
-        'debit_note': 'customer_debit_note',
-    },
-    'supplier': {
-        'payment': 'supplier_payment',
-        'refund': 'purchase_return_refund',
-        'credit_note': 'supplier_credit_note',
-        'debit_note': 'supplier_debit_note',
-    },
-}
-
-
-def note_totals(business_id, party_filter, kinds):
+def party_effect_totals(business_id, party_filter, party, statuses=CLEARED_ONLY,
+                        money_only=False):
     """
-    One party's credit and debit notes. Always cleared - a note is never
-    pending - so there is no status question to answer here.
-    """
-    rows = (
-        PartyPayment.objects
-        .filter(business_id=business_id, transaction__status='C',
-                transaction__type__in=[kinds['credit_note'], kinds['debit_note']],
-                **party_filter)
-        .values('transaction__type')
-        .annotate(total=Sum('transaction__amount'))
-    )
-    totals = {row['transaction__type']: row['total'] or 0 for row in rows}
-    return totals.get(kinds['credit_note'], 0), totals.get(kinds['debit_note'], 0)
-
-
-def on_account_totals(business_id, party_filter, kinds, statuses=CLEARED_ONLY):
-    """
-    On-account money for one party, split into what settles their balance and
-    what puts it back on.
+    One party's khaata rows that name no invoice (Transaction.PARTY_EFFECTS),
+    as (settles, adds): what takes debt off their balance - on-account
+    payments, credit notes - and what puts it back on - refunds, debit notes.
 
     `statuses` answers one of two different questions, and they need different
     answers - exactly as amount_paid and invoice_room differ on the invoice
@@ -77,20 +45,29 @@ def on_account_totals(business_id, party_filter, kinds, statuses=CLEARED_ONLY):
 
       CLEARED_ONLY   what the party actually owes. A pending cheque has paid
                      nothing yet, so it must not reduce a balance.
-      LIVE_ON_ACCOUNT what more can still be allocated. A pending cheque has
-                     already claimed that money, so offering it again in a
-                     payment picker invites settling the same debt twice.
+      ('PEN',)       what a pending cheque has already claimed, which a
+                     payment picker must hold back, or the same debt can be
+                     settled twice.
+
+    Notes are always cleared, so they only ever appear in the first. Pass
+    money_only to leave them out entirely.
     """
+    types = Transaction.party_types(party, money_only=money_only)
     rows = (
         PartyPayment.objects
         .filter(business_id=business_id, transaction__status__in=statuses,
-                transaction__type__in=[kinds['payment'], kinds['refund']],
-                **party_filter)
+                transaction__type__in=types, **party_filter)
         .values('transaction__type')
         .annotate(total=Sum('transaction__amount'))
     )
-    totals = {row['transaction__type']: row['total'] or 0 for row in rows}
-    return totals.get(kinds['payment'], 0), totals.get(kinds['refund'], 0)
+    settles = adds = 0
+    for row in rows:
+        _, effect, _ = Transaction.PARTY_EFFECTS[row['transaction__type']]
+        if effect == 'settles':
+            settles += row['total'] or 0
+        else:
+            adds += row['total'] or 0
+    return settles, adds
 
 
 def receipt_date(receipt):
@@ -200,10 +177,13 @@ def party_invoiced(business_id, customer=None, supplier=None,
 
 def _party_balance(business_id, kind, party, receipts):
     """
-    invoiced - paid against invoices - paid on account + refunded
-             - credit notes + debit notes + opening balance
+    invoiced - paid against invoices - what settles + what adds
+             + opening balance
 
-    Four aggregates rather than a settlement pass, because list screens call
+    "What settles" is on-account payments and credit notes; "what adds" is
+    refunds and debit notes (Transaction.PARTY_EFFECTS).
+
+    Three aggregates rather than a settlement pass, because list screens call
     this once per party. The engine's balance is the same figure by
     construction; accounts.tests_settlement asserts it.
 
@@ -212,18 +192,15 @@ def _party_balance(business_id, kind, party, receipts):
     credit for the same reason.
     """
     party_filter = {f'{kind}_id': party.id}
-    kinds = PARTY_ON_ACCOUNT[kind]
     invoiced = party_invoiced(business_id, **{kind: party})
     paid = receipts.filter(CLEARED_RECEIPT).aggregate(
         total=Sum('amount'))['total'] or 0
-    settled, refunded = on_account_totals(business_id, party_filter, kinds)
-    credited, debited = note_totals(business_id, party_filter, kinds)
+    settles, adds = party_effect_totals(business_id, party_filter, kind)
 
     opening = getattr(party, 'opening_balance', None)
     opening_amount = opening.amount if opening else 0
 
-    return round(invoiced - paid - settled + refunded
-                 - credited + debited + opening_amount)
+    return round(invoiced - paid - settles + adds + opening_amount)
 
 
 def customer_balance(customer, business_id):
@@ -371,9 +348,9 @@ def opening_balance_remaining(business_id, party, party_id, opening=None,
     settled = opening_amount - remaining
     if include_pending:
         if pending is None:
-            pending, _ = on_account_totals(
-                business_id, {f'{party}_id': party_id}, PARTY_ON_ACCOUNT[party],
-                statuses=('PEN',),
+            pending, _ = party_effect_totals(
+                business_id, {f'{party}_id': party_id}, party,
+                statuses=('PEN',), money_only=True,
             )
         settled += min(pending, remaining)
         remaining = max(remaining - pending, 0)
@@ -411,7 +388,8 @@ def uncleared_opening_balances(business_id, party):
         row[f'{party}_id']: row['total'] or 0
         for row in PartyPayment.objects
         .filter(business_id=business_id, transaction__status='PEN',
-                transaction__type=PARTY_ON_ACCOUNT[party]['payment'],
+                transaction__type__in=Transaction.party_types(
+                    party, 'settles', money_only=True),
                 **{f'{party}_id__in': party_ids})
         .values(f'{party}_id')
         .annotate(total=Sum('transaction__amount'))
@@ -546,18 +524,13 @@ def party_ledger(business_id, customer=None, supplier=None,
     # Everything on account carries no invoice. A payment or a credit note
     # lowers the balance; a refund (money going back out) or a debit note
     # raises it, so those land on the other side.
-    if customer:
-        party_filter = {'customer_id': customer.id}
-        kinds = PARTY_ON_ACCOUNT['customer']
-    else:
-        party_filter = {'supplier_id': supplier.id}
-        kinds = PARTY_ON_ACCOUNT['supplier']
+    kind = 'customer' if customer else 'supplier'
+    party_filter = {f'{kind}_id': party.id}
 
     descriptions = {
-        kinds['payment']: ('On-account payment', 'jama'),
-        kinds['credit_note']: ('Credit note', 'jama'),
-        kinds['refund']: ('Refund', 'naam'),
-        kinds['debit_note']: ('Debit note', 'naam'),
+        t: (LABELS[entry_kind], 'jama' if effect == 'settles' else 'naam')
+        for t, (p, effect, entry_kind) in Transaction.PARTY_EFFECTS.items()
+        if p == kind
     }
     on_account = PartyPayment.objects.filter(
         business_id=business_id, transaction__status='C',

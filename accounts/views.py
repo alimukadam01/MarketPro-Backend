@@ -497,7 +497,7 @@ class TransactionViewSet(PeriodFilterMixin, ModelViewSet):
 
         Nothing downstream needs unwinding, because no figure is stored:
         amount_paid skips receipts whose transaction is not 'C',
-        on_account_totals filters status='C', and LIVE_RECEIPT excludes 'B'.
+        party_effect_totals filters status='C', and LIVE_RECEIPT excludes 'B'.
         So clearing settles every item at once and a bounce releases them all.
         """
         business = get_active_business(request)

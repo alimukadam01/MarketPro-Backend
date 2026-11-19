@@ -50,27 +50,36 @@ from .models import PartyOpeningBalance, PartyPayment, Transaction
 # transaction amounts are whole rupees.
 EPSILON = 0.005
 
+def _pool_types(party_kind, effect):
+    """{type: kind} for one party kind's PARTY_EFFECTS rows with this effect."""
+    return {t: kind for t, (party, e, kind) in Transaction.PARTY_EFFECTS.items()
+            if party == party_kind and e == effect}
+
+
 # Per party kind: the invoice model and its foreign key, and which transaction
-# types are pool money (credits) or pool debts. Notes are split by direction;
-# refunds are money that went back out, so they put debt back on.
+# types are pool money (credits) or pool debts - read from
+# Transaction.PARTY_EFFECTS. Notes are split by direction; refunds are money
+# that went back out, so they put debt back on.
 PARTY_SPEC = {
     'customer': {
         'invoice_model': SalesInvoice,
         'party_model': Customer,
-        'credit_types': {'customer_receipt': 'payment',
-                         'customer_credit_note': 'credit_note'},
-        'debit_types': {'customer_debit_note': 'debit_note',
-                        'sales_return_refund': 'refund'},
+        'credit_types': _pool_types('customer', 'settles'),
+        'debit_types': _pool_types('customer', 'adds'),
     },
     'supplier': {
         'invoice_model': PurchaseInvoice,
         'party_model': Supplier,
-        'credit_types': {'supplier_payment': 'payment',
-                         'supplier_credit_note': 'credit_note'},
-        'debit_types': {'supplier_debit_note': 'debit_note',
-                        'purchase_return_refund': 'refund'},
+        'credit_types': _pool_types('supplier', 'settles'),
+        'debit_types': _pool_types('supplier', 'adds'),
     },
 }
+
+# The entry kinds that are pool credit from a transaction (on-account money
+# and credit notes), as opposed to an opening balance or an overpayment.
+SETTLING_KINDS = frozenset(
+    kind for _, effect, kind in Transaction.PARTY_EFFECTS.values()
+    if effect == 'settles')
 
 LABELS = {
     'opening': 'Opening balance',
@@ -162,7 +171,7 @@ class Settlement:
         return [
             {**debt.as_dict(), 'applied': round(amount)}
             for credit, debt, amount in self.matches
-            if credit.kind in ('payment', 'credit_note')
+            if credit.kind in SETTLING_KINDS
             and credit.id == transaction_id
         ]
 

@@ -23,8 +23,7 @@ from .payments import INVOICE, allocate, settleable_items
 from .settlement import settlement_for_transaction
 
 # Pool credit: the types whose `settles` list means something.
-SETTLING_TYPES = (
-    Transaction.CREDIT_NOTE_TYPES + ['customer_receipt', 'supplier_payment'])
+SETTLING_TYPES = Transaction.party_types(effect='settles')
 
 
 # ── MoneyAccount ──────────────────────────────────────────────────────────────
@@ -420,10 +419,8 @@ class BaseTransactionWriteSerializer(serializers.ModelSerializer):
     # Which party each on-account money type names. Notes are checked in
     # _validate_note.
     ON_ACCOUNT_PARTY = {
-        'customer_receipt': 'customer',
-        'sales_return_refund': 'customer',
-        'supplier_payment': 'supplier',
-        'purchase_return_refund': 'supplier',
+        t: Transaction.PARTY_EFFECTS[t][0]
+        for t in Transaction.party_types(money_only=True)
     }
 
 
