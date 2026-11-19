@@ -21,6 +21,7 @@ MODULES = [
     'products',
     'customers',
     'suppliers',
+    'people',
     'locations',
     'expenses',
     'projects',
@@ -40,6 +41,7 @@ BUSINESS_CONFIG_MAP = {
     'products':      None,
     'customers':     None,
     'suppliers':     None,
+    'people':        None,
     'locations':     None,
     'expenses':      None,
 }

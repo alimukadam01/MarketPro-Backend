@@ -19,7 +19,9 @@ from .models import (
     Employee,
     EmployeeAccess,
     BusinessConfig,
+    Person,
 )
+from .new_records import OpeningBalanceSerializer
 from .utils import generate_sku, generate_variant_name
 from audit.helpers import audited_bulk_create, audited_bulk_update
 
@@ -601,6 +603,140 @@ class SimpleSupplierSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'name', 'business_name',
         ]
+
+
+# ── People ────────────────────────────────────────────────────────────────────
+
+PERSON_DETAIL_FIELDS = [
+    'name', 'phone', 'email', 'address', 'city', 'business_name', 'notes',
+]
+
+
+class PersonSerializer(serializers.ModelSerializer):
+    """
+    One row of the People list. Balances and last activity are worked out for
+    the whole page at once and passed in the context (root/people.py).
+    """
+
+    city = CitySerializer(read_only=True)
+    roles = serializers.SerializerMethodField()
+    receivable = serializers.SerializerMethodField()
+    payable = serializers.SerializerMethodField()
+    net = serializers.SerializerMethodField()
+    last_activity = serializers.SerializerMethodField()
+    is_walk_in = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Person
+        fields = [
+            'id', *PERSON_DETAIL_FIELDS, 'created_at', 'updated_at',
+            'roles', 'receivable', 'payable', 'net', 'last_activity', 'is_walk_in',
+        ]
+
+    def get_roles(self, person):
+        from .people import ROLES, role_of
+        roles = {}
+        for kind in ROLES:
+            role = role_of(person, kind)
+            roles[kind] = {'id': role.id, 'is_active': role.is_active} if role else None
+        return roles
+
+    def _sides(self, person):
+        return self.context.get('balances', {}).get(person.id) or {'receivable': 0, 'payable': 0}
+
+    def get_receivable(self, person):
+        return self._sides(person)['receivable']
+
+    def get_payable(self, person):
+        return self._sides(person)['payable']
+
+    def get_net(self, person):
+        sides = self._sides(person)
+        return sides['receivable'] - sides['payable']
+
+    def get_last_activity(self, person):
+        day = self.context.get('last_activity', {}).get(person.id)
+        return day.isoformat() if day else None
+
+    def get_is_walk_in(self, person):
+        from .people import is_walk_in
+        return is_walk_in(person)
+
+
+class PersonDetailSerializer(PersonSerializer):
+    """The person page: the list row plus each side's opening balance."""
+
+    opening_balances = serializers.SerializerMethodField()
+
+    class Meta(PersonSerializer.Meta):
+        fields = PersonSerializer.Meta.fields + ['opening_balances']
+
+    def get_opening_balances(self, person):
+        from .people import role_of
+        sides = {}
+        for kind, side in (('customer', 'receivable'), ('supplier', 'payable')):
+            role = role_of(person, kind)
+            opening = getattr(role, 'opening_balance', None) if role else None
+            sides[side] = ({'amount': opening.amount, 'as_of_date': opening.as_of_date.isoformat()}
+                           if opening else None)
+        return sides
+
+
+class PersonWriteSerializer(serializers.ModelSerializer):
+    """
+    Create a person, with roles and an opening balance per side, or edit
+    their details. Roles change through /people/<id>/roles/ afterwards.
+    """
+
+    city = serializers.PrimaryKeyRelatedField(
+        queryset=City.objects.all(), required=False, allow_null=True)
+    roles = serializers.ListField(
+        child=serializers.ChoiceField(choices=['customer', 'supplier']),
+        required=False, write_only=True)
+    opening_balances = serializers.DictField(
+        child=OpeningBalanceSerializer(allow_null=True), required=False, write_only=True)
+
+    class Meta:
+        model = Person
+        fields = PERSON_DETAIL_FIELDS + ['roles', 'opening_balances']
+
+    def validate_opening_balances(self, value):
+        unknown = set(value) - {'receivable', 'payable'}
+        if unknown:
+            raise serializers.ValidationError('Use receivable and payable only.')
+        return {side: entry for side, entry in value.items() if entry and entry.get('amount')}
+
+    def validate(self, attrs):
+        if self.instance is not None and ('roles' in attrs or 'opening_balances' in attrs):
+            raise serializers.ValidationError(
+                'Roles change through /people/<id>/roles/; opening balances on their own screen.')
+        roles = set(attrs.get('roles', []))
+        openings = attrs.get('opening_balances', {})
+        if 'receivable' in openings and 'customer' not in roles:
+            raise serializers.ValidationError(
+                {'opening_balances': 'A Receivable opening balance needs the customer role.'})
+        if 'payable' in openings and 'supplier' not in roles:
+            raise serializers.ValidationError(
+                {'opening_balances': 'A Payable opening balance needs the supplier role.'})
+        return attrs
+
+    def create(self, validated_data):
+        from accounts.models import PartyOpeningBalance
+        roles = validated_data.pop('roles', [])
+        openings = validated_data.pop('opening_balances', {})
+        business_id = self.context['business_id']
+        with transaction.atomic():
+            person = Person.objects.create(business_id=business_id, **validated_data)
+            made = {}
+            for kind, model in (('customer', Customer), ('supplier', Supplier)):
+                if kind in roles:
+                    made[kind] = model.objects.create(business_id=business_id, person=person)
+            for side, kind in (('receivable', 'customer'), ('payable', 'supplier')):
+                if side in openings:
+                    PartyOpeningBalance.objects.create(
+                        business_id=business_id, amount=openings[side]['amount'],
+                        as_of_date=openings[side]['as_of_date'], **{kind: made[kind]})
+        return person
 
 
 class BaseItemSerializer(serializers.Serializer):

@@ -388,6 +388,17 @@ class ProductKPIViewSet(GenericViewSet):
         }, status=status.HTTP_405_METHOD_NOT_ALLOWED)
 
 
+def only_active_in_lists(view, queryset):
+    """
+    The /customers/ and /suppliers/ lists feed the document pickers, so a
+    deactivated role drops out of them (register R4). It is still reachable
+    by id, and ?include_inactive=true lists everyone.
+    """
+    if view.action == 'list' and view.request.query_params.get('include_inactive') != 'true':
+        return queryset.filter(is_active=True)
+    return queryset
+
+
 def role_delete_refused(role):
     """
     Customers and suppliers are roles of a person and are never deleted on
@@ -428,8 +439,9 @@ class SupplierViewSet(ModelViewSet):
 
         # select_related: the serializer nests each supplier's business, and
         # reads its details from its person.
-        return (Supplier.objects.filter(business_id=business.id)
-                .select_related('business', 'person').order_by('person__name'))
+        queryset = (Supplier.objects.filter(business_id=business.id)
+                    .select_related('business', 'person').order_by('person__name'))
+        return only_active_in_lists(self, queryset)
 
     def get_serializer_context(self):
         business = get_active_business(self.request)
@@ -607,8 +619,9 @@ class CustomerViewSet(ModelViewSet):
 
         # select_related: the serializer nests each customer's city, which
         # is on its person.
-        return (Customer.objects.filter(business_id=business.id)
-                .select_related('person__city').order_by('person__name'))
+        queryset = (Customer.objects.filter(business_id=business.id)
+                    .select_related('person__city').order_by('person__name'))
+        return only_active_in_lists(self, queryset)
 
     def get_serializer_class(self):
         if self.action == 'list':

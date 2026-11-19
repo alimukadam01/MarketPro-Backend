@@ -193,6 +193,7 @@ class EmployeeAccess(models.Model):
         "products":      {"view": bool, "create": bool, "edit": bool, "delete": bool},
         "customers":     {"view": bool, "create": bool, "edit": bool, "delete": bool},
         "suppliers":     {"view": bool, "create": bool, "edit": bool, "delete": bool},
+        "people":        {"view": bool, "create": bool, "edit": bool, "delete": bool},
         "locations":     {"view": bool, "create": bool, "edit": bool, "delete": bool},
         "expenses":      {"view": bool, "create": bool, "edit": bool, "delete": bool},
         "projects":      {"view": bool, "create": bool, "edit": bool, "delete": bool},
@@ -210,6 +211,9 @@ class EmployeeAccess(models.Model):
         "products",
         "customers",
         "suppliers",
+        # The People list and person page; only `people.delete` deletes a
+        # person. customers / suppliers now cover each side of it.
+        "people",
         "locations",
         "expenses",
         "projects",

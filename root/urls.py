@@ -9,6 +9,7 @@ from .views import (
     ProductViewSet, EmailTestingView, ProductVariantViewSet, ProductVariantTypeViewSet, ProductFieldViewSet,
     EmployeeViewSet, EmployeePermissionsViewSet,
 )
+from .people_views import PersonViewSet
 
 router = DefaultRouter()
 router.register('business', BusinessViewSet, basename='business')
@@ -19,6 +20,7 @@ router.register('categories', CategoryViewSet)
 router.register('suppliers', SupplierViewSet, basename='suppliers')
 router.register('locations', LocationViewSet, basename='locations')
 router.register('customers', CustomerViewSet, basename='customers')
+router.register('people', PersonViewSet, basename='people')
 router.register('expenses', ExpenseViewSet, basename='expenses')
 router.register('product-variant-types', ProductVariantTypeViewSet, basename='product-variant-types')
 router.register('product-variants', ProductVariantViewSet, basename='product-variants')
