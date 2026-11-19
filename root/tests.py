@@ -26,7 +26,7 @@ class WalkInCustomerSignalTests(TestCase):
 
     def walk_ins_for(self, business):
         return Customer.objects.filter(
-            business=business, name=WALK_IN_CUSTOMER_NAME
+            business=business, person__name=WALK_IN_CUSTOMER_NAME
         )
 
     def test_new_business_gets_exactly_one_walk_in(self):

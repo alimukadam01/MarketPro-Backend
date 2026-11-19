@@ -234,7 +234,7 @@ class PurchaseInvoiceViewSet(PeriodFilterMixin, SettledInvoiceViewMixin, ModelVi
     # The column-backed fields are unchanged, declared in its Meta.
     filterset_class = PurchaseInvoiceFilter
     search_fields = [
-        'id', 'invoice_number', 'supplier__name', 'status',
+        'id', 'invoice_number', 'supplier__person__name', 'status',
         'sub_total', 'total', 'goods_received', 'delivery', 'notes',
         # A line's extra-field answers find its invoice.
         'invoice_items__extra_fields',
@@ -247,7 +247,7 @@ class PurchaseInvoiceViewSet(PeriodFilterMixin, SettledInvoiceViewMixin, ModelVi
 
         queryset = by_date_then_number(PurchaseInvoice.objects.filter(
             business_id=business.id
-        ).select_related('supplier').prefetch_related(
+        ).select_related('supplier__person').prefetch_related(
             'payment_receipts__transaction_record', 'invoice_items', 'projects'
         ))
         if self.action == 'retrieve':
@@ -667,7 +667,7 @@ class SalesInvoiceViewSet(PeriodFilterMixin, SettledInvoiceViewMixin, ModelViewS
     # anything with a "c" in it matched every completed invoice, and a search
     # for a customer called Dawood matched every draft.
     search_fields = [
-        'id', 'invoice_number', 'customer__name', 'sub_total', 'total', 'discount', 'tax', 'notes', 'created_by__email',
+        'id', 'invoice_number', 'customer__person__name', 'sub_total', 'total', 'discount', 'tax', 'notes', 'created_by__email',
         # A line's extra-field answers - the colour code - find its invoice.
         'invoice_items__extra_fields',
     ]
@@ -679,7 +679,7 @@ class SalesInvoiceViewSet(PeriodFilterMixin, SettledInvoiceViewMixin, ModelViewS
 
         queryset = by_date_then_number(SalesInvoice.objects.filter(
             business_id=business.id
-        ).select_related('customer__city').prefetch_related(
+        ).select_related('customer__person__city').prefetch_related(
             'payment_receipts__transaction_record', 'invoice_items', 'projects'
         ))
         if self.action == 'retrieve':
@@ -1493,7 +1493,7 @@ class PurchaseQuotationViewSet(ModelViewSet):
     # on a timestamp matched almost everything. Status is a filter instead.
     search_fields = [
         'id', 'quotation_no', 'notes', 'items__product__name',
-        'items__product__base__name', 'items__supplier__name',
+        'items__product__base__name', 'items__supplier__person__name',
     ]
 
     def get_queryset(self):
@@ -1622,7 +1622,7 @@ class PurchaseQuotationItemViewSet(ModelViewSet):
     # parked in a string; these are the quotation item's own.
     filterset_fields = ['supplier', 'is_fulfilled', 'product']
     search_fields = [
-        'id', 'product__name', 'product__base__name', 'supplier__name', 'track_code', 'notes',
+        'id', 'product__name', 'product__base__name', 'supplier__person__name', 'track_code', 'notes',
     ]
 
     def get_queryset(self):

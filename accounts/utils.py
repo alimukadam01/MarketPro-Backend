@@ -245,9 +245,12 @@ def _khaata_sides(business_id):
     Four queries per party kind, however many parties.
     """
     receivable, payable = [], []
+    # select_related: each row reads its name and phone from the person.
     kinds = (
-        ('customer', Customer.objects.filter(business_id=business_id)),
-        ('supplier', Supplier.objects.filter(business_id=business_id)),
+        ('customer', Customer.objects.filter(business_id=business_id)
+         .select_related('person')),
+        ('supplier', Supplier.objects.filter(business_id=business_id)
+         .select_related('person')),
     )
     for kind, parties in kinds:
         settled = settle_parties(business_id, kind)
@@ -380,7 +383,7 @@ def uncleared_opening_balances(business_id, party):
         PartyOpeningBalance.objects
         .filter(business_id=business_id, amount__gt=0)
         .exclude(**{f'{party}__isnull': True})
-        .select_related(party)
+        .select_related(f'{party}__person')
     )
     party_ids = [getattr(opening, f'{party}_id') for opening in openings]
     settlements = settle_parties(business_id, party, party_ids)

@@ -86,7 +86,7 @@ MASKED_AMOUNT_FIELDS = {
     "accounts.Transaction": ("amount",),
     "accounts.PartyOpeningBalance": ("amount",),
     "root.Expense": ("amount",),
-    "root.Customer": ("total_sales",),
+
     "sales.SalesInvoice": ("sub_total", "total"),
     "sales.SalesInvoiceItem": ("unit_price",),
     "sales.PurchaseInvoice": ("sub_total", "total"),

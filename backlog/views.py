@@ -44,7 +44,7 @@ def _entries(request):
                               'outputs__product__unit',
                               'outputs__inventory_item__product__base',
                               'outputs__inventory_item__location',
-                              'new_records__customer__city', 'new_records__customer__opening_balance',
+                              'new_records__customer__person__city', 'new_records__customer__opening_balance',
                               'new_records__supplier__opening_balance', 'new_records__product__unit',
                               'new_records__product__variants', 'new_records__variant__base'))
 
@@ -274,7 +274,7 @@ class GlossaryViewSet(GenericViewSet):
     def get_queryset(self):
         business = get_active_business(self.request)
         return (GlossaryEntry.objects.filter(business_id=business.id).current()
-                .select_related('customer', 'supplier', 'product').order_by('term'))
+                .select_related('customer__person', 'supplier__person', 'product').order_by('term'))
 
     def list(self, request):
         business = get_active_business(request)
@@ -322,7 +322,7 @@ class GlossarySuggestionViewSet(mixins.ListModelMixin, GenericViewSet):
         business = get_active_business(self.request)
         return (GlossarySuggestion.objects
                 .filter(business_id=business.id, status=GlossarySuggestion.PENDING)
-                .select_related('suggested_by', 'customer', 'supplier', 'product')
+                .select_related('suggested_by', 'customer__person', 'supplier__person', 'product')
                 .order_by('created_at'))
 
     @action(['POST'], detail=True, url_path='approve', url_name='approve')

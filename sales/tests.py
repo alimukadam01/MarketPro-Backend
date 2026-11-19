@@ -193,7 +193,7 @@ class CaptureWalkInCustomerTests(TestCase):
         )
         # Created by root.signals.createWalkInCustomer.
         cls.walk_in = Customer.objects.get(
-            business=cls.business, name=WALK_IN_CUSTOMER_NAME
+            business=cls.business, person__name=WALK_IN_CUSTOMER_NAME
         )
         cls.invoice = SalesInvoice.objects.create(
             business=cls.business, customer=cls.walk_in,
@@ -280,7 +280,7 @@ class CaptureWalkInCustomerTests(TestCase):
         other_invoice = SalesInvoice.objects.create(
             business=other_business,
             customer=Customer.objects.get(
-                business=other_business, name=WALK_IN_CUSTOMER_NAME),
+                business=other_business, person__name=WALK_IN_CUSTOMER_NAME),
             created_by=other_user, status="C", total=500,
         )
 
@@ -350,7 +350,7 @@ class RepeatedProductOnSalesInvoiceTests(TestCase):
             phone="03001234567", is_active=True,
         )
         cls.customer = Customer.objects.get(
-            business=cls.business, name=WALK_IN_CUSTOMER_NAME
+            business=cls.business, person__name=WALK_IN_CUSTOMER_NAME
         )
         cls.unit = Unit.objects.create(name="Pieces", abv="Pcs")
         cls.product = Product.objects.create(
@@ -464,7 +464,7 @@ class DerivedSalesInvoiceStatusTests(TestCase):
             phone="03001234567", is_active=True,
         )
         cls.customer = Customer.objects.get(
-            business=cls.business, name=WALK_IN_CUSTOMER_NAME
+            business=cls.business, person__name=WALK_IN_CUSTOMER_NAME
         )
         cls.unit = Unit.objects.create(name="Litres", abv="L")
         cls.product = Product.objects.create(
@@ -811,7 +811,7 @@ class SalesInvoiceExtraChargesTests(TestCase):
             phone="03001234567", is_active=True,
         )
         cls.customer = Customer.objects.get(
-            business=cls.business, name=WALK_IN_CUSTOMER_NAME
+            business=cls.business, person__name=WALK_IN_CUSTOMER_NAME
         )
         cls.unit = Unit.objects.create(name="Gallons", abv="Gal")
         cls.product = Product.objects.create(
@@ -1054,8 +1054,8 @@ class SalesInvoiceExtraChargesTests(TestCase):
 
     def test_the_charges_reach_the_whatsapp_message(self):
         invoice = self.post("CHG-23", [{"label": "Delivery", "amount": 500}])
-        self.customer.phone = "03001234567"
-        self.customer.save(update_fields=["phone"])
+        self.customer.person.phone = "03001234567"
+        self.customer.person.save(update_fields=["phone"])
         invoice.refresh_from_db()
 
         payload = build_whatsapp_payload(invoice)
@@ -1115,7 +1115,7 @@ class InvoiceImageTests(TestCase):
             phone="03001234567", is_active=True,
         )
         cls.customer = Customer.objects.get(
-            business=cls.business, name=WALK_IN_CUSTOMER_NAME
+            business=cls.business, person__name=WALK_IN_CUSTOMER_NAME
         )
         cls.supplier = Supplier.objects.create(
             business=cls.business, name="Imaged Supply Co"
@@ -1192,7 +1192,7 @@ class InvoiceImageTests(TestCase):
         other_invoice = SalesInvoice.objects.create(
             business=other_business,
             customer=Customer.objects.get(
-                business=other_business, name=WALK_IN_CUSTOMER_NAME),
+                business=other_business, person__name=WALK_IN_CUSTOMER_NAME),
             created_by=other_user, invoice_number="OTHER-1")
 
         response = self.client.post(
@@ -1245,7 +1245,7 @@ class InvoiceImageTests(TestCase):
         other_invoice = SalesInvoice.objects.create(
             business=other_business,
             customer=Customer.objects.get(
-                business=other_business, name=WALK_IN_CUSTOMER_NAME),
+                business=other_business, person__name=WALK_IN_CUSTOMER_NAME),
             created_by=other_user, invoice_number="OTHER-2")
 
         response = self.client.post(
@@ -1312,7 +1312,7 @@ class PaymentImageTests(TestCase):
             phone="03001234567", is_active=True,
         )
         cls.customer = Customer.objects.get(
-            business=cls.business, name=WALK_IN_CUSTOMER_NAME
+            business=cls.business, person__name=WALK_IN_CUSTOMER_NAME
         )
         cls.invoice = SalesInvoice.objects.create(
             business=cls.business, customer=cls.customer,
@@ -1391,7 +1391,7 @@ class SalesInvoiceChargeExpenseTests(TestCase):
         )
         BusinessConfig.objects.create(business=cls.business, accounting=True)
         cls.customer = Customer.objects.get(
-            business=cls.business, name=WALK_IN_CUSTOMER_NAME
+            business=cls.business, person__name=WALK_IN_CUSTOMER_NAME
         )
         cls.unit = Unit.objects.create(name="Drums", abv="Drm")
         cls.product = Product.objects.create(
@@ -1833,7 +1833,7 @@ class SalesLineQuantityIncreaseTests(TestCase):
             phone="03001234567", is_active=True,
         )
         cls.customer = Customer.objects.get(
-            business=cls.business, name=WALK_IN_CUSTOMER_NAME
+            business=cls.business, person__name=WALK_IN_CUSTOMER_NAME
         )
         cls.unit = Unit.objects.create(name="Buckets", abv="Bkt")
         cls.product = Product.objects.create(
@@ -1976,7 +1976,7 @@ class AutomaticRefundTests(TestCase):
         )
         BusinessConfig.objects.create(business=cls.business, accounting=True)
         cls.customer = Customer.objects.get(
-            business=cls.business, name=WALK_IN_CUSTOMER_NAME
+            business=cls.business, person__name=WALK_IN_CUSTOMER_NAME
         )
         cls.supplier = Supplier.objects.create(
             business=cls.business, name="Refund Supply Co"
@@ -2469,7 +2469,7 @@ class SalesLineReAddedOnUpdateTests(TestCase):
             phone="03001234567", is_active=True,
         )
         cls.customer = Customer.objects.get(
-            business=cls.business, name=WALK_IN_CUSTOMER_NAME
+            business=cls.business, person__name=WALK_IN_CUSTOMER_NAME
         )
         cls.unit = Unit.objects.create(name="Tins", abv="Tin")
         cls.product = Product.objects.create(

@@ -133,32 +133,61 @@ class SimpleBusinessSerializer(serializers.ModelSerializer):
         fields = ['id', 'name', 'logo']
 
 
-class CustomerSerializer(serializers.ModelSerializer):
+def _detail_text(field, **kwargs):
+    """An optional text detail read from and written to the role's person."""
+    return field(source=f'person.{kwargs.pop("name")}', required=False,
+                 allow_null=True, allow_blank=True, **kwargs)
 
-    business = SimpleBusinessSerializer(read_only=True)
-    total_sales = serializers.FloatField(read_only=True)
 
-    class Meta:
-        model = Customer
-        fields = [
-            'id', 'name', 'business', 'phone', 'email',
-            'address', 'city', 'created_at', 'updated_at',
-            'notes', 'total_sales'
-        ]
+class RoleDetailsMixin:
+    """
+    For a Customer or Supplier serializer whose detail fields come from the
+    role's Person (fields with source='person.<detail>'). The API is the same
+    as when the details lived on the role: same names, same rules. Creating
+    makes the person (RoleManager.create); updating writes to it.
+    """
 
     def create(self, validated_data):
-        return Customer.objects.create(
+        details = validated_data.pop('person', {})
+        return self.Meta.model.objects.create(
             business_id=self.context['business_id'],
-            **self.validated_data
+            **details, **validated_data
         )
 
     def update(self, instance, validated_data):
+        details = validated_data.pop('person', {})
+        if details:
+            for attr, value in details.items():
+                setattr(instance.person, attr, value)
+            instance.person.save()
 
         for attr, value in validated_data.items():
             setattr(instance, attr, value)
 
         instance.save()
         return instance
+
+
+class CustomerSerializer(RoleDetailsMixin, serializers.ModelSerializer):
+
+    business = SimpleBusinessSerializer(read_only=True)
+    name = serializers.CharField(source='person.name', max_length=256)
+    phone = _detail_text(serializers.CharField, name='phone', max_length=256)
+    email = serializers.EmailField(source='person.email', required=False,
+                                   allow_null=True, allow_blank=True)
+    address = _detail_text(serializers.CharField, name='address')
+    # Required for customers, as it always was (register S5).
+    city = serializers.PrimaryKeyRelatedField(
+        source='person.city', queryset=City.objects.all())
+    notes = _detail_text(serializers.CharField, name='notes')
+
+    class Meta:
+        model = Customer
+        fields = [
+            'id', 'name', 'business', 'phone', 'email',
+            'address', 'city', 'created_at', 'updated_at',
+            'notes'
+        ]
 
 
 class CaptureCustomerSerializer(CustomerSerializer):
@@ -170,12 +199,17 @@ class CaptureCustomerSerializer(CustomerSerializer):
     WhatsApp to this number the moment it saves.
     """
 
-    phone = serializers.CharField(required=True, allow_blank=False)
+    phone = serializers.CharField(source='person.phone', max_length=256,
+                                  required=True, allow_blank=False)
 
 
 class SimpleCustomerSerializer(serializers.ModelSerializer):
 
-    city = CitySerializer()
+    name = serializers.CharField(source='person.name', read_only=True)
+    phone = serializers.CharField(source='person.phone', read_only=True)
+    email = serializers.EmailField(source='person.email', read_only=True)
+    address = serializers.CharField(source='person.address', read_only=True)
+    city = CitySerializer(source='person.city', read_only=True)
 
     class Meta:
         model = Customer
@@ -538,9 +572,16 @@ class ProductAndVariantCreateSerializer(FieldLinksMixin, serializers.ModelSerial
         fields = ['id', 'name', 'desc', 'unit', 'variants', 'field_links']
 
 
-class SupplierSerializer(serializers.ModelSerializer):
+class SupplierSerializer(RoleDetailsMixin, serializers.ModelSerializer):
 
     business = SimpleBusinessSerializer(read_only=True)
+    name = serializers.CharField(source='person.name', max_length=256)
+    business_name = _detail_text(
+        serializers.CharField, name='business_name', max_length=256)
+    phone = _detail_text(serializers.CharField, name='phone', max_length=256)
+    email = serializers.EmailField(source='person.email', required=False,
+                                   allow_null=True, allow_blank=True)
+    notes = _detail_text(serializers.CharField, name='notes')
 
     class Meta:
         model = Supplier
@@ -548,15 +589,12 @@ class SupplierSerializer(serializers.ModelSerializer):
             'id', 'business', 'name', 'business_name', 'phone', 'email', 'notes'
         ]
 
-    def create(self, validated_data):
-
-        return Supplier.objects.create(
-            business_id=self.context['business_id'],
-            **self.validated_data
-        )
-
 
 class SimpleSupplierSerializer(serializers.ModelSerializer):
+
+    name = serializers.CharField(source='person.name', read_only=True)
+    business_name = serializers.CharField(
+        source='person.business_name', read_only=True)
 
     class Meta:
         model = Supplier

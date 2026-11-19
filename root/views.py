@@ -388,11 +388,25 @@ class ProductKPIViewSet(GenericViewSet):
         }, status=status.HTTP_405_METHOD_NOT_ALLOWED)
 
 
+def role_delete_refused(role):
+    """
+    Customers and suppliers are roles of a person and are never deleted on
+    their own: a role is deactivated, and only a person is deleted, after the
+    user has seen everything that goes with them (People, register R13, S1).
+    """
+    return Response({
+        'detail': f'A {role} cannot be deleted. Deactivate the {role} role '
+                  'instead, or delete the person from People, which lists '
+                  'everything that will be deleted with them first.'
+    }, status=status.HTTP_405_METHOD_NOT_ALLOWED)
+
+
 class SupplierViewSet(ModelViewSet):
 
     filter_backends = [SearchFilter]
     search_fields = [
-        'id', 'name', 'business_name', 'phone', 'email', 'notes'
+        'id', 'person__name', 'person__business_name', 'person__phone',
+        'person__email', 'person__notes'
     ]
 
     serializer_class = SupplierSerializer
@@ -412,9 +426,10 @@ class SupplierViewSet(ModelViewSet):
         if not business:
             return []
 
-        # select_related: the serializer nests each supplier's business.
+        # select_related: the serializer nests each supplier's business, and
+        # reads its details from its person.
         return (Supplier.objects.filter(business_id=business.id)
-                .select_related('business').order_by('name'))
+                .select_related('business', 'person').order_by('person__name'))
 
     def get_serializer_context(self):
         business = get_active_business(self.request)
@@ -425,26 +440,12 @@ class SupplierViewSet(ModelViewSet):
             'business_id': business.id,
         }
 
+    def destroy(self, request, *args, **kwargs):
+        return role_delete_refused('supplier')
+
     @action(['POST'], detail=False, url_path='bulk-delete', url_name='bulk-delete')
     def bulk_delete(self, request):
-
-        supplier_ids = request.data.get('supplier_ids', [])
-        if not supplier_ids:
-            return Response({
-                'detail': 'Bad Request.'
-            }, status=status.HTTP_400_BAD_REQUEST)
-
-        try:
-            Supplier.objects.filter(id__in=supplier_ids).delete()
-            return Response({
-                'detail': 'Success.'
-            }, status=status.HTTP_200_OK)
-
-        except Exception as error:
-            print(error)
-            return Response({
-                'detail': 'Internal Server Error.'
-            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        return role_delete_refused('supplier')
 
     ### the money picture for one supplier, for the detail screen cards
     @action(['GET'], detail=True, url_path='summary', url_name='summary')
@@ -585,7 +586,8 @@ class CustomerViewSet(ModelViewSet):
     filter_backends = [SearchFilter, DjangoFilterBackend]
     filterset_class = CustomerFilter
     search_fields = [
-        'id', 'name', 'phone', 'email', 'address', 'city__name'
+        'id', 'person__name', 'person__phone', 'person__email',
+        'person__address', 'person__city__name'
     ]
 
     @action(['POST'], detail=False, url_path='create-with-balance', url_name='create-with-balance')
@@ -603,9 +605,10 @@ class CustomerViewSet(ModelViewSet):
         if not business:
             return []
 
-        # select_related: the serializer nests each customer's city.
+        # select_related: the serializer nests each customer's city, which
+        # is on its person.
         return (Customer.objects.filter(business_id=business.id)
-                .select_related('city').order_by('name'))
+                .select_related('person__city').order_by('person__name'))
 
     def get_serializer_class(self):
         if self.action == 'list':
@@ -621,26 +624,12 @@ class CustomerViewSet(ModelViewSet):
             'business_id': business.id
         }
 
+    def destroy(self, request, *args, **kwargs):
+        return role_delete_refused('customer')
+
     @action(['POST'], detail=False, url_path='bulk-delete', url_name='bulk-delete')
     def bulk_delete(self, request):
-
-        customer_ids = request.data.get('customer_ids', [])
-        if not customer_ids:
-            return Response({
-                'detail': 'Bad Request.'
-            }, status=status.HTTP_400_BAD_REQUEST)
-
-        try:
-            Customer.objects.filter(id__in=customer_ids).delete()
-            return Response({
-                'detail': 'Success.'
-            }, status=status.HTTP_200_OK)
-
-        except Exception as error:
-            print(error)
-            return Response({
-                'detail': 'Internal Server Error.'
-            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        return role_delete_refused('customer')
 
     ### the money picture for one customer, for the detail screen cards
     @action(['GET'], detail=True, url_path='summary', url_name='summary')

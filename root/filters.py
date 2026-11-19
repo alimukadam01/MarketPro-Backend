@@ -128,13 +128,13 @@ class MultiModelSearchEngine:
 GlobalSearch = MultiModelSearchEngine()
 GlobalSearch.set_models({
     SalesInvoice: [
-        'id', 'invoice_number', 'customer__name', 'status', 'sub_total', 'total', 'discount', 'tax', 'notes', 'created_by__email'
+        'id', 'invoice_number', 'customer__person__name', 'status', 'sub_total', 'total', 'discount', 'tax', 'notes', 'created_by__email'
     ],
     SalesInvoiceItem: [
         'id', 'sales_invoice__id', 'sales_invoice__invoice_number', 'product__name', 'product__base__name', 'track_code', 'quantity_received', 'unit_price', 'discount'
     ],
     PurchaseInvoice: [
-        'id', 'invoice_number', 'supplier__name', 'status',
+        'id', 'invoice_number', 'supplier__person__name', 'status',
         'sub_total', 'total', 'goods_received', 'delivery', 'notes'
     ],
     PurchaseInvoiceItem: [
@@ -151,10 +151,12 @@ GlobalSearch.set_models({
         'id', 'base__name', 'name', 'desc', 'unit__name'
     ],
     Customer: [
-        'id', 'name', 'phone', 'email', 'address', 'city__name'
+        'id', 'person__name', 'person__phone', 'person__email',
+        'person__address', 'person__city__name'
     ],
     Supplier: [
-        'id', 'name', 'business_name', 'phone', 'email', 'notes'
+        'id', 'person__name', 'person__business_name', 'person__phone',
+        'person__email', 'person__notes'
     ],
     Location: [
         'id', 'name', 'address'
