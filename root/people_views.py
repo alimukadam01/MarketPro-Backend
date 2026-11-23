@@ -2,6 +2,7 @@
 /people/: one record per person, with their roles and both sides of their
 khaata (register #29). The rules live in root/people.py.
 """
+from accounts.settlement import settle_person_sides
 from rest_framework import status
 from rest_framework.decorators import action
 from rest_framework.filters import SearchFilter
@@ -37,8 +38,8 @@ class PersonViewSet(ModelViewSet):
             return Person.objects.none()
 
         queryset = (Person.objects.filter(business_id=business.id)
-                    .select_related('city', 'customer', 'supplier', 'customer__opening_balance',
-                                    'supplier__opening_balance')
+                    .select_related('city', 'customer', 'supplier')
+                    .prefetch_related('opening_balances')
                     .order_by('name', 'id'))
 
         params = self.request.query_params
@@ -99,6 +100,9 @@ class PersonViewSet(ModelViewSet):
 
     def _detail(self, business, person, code=status.HTTP_200_OK):
         context = self._with_money(business, [person])
+        sides = settle_person_sides(business.id, [person.id]).get(person.id) or {}
+        context['role_balances'] = {
+            kind: round(khaata.balance) for kind, khaata in sides.items() if khaata is not None}
         return Response(PersonDetailSerializer(person, context=context).data, status=code)
 
     def retrieve(self, request, *args, **kwargs):

@@ -16,8 +16,16 @@ The user enters an amount and may tick invoices. Two rules shape this module:
 The opening balance is therefore never ticked: on-account money reaches it
 first anyway.
 
-So one payment becomes one transaction per ticked invoice plus at most one
-on-account transaction. They are written together or not at all, named
+The sides are the person's (register #25): Payable is everything the
+business owes them, which can include a customer's advance, and Receivable
+everything they owe, which can include money a supplier holds. So before
+going on account, the payment first pays back that other khaata's advance,
+as a refund on it: 'You pay' refunds a customer's advance, '<name> pays you'
+collects what a supplier holds. A person without the role for the payment's
+own side can still be paid back an advance this way, up to the advance.
+
+So one payment becomes one transaction per ticked invoice, at most one refund
+of the other side's advance, and at most one on-account transaction. They are written together or not at all, named
 payments first - each is checked against its invoice's room, which the
 on-account part would otherwise shrink - and they share a payment_group so the
 rest of the system can treat them as the single payment they are.
@@ -27,13 +35,17 @@ import uuid
 
 from django.db import transaction as db_transaction
 
+from rest_framework import serializers
+
 from root.models import Customer, Supplier
 from sales.models import PurchaseInvoice, SalesInvoice
 from sales.utils import invoice_room
 
 from .models import Transaction
-from .settlement import LABELS, attach_settlement, settle_parties
-from .utils import NOT_A_DEBT_PURCHASE_STATUSES, NOT_A_DEBT_SALES_STATUSES
+from .settlement import LABELS, attach_settlement, settle_parties, settle_party
+from .utils import (
+    NOT_A_DEBT_PURCHASE_STATUSES, NOT_A_DEBT_SALES_STATUSES, party_effect_totals,
+)
 
 
 ON_ACCOUNT = 'on_account'
@@ -56,6 +68,36 @@ ITEM_TYPES = {
 # The write-only picker field on TransactionCreateSerializer for each party's
 # invoices.
 INVOICE_FIELDS = {'customer': 'sales_invoice', 'supplier': 'purchase_invoice'}
+
+# The other khaata's advance a payment pays back first, and the refund that
+# does it: paying a person ('supplier' side) refunds their customer advance;
+# being paid ('customer' side) collects what their supplier role holds.
+ADVANCE = 'advance'
+ADVANCE_REFUND = {
+    'customer': ('supplier', 'purchase_return_refund'),
+    'supplier': ('customer', 'sales_return_refund'),
+}
+
+
+def other_side_advance(business_id, party, person):
+    """
+    (role_id, room): the person's other role and how far its khaata runs past
+    zero - the advance this payment can pay back - less any refund of it
+    already waiting in a pending cheque. (None, 0) when there is none.
+    """
+    from root.people import role_of
+
+    other_kind, _ = ADVANCE_REFUND[party]
+    role = role_of(person, other_kind) if person is not None else None
+    if role is None:
+        return None, 0
+    advance = max(-round(settle_party(business_id, other_kind, role.id).balance), 0)
+    if advance:
+        _, pending = party_effect_totals(
+            business_id, {f'person__{other_kind}__id': role.id}, other_kind,
+            statuses=('PEN',), money_only=True)
+        advance = max(advance - round(pending), 0)
+    return role.id, advance
 
 
 def _invoice_queryset(business_id, party, party_id):
@@ -197,7 +239,8 @@ def allocate(items, amount, order='oldest'):
 
 
 def record_party_payment(business_id, user_id, party, party_id, amount,
-                         item_ids, money_details, context, order='oldest'):
+                         item_ids, money_details, context, order='oldest',
+                         person=None):
     """
     Write one payment atomically: one transaction per ticked invoice it
     reaches, then one on-account transaction for whatever is left.
@@ -208,13 +251,20 @@ def record_party_payment(business_id, user_id, party, party_id, amount,
     split, the group id and the all-or-nothing boundary.
 
     `item_ids` is the list of {kind, id} the user ticked, possibly empty.
-    Returns the created transactions, named ones in allocation order, the
-    on-account one last.
+    `party_id` may be None when the person has no role on this side; then
+    only the other side's advance can be paid back. Returns the created
+    transactions, named ones in allocation order, then the refund of the
+    other side's advance, the on-account one last.
     """
     from .serializers import TransactionCreateSerializer
 
-    available = {(item['kind'], item['id']): item
-                 for item in settleable_items(business_id, party, party_id)}
+    if person is None and party_id is not None:
+        Role = Customer if party == 'customer' else Supplier
+        person = Role.objects.select_related('person').get(pk=party_id).person
+
+    available = ({(item['kind'], item['id']): item
+                  for item in settleable_items(business_id, party, party_id)}
+                 if party_id is not None else {})
 
     chosen = []
     for ref in item_ids:
@@ -229,7 +279,16 @@ def record_party_payment(business_id, user_id, party, party_id, amount,
     # and the on-account part, once written, would reach the oldest invoices
     # and shrink that room.
     parts = [(item['kind'], item['id'], applied) for item, applied in applied_rows]
+    advance_role, advance_room = other_side_advance(business_id, party, person)
+    refund = min(left, advance_room)
+    if refund > 0:
+        parts.append((ADVANCE, advance_role, refund))
+        left -= refund
     if left > 0:
+        if party_id is None:
+            raise serializers.ValidationError({'amount': (
+                f'Only {advance_room:,} can be paid here, the advance on the other '
+                f'side. Add the {party} role to record more.')})
         parts.append((ON_ACCOUNT, party_id, left))
     person_id = None
     if any(kind == LOAN for kind, _, _ in parts):
@@ -251,6 +310,10 @@ def record_party_payment(business_id, user_id, party, party_id, amount,
                 payload['type'] = Transaction.LOAN_REPAID_BY[LOAN_TYPE[party]]
                 payload['person'] = person_id
                 payload['loan'] = target_id
+            elif kind == ADVANCE:
+                other_kind, refund_type = ADVANCE_REFUND[party]
+                payload['type'] = refund_type
+                payload[other_kind] = target_id
             elif kind == ON_ACCOUNT:
                 payload['type'] = types[kind]
                 payload[party] = target_id

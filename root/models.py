@@ -317,6 +317,18 @@ class PersonDetails:
     business_name = property(lambda self: self.person.business_name)
     notes = property(lambda self: self.person.notes)
 
+    @property
+    def opening_balance(self):
+        """
+        The person's opening balances that count on this role's khaata,
+        netted (accounts.models.OpeningNet), or None. Reads
+        person.opening_balances, so prefetch it for a list.
+        """
+        from accounts.models import OpeningNet
+        kind = self._meta.model_name
+        return OpeningNet.of(
+            row for row in self.person.opening_balances.all() if row.kind == kind)
+
 
 class CustomerQuerySet(BaseQuerySet):
     pass

@@ -18,9 +18,9 @@ from root.utils import get_active_business, whatsapp_number
 from sales.models import PurchaseReceipt, SalesInvoice, SalesReceipt
 from sales.utils import sync_charge_expenses
 from .filters import TransactionFilter
-from .models import MoneyAccount, PartyOpeningBalance, Transaction
+from .models import MoneyAccount, OpeningNet, PartyOpeningBalance, Transaction
 from .payments import (
-    record_party_payment, resolve_party,
+    ADVANCE_REFUND, other_side_advance, record_party_payment, resolve_party,
     settleable_items as party_settleable_items,
 )
 from .permissions import HasAccountingAccess
@@ -359,6 +359,7 @@ class TransactionViewSet(PeriodFilterMixin, ModelViewSet):
             money_details=serializer.money_details(),
             context=context,
             order=serializer.validated_data['order'],
+            person=serializer.validated_data['person'],
         )
 
         return Response(
@@ -700,7 +701,7 @@ class PartyOpeningBalanceViewSet(ModelViewSet):
     permission_classes = [IsAuthenticated, HasAccountingAccess]
     serializer_class = PartyOpeningBalanceSerializer
     filter_backends = [SearchFilter, DjangoFilterBackend]
-    filterset_fields = ['customer', 'supplier']
+    filterset_fields = ['person', 'side']
     search_fields = ['id', 'amount']
 
     def get_queryset(self):
@@ -842,16 +843,45 @@ class AccountingKPIViewSet(GenericViewSet):
         if guard_error:
             return guard_error
 
-        party, party_id = resolve_party(
-            business.id,
-            customer_id=request.query_params.get('customer_id'),
-            supplier_id=request.query_params.get('supplier_id'),
-        )
-        if not party:
-            return Response({'detail': 'Not Found'},
-                            status=status.HTTP_404_NOT_FOUND)
+        # ?person_id=&direction=in|out also works for someone without the
+        # role on that side: only the other side's advance is then on offer.
+        params = request.query_params
+        person = None
+        if params.get('person_id') and params.get('direction') in ('in', 'out'):
+            from root.people import role_of
+            person = Person.objects.filter(
+                pk=params['person_id'], business_id=business.id).first()
+            if person is None:
+                return Response({'detail': 'Not Found'},
+                                status=status.HTTP_404_NOT_FOUND)
+            party = 'customer' if params['direction'] == 'in' else 'supplier'
+            role = role_of(person, party)
+            party_id = role.id if role else None
+        else:
+            party, party_id = resolve_party(
+                business.id,
+                customer_id=params.get('customer_id'),
+                supplier_id=params.get('supplier_id'),
+            )
+            if not party:
+                return Response({'detail': 'Not Found'},
+                                status=status.HTTP_404_NOT_FOUND)
+            Role = Customer if party == 'customer' else Supplier
+            person = Role.objects.select_related('person').get(pk=party_id).person
 
         try:
+            advance_role, advance_room = other_side_advance(business.id, party, person)
+            advance = {'kind': ADVANCE_REFUND[party][0], 'role_id': advance_role,
+                       'room': advance_room}
+            if party_id is None:
+                return Response({
+                    'items': [],
+                    'opening_balance': {'amount': 0, 'settled': 0, 'remaining': 0,
+                                        'room': 0, 'as_of_date': None},
+                    'advance': advance,
+                    'has_role': False,
+                }, status=status.HTTP_200_OK)
+
             opening, settled, remaining = opening_balance_remaining(
                 business.id, party, party_id)
             _, _, room = opening_balance_remaining(
@@ -861,19 +891,21 @@ class AccountingKPIViewSet(GenericViewSet):
             # today. Without it the form fell back to today's date, so the card
             # misreported when the balance was taken and re-saving silently
             # moved it forward.
-            row = PartyOpeningBalance.objects.filter(
-                business_id=business.id, **{f'{party}_id': party_id}).first()
+            row = OpeningNet.of(
+                PartyOpeningBalance.objects
+                .filter(business_id=business.id).of_role(party, party_id))
 
             return Response({
                 'items': party_settleable_items(business.id, party, party_id),
                 'opening_balance': {
-                    'id': row.id if row else None,
                     'amount': opening,
                     'settled': settled,
                     'remaining': remaining,
                     'room': room,
                     'as_of_date': row.as_of_date.isoformat() if row else None,
                 },
+                'advance': advance,
+                'has_role': True,
             }, status=status.HTTP_200_OK)
         except Exception as error:
             print(error)

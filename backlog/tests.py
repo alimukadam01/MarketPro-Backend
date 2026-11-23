@@ -627,7 +627,7 @@ class NewRecordsTests(BacklogFixture):
         customer = Customer.objects.get(pk=response.json()['id'])
         self.assertEqual(response.json(), {'id': customer.id, 'label': 'Shafiq Ahmed'})
         self.assertEqual((customer.business, customer.city), (self.business, self.city))
-        self.assertFalse(PartyOpeningBalance.objects.filter(customer=customer).exists())
+        self.assertFalse(PartyOpeningBalance.objects.filter(person=customer.person).exists())
 
     def test_a_new_supplier_from_a_backlog_page(self):
         from accounts.models import PartyOpeningBalance
@@ -637,7 +637,7 @@ class NewRecordsTests(BacklogFixture):
             'opening_balance': {'amount': 3000, 'as_of_date': '2019-01-01'}}, format='json')
         self.assertEqual(response.status_code, 201, response.content)
         self.assertEqual(response.json()['label'], 'Nippon (Nippon Paint Pakistan)')
-        self.assertFalse(PartyOpeningBalance.objects.filter(supplier_id=response.json()['id']).exists())
+        self.assertFalse(PartyOpeningBalance.objects.filter(person__supplier__id=response.json()['id']).exists())
 
     def test_products_are_not_created_from_an_invoice(self):
         """Only a stock page makes products; the invoice screens' endpoints
@@ -747,7 +747,7 @@ class NewRecordsTests(BacklogFixture):
             'name': 'Walk-in Builders', 'city': self.city.id,
             'opening_balance': {'amount': 750, 'as_of_date': '2026-01-01'}}, format='json')
         self.assertEqual(customer.status_code, 201, customer.content)
-        self.assertEqual(PartyOpeningBalance.objects.get(customer_id=customer.json()['id']).amount, 750)
+        self.assertEqual(PartyOpeningBalance.objects.get(person__customer__id=customer.json()['id']).amount, 750)
 
         supplier = owner.post('/suppliers/create-with-balance/', {'name': 'Nippon'}, format='json')
         self.assertEqual((supplier.status_code, supplier.json()['label']), (201, 'Nippon'))

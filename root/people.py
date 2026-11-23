@@ -370,12 +370,13 @@ def merge(kept, other, name=None, phone=None):
         raise PeopleError('These people belong to different businesses.')
     if is_walk_in(kept) or is_walk_in(other):
         raise PeopleError('The walk-in customer cannot be merged.')
-    for kind in ROLES:
-        mine, theirs = role_of(kept, kind), role_of(other, kind)
-        if mine and theirs and hasattr(mine, 'opening_balance') and hasattr(theirs, 'opening_balance'):
-            side = 'Receivable' if kind == 'customer' else 'Payable'
-            raise PeopleError(
-                f'Both have a {side} opening balance. Clear one of them before merging.')
+    # Opening balances are the person's, one per side: two on one side
+    # would leave the kept person with both.
+    both = (set(kept.opening_balances.values_list('side', flat=True))
+            & set(other.opening_balances.values_list('side', flat=True)))
+    for side in sorted(both):
+        raise PeopleError(
+            f'Both have a {side.capitalize()} opening balance. Clear one of them before merging.')
 
     from targets.models import Target
     with db_transaction.atomic():

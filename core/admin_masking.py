@@ -117,7 +117,7 @@ MASKED_LABELS = {
         lambda obj: f"{obj.id}-{obj.customer or obj.supplier}-{MASK}"
     ),
     "accounts.PartyOpeningBalance": (
-        lambda obj: f"{obj.id}-{obj.customer or obj.supplier}-{MASK}"
+        lambda obj: f"{obj.id}-{obj.person}-{obj.side}-{MASK}"
     ),
 }
 

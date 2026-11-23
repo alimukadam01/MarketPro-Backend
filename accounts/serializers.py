@@ -19,7 +19,7 @@ from .models import (
 )
 # payments.py imports TransactionCreateSerializer lazily, inside the function
 # that needs it, so this direction is safe.
-from .payments import INVOICE, LOAN, allocate, settleable_items
+from .payments import INVOICE, LOAN, allocate, other_side_advance, settleable_items
 from .settlement import settlement_for_transaction
 
 # Pool credit: the types whose `settles` list means something.
@@ -811,37 +811,55 @@ class TransactionUpdateSerializer(BaseTransactionWriteSerializer):
 # ── PartyOpeningBalance ───────────────────────────────────────────────────────
 
 class PartyOpeningBalanceSerializer(serializers.ModelSerializer):
+    """
+    One side of a person's opening balance. `kind`, the khaata it counts on,
+    is worked out when it is first saved (PartyOpeningBalance.opening_kind)
+    and then kept.
+    """
 
     business = serializers.PrimaryKeyRelatedField(read_only=True)
+    person = serializers.PrimaryKeyRelatedField(queryset=Person.objects.none())
+    amount = serializers.IntegerField(min_value=0)
 
     class Meta:
         model = PartyOpeningBalance
         fields = [
-            'id', 'business', 'customer', 'supplier',
+            'id', 'business', 'person', 'side', 'kind',
             'amount', 'as_of_date', 'created_at',
         ]
+        read_only_fields = ['kind']
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        business_id = self.context.get('business_id')
+        if business_id:
+            self.fields['person'].queryset = Person.objects.filter(business_id=business_id)
 
     def validate(self, attrs):
-        customer = attrs.get('customer')
-        supplier = attrs.get('supplier')
-
-        if not customer and not supplier:
-            raise serializers.ValidationError({
-                'customer': 'Name either a customer or a supplier.'
-            })
-        if customer and supplier:
-            raise serializers.ValidationError({
-                'customer': 'Name either a customer or a supplier, not both.'
-            })
+        person = attrs.get('person', getattr(self.instance, 'person', None))
+        side = attrs.get('side', getattr(self.instance, 'side', None))
+        clash = PartyOpeningBalance.objects.filter(person=person, side=side)
+        if self.instance is not None:
+            clash = clash.exclude(pk=self.instance.pk)
+        if clash.exists():
+            raise serializers.ValidationError(
+                {'side': f'{person.name} already has a {side} opening balance.'})
         return attrs
 
     def create(self, validated_data):
+        validated_data['kind'] = PartyOpeningBalance.opening_kind(
+            validated_data['person'], validated_data['side'])
         return PartyOpeningBalance.objects.create(
             business_id=self.context['business_id'],
             **validated_data
         )
 
     def update(self, instance, validated_data):
+        if ('person' in validated_data and validated_data['person'] != instance.person) or (
+                'side' in validated_data and validated_data['side'] != instance.side):
+            validated_data['kind'] = PartyOpeningBalance.opening_kind(
+                validated_data.get('person', instance.person),
+                validated_data.get('side', instance.side))
         for attr, value in validated_data.items():
             setattr(instance, attr, value)
         instance.save()
@@ -864,6 +882,12 @@ class RecordPartyPaymentSerializer(serializers.Serializer):
         queryset=Customer.objects.none(), required=False, allow_null=True)
     supplier = serializers.PrimaryKeyRelatedField(
         queryset=Supplier.objects.none(), required=False, allow_null=True)
+    # Or the person and which way the money goes, for someone without the
+    # role on that side: they can still be paid back an advance on the other.
+    person = serializers.PrimaryKeyRelatedField(
+        queryset=Person.objects.none(), required=False, allow_null=True)
+    direction = serializers.ChoiceField(
+        choices=['in', 'out'], required=False, allow_null=True)
 
     amount = serializers.IntegerField(min_value=1)
     items = serializers.JSONField(required=False, default=list)
@@ -899,6 +923,8 @@ class RecordPartyPaymentSerializer(serializers.Serializer):
             self.fields['customer'].queryset = Customer.objects.filter(
                 business_id=business_id)
             self.fields['supplier'].queryset = Supplier.objects.filter(
+                business_id=business_id)
+            self.fields['person'].queryset = Person.objects.filter(
                 business_id=business_id)
 
     def validate_items(self, value):
@@ -950,16 +976,24 @@ class RecordPartyPaymentSerializer(serializers.Serializer):
         return cleaned
 
     def validate(self, attrs):
+        from root.people import role_of
+
         customer = attrs.get('customer')
         supplier = attrs.get('supplier')
+        person = attrs.get('person')
+        direction = attrs.get('direction')
 
-        if not customer and not supplier:
-            raise serializers.ValidationError({
-                'customer': 'Name either a customer or a supplier.'
-            })
         if customer and supplier:
             raise serializers.ValidationError({
                 'customer': 'Name either a customer or a supplier, not both.'
+            })
+        if not customer and not supplier and not (person and direction):
+            raise serializers.ValidationError({
+                'customer': 'Name a customer, a supplier, or a person and a direction.'
+            })
+        if direction and (customer and direction != 'in' or supplier and direction != 'out'):
+            raise serializers.ValidationError({
+                'direction': 'A customer pays in; a supplier is paid out.'
             })
 
         if attrs.get('payment_method') == 'cheque' and not (
@@ -968,14 +1002,31 @@ class RecordPartyPaymentSerializer(serializers.Serializer):
                 'cheque_number': 'A cheque payment needs a cheque number.'
             })
 
-        party = 'customer' if customer else 'supplier'
-        party_id = (customer or supplier).id
+        if customer or supplier:
+            party = 'customer' if customer else 'supplier'
+            party_id = (customer or supplier).id
+            person = (customer or supplier).person
+        else:
+            party = 'customer' if direction == 'in' else 'supplier'
+            role = role_of(person, party)
+            party_id = role.id if role else None
         business_id = self.context['business_id']
 
-        available = {
+        if party_id is None:
+            if attrs['items']:
+                raise serializers.ValidationError({
+                    'items': f'{person.name} has no {party} role, so there is nothing to tick.'
+                })
+            _, room = other_side_advance(business_id, party, person)
+            if attrs['amount'] > room:
+                raise serializers.ValidationError({'amount': (
+                    f'Only {room:,} can be paid here, the advance on the other side. '
+                    f'Add the {party} role to record more.')})
+
+        available = ({
             (item['kind'], item['id']): item
             for item in settleable_items(business_id, party, party_id)
-        }
+        } if party_id is not None else {})
 
         chosen = []
         for ref in attrs['items']:
@@ -1005,6 +1056,7 @@ class RecordPartyPaymentSerializer(serializers.Serializer):
 
         attrs['party'] = party
         attrs['party_id'] = party_id
+        attrs['person'] = person
         return attrs
 
     def money_details(self):

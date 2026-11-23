@@ -149,13 +149,28 @@ class PersonCreateAndEditTests(PeopleAPIFixture):
         self.assertEqual(response.status_code, 201, response.content)
         self.assertEqual(response.json()['roles'], {'customer': None, 'supplier': None})
 
-    def test_an_opening_balance_needs_the_role_for_its_side(self):
+    def test_opening_balances_belong_to_the_person_not_the_roles(self):
+        # A supplier-only person's Receivable opening is money they hold,
+        # used by the next purchase (its supplier khaata, below zero).
         response = self.client.post('/people/', {
-            'name': 'X', 'roles': ['supplier'],
-            'opening_balances': {'receivable': {'amount': 5, 'as_of_date': '2026-01-01'}},
+            'name': 'X', 'roles': ['supplier'], 'city': self.city.id,
+            'opening_balances': {'receivable': {'amount': 5000, 'as_of_date': '2026-01-01'}},
         }, format='json')
-        self.assertEqual(response.status_code, 400)
-        self.assertIn('opening_balances', response.json())
+        self.assertEqual(response.status_code, 201, response.content)
+        body = response.json()
+        self.assertEqual(body['opening_balances']['receivable']['amount'], 5000)
+        self.assertEqual(body['opening_balances']['receivable']['kind'], 'supplier')
+        self.assertEqual((body['receivable'], body['payable']), (5000, 0))
+        self.assertEqual(body['roles']['supplier']['balance'], -5000)
+
+        # Someone with no role at all can carry both sides.
+        response = self.client.post('/people/', {
+            'name': 'Y',
+            'opening_balances': {'receivable': {'amount': 300, 'as_of_date': '2026-01-01'},
+                                 'payable': {'amount': 700, 'as_of_date': '2026-01-01'}},
+        }, format='json')
+        self.assertEqual(response.status_code, 201, response.content)
+        self.assertEqual((response.json()['receivable'], response.json()['payable']), (300, 700))
 
     def test_editing_details_changes_them_for_every_role(self):
         ali = self.customer('Ali Traders')

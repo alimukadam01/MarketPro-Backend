@@ -667,21 +667,34 @@ class PersonSerializer(serializers.ModelSerializer):
 
 
 class PersonDetailSerializer(PersonSerializer):
-    """The person page: the list row plus each side's opening balance."""
+    """
+    The person page: the list row plus each side's opening balance, and each
+    role's own balance (signed its khaata's way), which decides whether the
+    role can be deactivated.
+    """
 
     opening_balances = serializers.SerializerMethodField()
 
     class Meta(PersonSerializer.Meta):
         fields = PersonSerializer.Meta.fields + ['opening_balances']
 
+    def get_roles(self, person):
+        roles = super().get_roles(person)
+        balances = self.context.get('role_balances', {})
+        for kind, role in roles.items():
+            if role is not None:
+                role['balance'] = balances.get(kind, 0)
+        return roles
+
     def get_opening_balances(self, person):
-        from .people import role_of
-        sides = {}
-        for kind, side in (('customer', 'receivable'), ('supplier', 'payable')):
-            role = role_of(person, kind)
-            opening = getattr(role, 'opening_balance', None) if role else None
-            sides[side] = ({'amount': opening.amount, 'as_of_date': opening.as_of_date.isoformat()}
-                           if opening else None)
+        sides = {'receivable': None, 'payable': None}
+        for opening in person.opening_balances.all():
+            sides[opening.side] = {
+                'id': opening.id,
+                'amount': opening.amount,
+                'as_of_date': opening.as_of_date.isoformat(),
+                'kind': opening.kind,
+            }
         return sides
 
 
@@ -710,17 +723,11 @@ class PersonWriteSerializer(serializers.ModelSerializer):
         return {side: entry for side, entry in value.items() if entry and entry.get('amount')}
 
     def validate(self, attrs):
+        # Opening balances are the person's, one per side, whatever roles
+        # they hold (or none).
         if self.instance is not None and ('roles' in attrs or 'opening_balances' in attrs):
             raise serializers.ValidationError(
                 'Roles change through /people/<id>/roles/; opening balances on their own screen.')
-        roles = set(attrs.get('roles', []))
-        openings = attrs.get('opening_balances', {})
-        if 'receivable' in openings and 'customer' not in roles:
-            raise serializers.ValidationError(
-                {'opening_balances': 'A Receivable opening balance needs the customer role.'})
-        if 'payable' in openings and 'supplier' not in roles:
-            raise serializers.ValidationError(
-                {'opening_balances': 'A Payable opening balance needs the supplier role.'})
         return attrs
 
     def create(self, validated_data):
@@ -730,15 +737,16 @@ class PersonWriteSerializer(serializers.ModelSerializer):
         business_id = self.context['business_id']
         with transaction.atomic():
             person = Person.objects.create(business_id=business_id, **validated_data)
-            made = {}
             for kind, model in (('customer', Customer), ('supplier', Supplier)):
                 if kind in roles:
-                    made[kind] = model.objects.create(business_id=business_id, person=person)
-            for side, kind in (('receivable', 'customer'), ('payable', 'supplier')):
+                    model.objects.create(business_id=business_id, person=person)
+            for side in ('receivable', 'payable'):
                 if side in openings:
                     PartyOpeningBalance.objects.create(
-                        business_id=business_id, amount=openings[side]['amount'],
-                        as_of_date=openings[side]['as_of_date'], **{kind: made[kind]})
+                        business_id=business_id, person=person, side=side,
+                        kind=PartyOpeningBalance.opening_kind(person, side),
+                        amount=abs(openings[side]['amount']),
+                        as_of_date=openings[side]['as_of_date'])
         return person
 
 

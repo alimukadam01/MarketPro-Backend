@@ -44,7 +44,7 @@ from root.models import Customer, Supplier
 from root.utils import local_date
 from sales.models import PurchaseInvoice, SalesInvoice
 
-from .models import PartyOpeningBalance, PartyPayment, Transaction
+from .models import OpeningNet, PartyOpeningBalance, PartyPayment, Transaction
 
 
 # Money compared below this is treated as equal. Invoice totals are floats;
@@ -282,16 +282,7 @@ def settle_parties(business_id, party_kind, party_ids=None,
             result[party_id] = Settlement(party_kind, party_id)
         return result[party_id]
 
-    for opening in PartyOpeningBalance.objects.filter(**scope):
-        amount = opening.amount or 0
-        if not amount:
-            continue
-        entry = Entry(
-            kind='opening', id=None, label=LABELS['opening'],
-            date=opening.as_of_date, amount=abs(amount), leads=True,
-            seq=opening.created_at.isoformat() if opening.created_at else '')
-        target = get(getattr(opening, party_field))
-        (target.debts if amount > 0 else target.credits).append(entry)
+    _add_openings(business_id, party_kind, get, role_ids=party_ids)
 
     excluded = set(not_a_debt_statuses(Invoice))
     invoices = (
@@ -337,6 +328,41 @@ def settle_parties(business_id, party_kind, party_ids=None,
     for settlement in result.values():
         _match(settlement)
     return result
+
+
+def _add_openings(business_id, party_kind, get, role_ids=None,
+                  people_without_role=False, person_ids=None):
+    """
+    The opening balances that count on this side's khaata, netted per person
+    into one entry that leads: a debt when it comes out positive, credit when
+    negative (an advance). Keyed like _add_money_rows: by the person's role on
+    this side, or, with people_without_role, by person for those without it.
+    """
+    rows = PartyOpeningBalance.objects.filter(business_id=business_id, kind=party_kind)
+    if people_without_role:
+        rows = rows.filter(**{f'person__{party_kind}__isnull': True})
+        if person_ids is not None:
+            rows = rows.filter(person_id__in=list(person_ids))
+        rows = rows.annotate(_key=F('person_id'))
+    else:
+        rows = rows.annotate(_key=F(f'person__{party_kind}__id'))
+        rows = (rows.filter(_key__in=list(role_ids)) if role_ids is not None
+                else rows.filter(_key__isnull=False))
+
+    grouped = defaultdict(list)
+    for row in rows:
+        grouped[row._key].append(row)
+    for key, openings in grouped.items():
+        net = OpeningNet.of(openings)
+        amount = net.amount
+        if not amount:
+            continue
+        entry = Entry(
+            kind='opening', id=None, label=LABELS['opening'],
+            date=net.as_of_date, amount=abs(amount), leads=True,
+            seq=net.created_at.isoformat() if net.created_at else '')
+        target = get(key)
+        (target.debts if amount > 0 else target.credits).append(entry)
 
 
 def _add_money_rows(business_id, party_kind, include_pending, get,
@@ -424,8 +450,8 @@ def settle_party(business_id, party_kind, party_id):
 def settle_people(business_id, party_kind, person_ids=None, include_pending=False):
     """
     One side's khaata for people who do NOT have that side's role - someone
-    who only lent you money, say (register #28). Only their loans and
-    set-offs can be on it. Returns {person_id: Settlement}; anyone with the
+    who only lent you money, say (register #28). Only their opening balance,
+    loans and set-offs can be on it. Returns {person_id: Settlement}; anyone with the
     role is left out, because settle_parties already covers them.
     """
     result = {}
@@ -435,6 +461,8 @@ def settle_people(business_id, party_kind, person_ids=None, include_pending=Fals
             result[person_id] = Settlement(party_kind, person_id, person_id=person_id)
         return result[person_id]
 
+    _add_openings(business_id, party_kind, get,
+                  people_without_role=True, person_ids=person_ids)
     _add_money_rows(business_id, party_kind, include_pending, get,
                     people_without_role=True, person_ids=person_ids)
     for settlement in result.values():

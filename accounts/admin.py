@@ -34,4 +34,4 @@ class PartyPaymentAdmin(MaskedAmountsAdminMixin, admin.ModelAdmin):
 
 @admin.register(PartyOpeningBalance)
 class PartyOpeningBalanceAdmin(MaskedAmountsAdminMixin, admin.ModelAdmin):
-    list_display = ('id', 'customer', 'supplier', 'amount', 'as_of_date')
+    list_display = ('id', 'person', 'side', 'kind', 'amount', 'as_of_date')

@@ -868,32 +868,117 @@ class PartyPayment(models.Model):
         return f"{self.id}-{party}-{self.transaction.amount}"
 
 
+class OpeningNet:
+    """
+    A person's opening balance on one khaata kind, netted: what the engine
+    and the list balances count. `amount` is signed the kind's way (positive:
+    the customer owes us, or we owe the supplier); `as_of_date` is the
+    earliest of the rows it nets.
+    """
+
+    __slots__ = ('amount', 'as_of_date', 'created_at')
+
+    def __init__(self, amount, as_of_date, created_at):
+        self.amount = amount
+        self.as_of_date = as_of_date
+        self.created_at = created_at
+
+    @classmethod
+    def of(cls, rows):
+        rows = list(rows)
+        if not rows:
+            return None
+        return cls(
+            sum(row.signed_amount for row in rows),
+            min(row.as_of_date for row in rows),
+            min((row.created_at for row in rows if row.created_at), default=None),
+        )
+
+
+class PartyOpeningBalanceQuerySet(models.QuerySet):
+
+    def of_role(self, kind, role_id):
+        """The rows that count on one role's khaata."""
+        return self.filter(kind=kind, **{f'person__{kind}__id': role_id})
+
+
+class PartyOpeningBalanceManager(models.Manager.from_queryset(PartyOpeningBalanceQuerySet)):
+
+    def create(self, customer=None, supplier=None, **kwargs):
+        """
+        Also takes the old role form, customer= or supplier= with a signed
+        amount, and stores it on the role's person, on the role's khaata:
+        exactly how such a row counted before openings moved to the person.
+        """
+        role = customer or supplier
+        if role is not None:
+            kind = 'customer' if customer is not None else 'supplier'
+            amount = kwargs.pop('amount', 0) or 0
+            natural = PartyOpeningBalance.NATURAL_SIDE[kind]
+            kwargs.update(
+                person_id=role.person_id, kind=kind, amount=abs(amount),
+                side=natural if amount >= 0 else PartyOpeningBalance.OTHER_SIDE[natural])
+        return super().create(**kwargs)
+
+
 class PartyOpeningBalance(models.Model):
     """
     A balance carried across from the paper khaata at onboarding (BRD §6.6).
     Counted in party balances, excluded from period reporting.
+
+    It belongs to the person: one per side (Receivable, Payable), whatever
+    roles they hold. `amount` is never negative; `side` says which way it
+    goes. `kind` is the khaata it counts on, fixed when it is first saved
+    (opening_kind): a Payable opening for someone who is only a customer is an
+    advance on the customer khaata, which their next sale uses up, and a
+    Receivable opening for someone who is only a supplier is used by the next
+    purchase. Otherwise each side counts on its own khaata.
     """
+
+    SIDES = [('receivable', 'Receivable'), ('payable', 'Payable')]
+    KINDS = [('customer', 'Customer'), ('supplier', 'Supplier')]
+    NATURAL_SIDE = {'customer': 'receivable', 'supplier': 'payable'}
+    OTHER_SIDE = {'receivable': 'payable', 'payable': 'receivable'}
 
     business = models.ForeignKey(
         Business, on_delete=models.CASCADE,
         related_name='party_opening_balances'
     )
-    customer = models.OneToOneField(
-        Customer, on_delete=models.CASCADE,
-        null=True, blank=True, related_name='opening_balance'
+    person = models.ForeignKey(
+        'root.Person', on_delete=models.CASCADE,
+        related_name='opening_balances'
     )
-    supplier = models.OneToOneField(
-        Supplier, on_delete=models.CASCADE,
-        null=True, blank=True, related_name='opening_balance'
-    )
-    amount = models.IntegerField(
-        default=0,
-        help_text='Positive means the customer owes us, or we owe the supplier.'
-    )
+    side = models.CharField(max_length=16, choices=SIDES)
+    kind = models.CharField(max_length=16, choices=KINDS)
+    amount = models.IntegerField(default=0)
     as_of_date = models.DateField()
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
+    objects = PartyOpeningBalanceManager()
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=['person', 'side'], name='one_opening_balance_per_person_side'),
+        ]
+
+    @property
+    def signed_amount(self):
+        """The amount as its khaata counts it (positive: on the kind's own side)."""
+        amount = self.amount or 0
+        return amount if self.side == self.NATURAL_SIDE[self.kind] else -amount
+
+    @staticmethod
+    def opening_kind(person, side):
+        """
+        The khaata a new opening on `side` counts on. Only when the person
+        holds the other side's role alone is it that role's advance.
+        """
+        has = {kind: hasattr(person, kind) for kind in ('customer', 'supplier')}
+        if side == 'receivable':
+            return 'supplier' if has['supplier'] and not has['customer'] else 'customer'
+        return 'customer' if has['customer'] and not has['supplier'] else 'supplier'
+
     def __str__(self):
-        party = self.customer or self.supplier
-        return f"{self.id}-{party}-{self.amount}"
+        return f"{self.id}-{self.person_id}-{self.side}-{self.amount}"
