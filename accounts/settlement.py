@@ -32,45 +32,55 @@ Invariant, asserted by the tests on every fixture:
 
 Kept free of accounts.utils so utils can import this module.
 """
+from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import date as date_cls
 from typing import Optional
 
-from django.db.models import Q
+from django.db.models import F, Q
 from django.utils import timezone
 
 from root.models import Customer, Supplier
 from root.utils import local_date
 from sales.models import PurchaseInvoice, SalesInvoice
 
-from .models import PartyOpeningBalance, PartyPayment, Transaction
+from .models import OpeningNet, PartyOpeningBalance, PartyPayment, Transaction
 
 
 # Money compared below this is treated as equal. Invoice totals are floats;
 # transaction amounts are whole rupees.
 EPSILON = 0.005
 
+def _pool_types(party_kind, effect):
+    """{type: kind} for one party kind's PARTY_EFFECTS rows with this effect."""
+    return {t: kind for t, (party, e, kind) in Transaction.PARTY_EFFECTS.items()
+            if party == party_kind and e == effect}
+
+
 # Per party kind: the invoice model and its foreign key, and which transaction
-# types are pool money (credits) or pool debts. Notes are split by direction;
-# refunds are money that went back out, so they put debt back on.
+# types are pool money (credits) or pool debts - read from
+# Transaction.PARTY_EFFECTS. Notes are split by direction; refunds are money
+# that went back out, so they put debt back on.
 PARTY_SPEC = {
     'customer': {
         'invoice_model': SalesInvoice,
         'party_model': Customer,
-        'credit_types': {'customer_receipt': 'payment',
-                         'customer_credit_note': 'credit_note'},
-        'debit_types': {'customer_debit_note': 'debit_note',
-                        'sales_return_refund': 'refund'},
+        'credit_types': _pool_types('customer', 'settles'),
+        'debit_types': _pool_types('customer', 'adds'),
     },
     'supplier': {
         'invoice_model': PurchaseInvoice,
         'party_model': Supplier,
-        'credit_types': {'supplier_payment': 'payment',
-                         'supplier_credit_note': 'credit_note'},
-        'debit_types': {'supplier_debit_note': 'debit_note',
-                        'purchase_return_refund': 'refund'},
+        'credit_types': _pool_types('supplier', 'settles'),
+        'debit_types': _pool_types('supplier', 'adds'),
     },
 }
+
+# The entry kinds that are pool credit from a transaction (on-account money
+# and credit notes), as opposed to an opening balance or an overpayment.
+SETTLING_KINDS = frozenset(
+    kind for _, effect, kind in Transaction.PARTY_EFFECTS.values()
+    if effect == 'settles')
 
 LABELS = {
     'opening': 'Opening balance',
@@ -79,6 +89,11 @@ LABELS = {
     'debit_note': 'Debit note',
     'refund': 'Refund',
     'overpayment': 'Overpayment',
+    'loan_given': 'Loan given',
+    'loan_recovered': 'Loan recovered',
+    'loan_received': 'Loan received',
+    'loan_repayment': 'Loan repaid',
+    'set_off': 'Set-off',
 }
 
 
@@ -100,6 +115,7 @@ class Entry:
     reference: Optional[str] = None
     remaining: float = 0.0    # after matching
     leads: bool = False       # the opening balance: always first
+    repaid: float = 0.0       # a loan: what repayments naming it paid off
 
     def __post_init__(self):
         self.amount = round(float(self.amount), 2)
@@ -129,6 +145,9 @@ class Settlement:
     debts: list = field(default_factory=list)
     credits: list = field(default_factory=list)
     matches: list = field(default_factory=list)   # (credit, debt, amount)
+    # The person behind it. For a khaata from loans alone (settle_people),
+    # party_id is the person's id too.
+    person_id: Optional[int] = None
 
     @property
     def balance(self):
@@ -162,9 +181,26 @@ class Settlement:
         return [
             {**debt.as_dict(), 'applied': round(amount)}
             for credit, debt, amount in self.matches
-            if credit.kind in ('payment', 'credit_note')
+            if credit.kind in SETTLING_KINDS
             and credit.id == transaction_id
         ]
+
+    def loan_status(self, transaction_id):
+        """
+        A loan's standing (register R18): {'amount', 'repaid', 'remaining',
+        'status'} with status 'open', 'part' or 'settled'; None if the loan
+        is not on this khaata.
+        """
+        for debt in self.debts:
+            if debt.id == transaction_id and debt.kind in Transaction.LOAN_REPAID_BY:
+                full = round(debt.amount + debt.repaid, 2)
+                remaining = round(debt.remaining, 2)
+                repaid = round(full - remaining, 2)
+                status = ('settled' if remaining <= EPSILON
+                          else 'part' if repaid > EPSILON else 'open')
+                return {'amount': round(full), 'repaid': round(repaid),
+                        'remaining': round(remaining), 'status': status}
+        return None
 
     def opening_remaining(self):
         for debt in self.debts:
@@ -246,16 +282,7 @@ def settle_parties(business_id, party_kind, party_ids=None,
             result[party_id] = Settlement(party_kind, party_id)
         return result[party_id]
 
-    for opening in PartyOpeningBalance.objects.filter(**scope):
-        amount = opening.amount or 0
-        if not amount:
-            continue
-        entry = Entry(
-            kind='opening', id=None, label=LABELS['opening'],
-            date=opening.as_of_date, amount=abs(amount), leads=True,
-            seq=opening.created_at.isoformat() if opening.created_at else '')
-        target = get(getattr(opening, party_field))
-        (target.debts if amount > 0 else target.credits).append(entry)
+    _add_openings(business_id, party_kind, get, role_ids=party_ids)
 
     excluded = set(not_a_debt_statuses(Invoice))
     invoices = (
@@ -291,6 +318,69 @@ def settle_parties(business_id, party_kind, party_ids=None,
                        else f"{LABELS['overpayment']} on {label}"),
                 date=issued, amount=-unpaid, seq=seq))
 
+    # The money rows are read by person: a role's khaata also carries its
+    # person's loans and set-offs, which name only the person (register #28).
+    # A person has at most one role per side, so each row's role is exact,
+    # and it comes from the same query (the person's role on this side).
+    _add_money_rows(business_id, party_kind, include_pending, get,
+                    role_ids=party_ids)
+
+    for settlement in result.values():
+        _match(settlement)
+    return result
+
+
+def _add_openings(business_id, party_kind, get, role_ids=None,
+                  people_without_role=False, person_ids=None):
+    """
+    The opening balances that count on this side's khaata, netted per person
+    into one entry that leads: a debt when it comes out positive, credit when
+    negative (an advance). Keyed like _add_money_rows: by the person's role on
+    this side, or, with people_without_role, by person for those without it.
+    """
+    rows = PartyOpeningBalance.objects.filter(business_id=business_id, kind=party_kind)
+    if people_without_role:
+        rows = rows.filter(**{f'person__{party_kind}__isnull': True})
+        if person_ids is not None:
+            rows = rows.filter(person_id__in=list(person_ids))
+        rows = rows.annotate(_key=F('person_id'))
+    else:
+        rows = rows.annotate(_key=F(f'person__{party_kind}__id'))
+        rows = (rows.filter(_key__in=list(role_ids)) if role_ids is not None
+                else rows.filter(_key__isnull=False))
+
+    grouped = defaultdict(list)
+    for row in rows:
+        grouped[row._key].append(row)
+    for key, openings in grouped.items():
+        net = OpeningNet.of(openings)
+        amount = net.amount
+        if not amount:
+            continue
+        entry = Entry(
+            kind='opening', id=None, label=LABELS['opening'],
+            date=net.as_of_date, amount=abs(amount), leads=True,
+            seq=net.created_at.isoformat() if net.created_at else '')
+        target = get(key)
+        (target.debts if amount > 0 else target.credits).append(entry)
+
+
+def _add_money_rows(business_id, party_kind, include_pending, get,
+                    role_ids=None, people_without_role=False, person_ids=None):
+    """
+    One side's PartyPayment rows (on-account money, notes, refunds, loans,
+    set-offs) onto the settlements `get` returns.
+
+    By default each row goes to its person's role on this side (`role_ids`
+    narrows it); a person without that role is skipped. With
+    people_without_role, the opposite: only people with no role on this side,
+    keyed by person id (`person_ids` narrows it).
+
+    A repayment that names its loan applies to that loan first, as a receipt
+    applies to its invoice; any part beyond the loan stays on the khaata as
+    credit.
+    """
+    spec = PARTY_SPEC[party_kind]
     pool_types = {**spec['credit_types'], **spec['debit_types']}
     counted = Q(transaction__status='C')
     if include_pending:
@@ -298,31 +388,108 @@ def settle_parties(business_id, party_kind, party_ids=None,
                      transaction__type__in=list(spec['credit_types']))
     rows = (
         PartyPayment.objects
-        .filter(counted, **scope, transaction__type__in=list(pool_types))
+        .filter(counted, business_id=business_id,
+                transaction__type__in=list(pool_types))
         .select_related('transaction')
     )
+    role = f'person__{party_kind}__id'
+    if people_without_role:
+        rows = rows.filter(**{f'person__{party_kind}__isnull': True})
+        if person_ids is not None:
+            rows = rows.filter(person_id__in=list(person_ids))
+        rows = rows.annotate(_key=F('person_id'))
+    else:
+        rows = rows.annotate(_key=F(role))
+        rows = (rows.filter(_key__in=list(role_ids)) if role_ids is not None
+                else rows.filter(_key__isnull=False))
+
+    repayment_types = set(Transaction.LOAN_REPAID_BY.values())
+    loans, named = {}, defaultdict(list)
     for row in rows:
+        key = row._key
         txn = row.transaction
         kind = pool_types[txn.type]
         entry = Entry(
             kind=kind, id=txn.id, label=LABELS[kind], date=txn.date,
             amount=txn.amount or 0, reference=txn.reference,
             seq=txn.created_at.isoformat() if txn.created_at else '')
-        target = get(getattr(row, party_field))
-        if txn.type in spec['credit_types']:
+        target = get(key)
+        if row.loan_id and txn.type in repayment_types:
+            named[(key, row.loan_id)].append(entry)
+        elif txn.type in spec['credit_types']:
             target.credits.append(entry)
         else:
             target.debts.append(entry)
+            if txn.type in Transaction.LOAN_REPAID_BY:
+                loans[(key, txn.id)] = entry
 
-    for settlement in result.values():
-        _match(settlement)
-    return result
+    for (key, loan_id), repayments in named.items():
+        loan = loans.get((key, loan_id))
+        if loan is None:
+            # The loan is not on this khaata (deleted, or another side): the
+            # money is still theirs, so it joins the pool like any payment.
+            get(key).credits.extend(repayments)
+            continue
+        paid = round(sum(entry.amount for entry in repayments), 2)
+        applied = min(paid, loan.amount)
+        loan.amount = loan.remaining = round(loan.amount - applied, 2)
+        loan.repaid += applied
+        if paid - applied > EPSILON:
+            get(key).credits.append(Entry(
+                kind='overpayment', id=loan.id,
+                label=f"Repaid beyond {LABELS[loan.kind].lower()} {loan.reference or f'#{loan.id}'}",
+                date=repayments[-1].date, amount=paid - applied, seq=repayments[-1].seq))
 
 
 def settle_party(business_id, party_kind, party_id):
     """One party's khaata. Never None: an empty khaata settles to nothing."""
     return (settle_parties(business_id, party_kind, [party_id])
             .get(party_id) or Settlement(party_kind, party_id))
+
+
+def settle_people(business_id, party_kind, person_ids=None, include_pending=False):
+    """
+    One side's khaata for people who do NOT have that side's role - someone
+    who only lent you money, say (register #28). Only their opening balance,
+    loans and set-offs can be on it. Returns {person_id: Settlement}; anyone with the
+    role is left out, because settle_parties already covers them.
+    """
+    result = {}
+
+    def get(person_id):
+        if person_id not in result:
+            result[person_id] = Settlement(party_kind, person_id, person_id=person_id)
+        return result[person_id]
+
+    _add_openings(business_id, party_kind, get,
+                  people_without_role=True, person_ids=person_ids)
+    _add_money_rows(business_id, party_kind, include_pending, get,
+                    people_without_role=True, person_ids=person_ids)
+    for settlement in result.values():
+        _match(settlement)
+    return result
+
+
+def settle_person_sides(business_id, person_ids=None):
+    """
+    {person_id: {'customer': Settlement | None, 'supplier': Settlement | None}}:
+    both sides of each person, whether the side comes from a role or only
+    from loans and set-offs.
+    """
+    sides = defaultdict(lambda: {'customer': None, 'supplier': None})
+    for kind in PARTY_SPEC:
+        Role = PARTY_SPEC[kind]['party_model']
+        roles = Role.objects.filter(business_id=business_id)
+        if person_ids is not None:
+            roles = roles.filter(person_id__in=list(person_ids))
+        person_of = dict(roles.values_list('id', 'person_id'))
+        if person_of:
+            for role_id, settlement in settle_parties(business_id, kind, list(person_of)).items():
+                settlement.person_id = person_of[role_id]
+                sides[person_of[role_id]][kind] = settlement
+        for person_id, settlement in settle_people(business_id, kind, person_ids).items():
+            sides[person_id][kind] = settlement
+    return sides
 
 
 def on_account_paid_on_issue_date(business_id, party_kind, date_from, date_to):
@@ -405,14 +572,22 @@ def attach_settlement(invoices, include_pending=False):
 
 
 def settlement_for_transaction(transaction):
-    """The khaata a note or an on-account payment belongs to, or None."""
+    """
+    The khaata a note, an on-account payment, a loan or a set-off belongs to,
+    or None. Its side comes from the type; a person with no role on that side
+    (a lender, say) has a khaata of loans alone.
+    """
     party_payment = getattr(transaction, 'party_payment', None)
-    if party_payment is None:
+    if party_payment is None or transaction.type not in Transaction.PARTY_EFFECTS:
         return None
-    if party_payment.customer_id:
-        return settle_party(transaction.business_id, 'customer',
-                            party_payment.customer_id)
-    if party_payment.supplier_id:
-        return settle_party(transaction.business_id, 'supplier',
-                            party_payment.supplier_id)
-    return None
+    kind = Transaction.PARTY_EFFECTS[transaction.type][0]
+    role_id = (party_payment.customer_id if kind == 'customer'
+               else party_payment.supplier_id)
+    if role_id is None:
+        Role = PARTY_SPEC[kind]['party_model']
+        role_id = (Role.objects.filter(person_id=party_payment.person_id)
+                   .values_list('id', flat=True).first())
+    if role_id is not None:
+        return settle_party(transaction.business_id, kind, role_id)
+    return (settle_people(transaction.business_id, kind, [party_payment.person_id])
+            .get(party_payment.person_id))

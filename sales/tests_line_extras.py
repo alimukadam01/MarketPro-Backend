@@ -43,7 +43,7 @@ class LineFixture(TestCase):
         City.objects.get_or_create(name="Karachi", defaults={"postal_code": "74000"})
         cls.business = Business.objects.create(
             name="Urban Paints", owner=cls.user, phone="03001234567", is_active=True)
-        cls.customer = Customer.objects.get(business=cls.business, name=WALK_IN_CUSTOMER_NAME)
+        cls.customer = Customer.objects.get(business=cls.business, person__name=WALK_IN_CUSTOMER_NAME)
         cls.supplier = Supplier.objects.create(business=cls.business, name="Dealer")
         cls.unit = Unit.objects.create(name="Tins", abv="Tin")
         cls.paint = Product.objects.create(

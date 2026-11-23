@@ -58,14 +58,14 @@ register(SearchType(
     text_fields=[
         "reference", "notes", "cheque_number",
         "account__name", "transfer_account__name",
-        "party_payment__customer__name", "party_payment__supplier__name",
+        "party_payment__customer__person__name", "party_payment__supplier__person__name",
         "sales_receipt__sales_invoice__invoice_number",
-        "sales_receipt__sales_invoice__customer__name",
+        "sales_receipt__sales_invoice__customer__person__name",
         "purchase_receipt__purchase_invoice__invoice_number",
-        "purchase_receipt__purchase_invoice__supplier__name",
+        "purchase_receipt__purchase_invoice__supplier__person__name",
     ],
     number_fields=["id", "amount"],
-    phone_fields=["party_payment__customer__phone", "party_payment__supplier__phone"],
+    phone_fields=["party_payment__customer__person__phone", "party_payment__supplier__person__phone"],
     # "customer payment" finds customer receipts; "cheque" finds cheques;
     # "bounced" finds bounced ones.
     choice_fields={"type": None, "payment_method": None, "status": None},

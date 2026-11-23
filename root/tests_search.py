@@ -17,7 +17,7 @@ from inventory.models import InventoryItem
 from projects.models import Project, ProjectTask
 from root.models import (
     WALK_IN_CUSTOMER_NAME, Business, BusinessConfig, City, Customer, Employee,
-    EmployeeAccess, Expense, Location, Product, ProductVariant, Supplier, Unit,
+    EmployeeAccess, Expense, Location, Person, Product, ProductVariant, Supplier, Unit,
 )
 from root.search import Hit, SearchType, matching, registered
 from root.search.access import Access
@@ -112,7 +112,8 @@ class SearchFixture(TestCase):
             "purchase_quotation": quotation.id, "purchase_quotation_item": quotation_item.id,
             "returned_item": returned.id, "invoice_image": image.id, "inventory_item": stock.id,
             "product": product.id, "product_variant": variant.id, "location": location.id,
-            "customer": customer.id, "supplier": supplier.id, "employee": employee.id,
+            # One People result per person (register R33).
+            "person": customer.person_id, "employee": employee.id,
             "transaction": txn.id, "money_account": account.id, "expense": expense.id,
             "project": project.id, "project_task": task.id, "target": target.id,
             "manual_data_point": point.id, "backlog_entry": entry.id,
@@ -135,7 +136,8 @@ class RegistryContractTests(SearchFixture):
 
     def test_every_type_is_complete_and_builds_its_query(self):
         access = Access(self.request_for(self.owner), self.business)
-        self.assertGreaterEqual(len(registered()), 23)
+        # 22 since People: customers and suppliers became one People type.
+        self.assertGreaterEqual(len(registered()), 22)
         for search_type in registered():
             with self.subTest(search_type.key):
                 self.assertTrue(search_type.label)
@@ -150,7 +152,7 @@ class RegistryContractTests(SearchFixture):
         with self.assertRaises(SearchRegistrationError):
             register(bad)
         self.assertNotIn("broken", _REGISTRY)
-        duplicate = SearchType(key="customer", label="Again", model=Customer, module="customers",
+        duplicate = SearchType(key="person", label="Again", model=Person, module="people",
                                text_fields=["name"], to_hit=lambda row: Hit(id=row.id, title=""))
         with self.assertRaises(SearchRegistrationError):
             register(duplicate)
@@ -190,7 +192,7 @@ class ResultShapeTests(SearchFixture):
     def test_hits_are_capped_and_total_is_the_full_count(self):
         for n in range(7):
             Customer.objects.create(business=self.business, name=f"Crowd {n}", city=self.city)
-        group = self.groups(self.run_search("crowd"))["customer"]
+        group = self.groups(self.run_search("crowd"))["person"]
         self.assertEqual(len(group["hits"]), MAX_HITS)
         self.assertEqual(group["total"], 7)
 
@@ -212,7 +214,7 @@ class MatchingTests(SearchFixture):
         self.assertNotIn("sales_invoice", self.groups(self.run_search("completed")))
 
     def test_a_number_matches_exactly(self):
-        customer = Customer.objects.get(id=self.seeded["customer"])
+        customer = Customer.objects.get(person_id=self.seeded["person"])
         hit = SalesInvoice.objects.create(business=self.business, customer=customer, invoice_number="AAA",
                                           created_by=self.owner, date_issued=noon(date.today()),
                                           date_due=date.today(), total=612)
@@ -228,8 +230,8 @@ class MatchingTests(SearchFixture):
                                            phone="0300-7654321", city=self.city)
         for query in ("03007654321", "0300 7654321", "+923007654321", "7654321"):
             with self.subTest(query):
-                ids = [h["id"] for h in self.groups(self.run_search(query))["customer"]["hits"]]
-                self.assertIn(customer.id, ids)
+                ids = [h["id"] for h in self.groups(self.run_search(query))["person"]["hits"]]
+                self.assertIn(customer.person_id, ids)
 
     def test_choice_labels_find_their_codes(self):
         account = MoneyAccount.objects.get(id=self.seeded["money_account"])
@@ -265,9 +267,9 @@ class PermissionTests(SearchFixture):
         return user, employee
 
     def test_an_employee_sees_only_their_modules(self):
-        user, _ = self.employee({"customers": {"view": True}, "expenses": {"view": False}})
+        user, _ = self.employee({"people": {"view": True}, "expenses": {"view": False}})
         found = self.groups(self.run_search(TOKEN, user=user))
-        self.assertIn("customer", found)
+        self.assertIn("person", found)
         for hidden in ("expense", "sales_invoice", "transaction", "money_account", "employee", "target"):
             self.assertNotIn(hidden, found)
 

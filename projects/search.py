@@ -26,7 +26,7 @@ register(SearchType(
     label="Projects",
     model=Project,
     module="projects",
-    text_fields=["name", "desc", "customer__name"],
+    text_fields=["name", "desc", "customer__person__name"],
     number_fields=["id"],
     choice_fields={"status": None},
     select_related=["customer"],

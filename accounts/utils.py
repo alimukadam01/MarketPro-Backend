@@ -1,18 +1,20 @@
+from collections import defaultdict
 from datetime import date as date_cls, timedelta
 
-from django.db.models import Q, Sum
+from django.db.models import F, Q, Sum
 from django.utils import timezone
 
 from inventory.models import InventoryItem
-from root.models import Customer, Expense, Supplier
+from root.models import Customer, Expense, Person, Supplier
 from root.utils import local_date
 from sales.models import (
     PurchaseInvoice, PurchaseReceipt, SalesInvoice, SalesInvoiceItem,
     SalesReceipt
 )
-from .models import MoneyAccount, PartyOpeningBalance, PartyPayment, Transaction
+from .models import MoneyAccount, OpeningNet, PartyOpeningBalance, PartyPayment, Transaction
 from .settlement import (
-    Settlement, on_account_paid_on_issue_date, settle_parties, settle_party,
+    LABELS, Settlement, on_account_paid_on_issue_date, settle_parties,
+    settle_party, settle_people,
 )
 
 
@@ -31,45 +33,12 @@ CLEARED_RECEIPT = (
 CLEARED_ONLY = ('C',)
 LIVE_ON_ACCOUNT = ('C', 'PEN')
 
-# On-account money and which way it moves a party's balance. A payment settles
-# what they owe; a refund is money going back out, so it puts the debt back on.
-PARTY_ON_ACCOUNT = {
-    'customer': {
-        'payment': 'customer_receipt',
-        'refund': 'sales_return_refund',
-        'credit_note': 'customer_credit_note',
-        'debit_note': 'customer_debit_note',
-    },
-    'supplier': {
-        'payment': 'supplier_payment',
-        'refund': 'purchase_return_refund',
-        'credit_note': 'supplier_credit_note',
-        'debit_note': 'supplier_debit_note',
-    },
-}
-
-
-def note_totals(business_id, party_filter, kinds):
+def party_effect_totals(business_id, party_filter, party, statuses=CLEARED_ONLY,
+                        money_only=False):
     """
-    One party's credit and debit notes. Always cleared - a note is never
-    pending - so there is no status question to answer here.
-    """
-    rows = (
-        PartyPayment.objects
-        .filter(business_id=business_id, transaction__status='C',
-                transaction__type__in=[kinds['credit_note'], kinds['debit_note']],
-                **party_filter)
-        .values('transaction__type')
-        .annotate(total=Sum('transaction__amount'))
-    )
-    totals = {row['transaction__type']: row['total'] or 0 for row in rows}
-    return totals.get(kinds['credit_note'], 0), totals.get(kinds['debit_note'], 0)
-
-
-def on_account_totals(business_id, party_filter, kinds, statuses=CLEARED_ONLY):
-    """
-    On-account money for one party, split into what settles their balance and
-    what puts it back on.
+    One party's khaata rows that name no invoice (Transaction.PARTY_EFFECTS),
+    as (settles, adds): what takes debt off their balance - on-account
+    payments, credit notes - and what puts it back on - refunds, debit notes.
 
     `statuses` answers one of two different questions, and they need different
     answers - exactly as amount_paid and invoice_room differ on the invoice
@@ -77,20 +46,29 @@ def on_account_totals(business_id, party_filter, kinds, statuses=CLEARED_ONLY):
 
       CLEARED_ONLY   what the party actually owes. A pending cheque has paid
                      nothing yet, so it must not reduce a balance.
-      LIVE_ON_ACCOUNT what more can still be allocated. A pending cheque has
-                     already claimed that money, so offering it again in a
-                     payment picker invites settling the same debt twice.
+      ('PEN',)       what a pending cheque has already claimed, which a
+                     payment picker must hold back, or the same debt can be
+                     settled twice.
+
+    Notes are always cleared, so they only ever appear in the first. Pass
+    money_only to leave them out entirely.
     """
+    types = Transaction.party_types(party, money_only=money_only)
     rows = (
         PartyPayment.objects
         .filter(business_id=business_id, transaction__status__in=statuses,
-                transaction__type__in=[kinds['payment'], kinds['refund']],
-                **party_filter)
+                transaction__type__in=types, **party_filter)
         .values('transaction__type')
         .annotate(total=Sum('transaction__amount'))
     )
-    totals = {row['transaction__type']: row['total'] or 0 for row in rows}
-    return totals.get(kinds['payment'], 0), totals.get(kinds['refund'], 0)
+    settles = adds = 0
+    for row in rows:
+        _, effect, _ = Transaction.PARTY_EFFECTS[row['transaction__type']]
+        if effect == 'settles':
+            settles += row['total'] or 0
+        else:
+            adds += row['total'] or 0
+    return settles, adds
 
 
 def receipt_date(receipt):
@@ -200,10 +178,13 @@ def party_invoiced(business_id, customer=None, supplier=None,
 
 def _party_balance(business_id, kind, party, receipts):
     """
-    invoiced - paid against invoices - paid on account + refunded
-             - credit notes + debit notes + opening balance
+    invoiced - paid against invoices - what settles + what adds
+             + opening balance
 
-    Four aggregates rather than a settlement pass, because list screens call
+    "What settles" is on-account payments and credit notes; "what adds" is
+    refunds and debit notes (Transaction.PARTY_EFFECTS).
+
+    Three aggregates rather than a settlement pass, because list screens call
     this once per party. The engine's balance is the same figure by
     construction; accounts.tests_settlement asserts it.
 
@@ -211,19 +192,18 @@ def _party_balance(business_id, kind, party, receipts):
     cancelled invoice: that money was still received. The engine keeps it as
     credit for the same reason.
     """
-    party_filter = {f'{kind}_id': party.id}
-    kinds = PARTY_ON_ACCOUNT[kind]
+    # By person: the side also carries the person's loans and set-offs, which
+    # name no role (register #28). The types keep it to this side.
+    party_filter = {'person_id': party.person_id}
     invoiced = party_invoiced(business_id, **{kind: party})
     paid = receipts.filter(CLEARED_RECEIPT).aggregate(
         total=Sum('amount'))['total'] or 0
-    settled, refunded = on_account_totals(business_id, party_filter, kinds)
-    credited, debited = note_totals(business_id, party_filter, kinds)
+    settles, adds = party_effect_totals(business_id, party_filter, kind)
 
     opening = getattr(party, 'opening_balance', None)
     opening_amount = opening.amount if opening else 0
 
-    return round(invoiced - paid - settled + refunded
-                 - credited + debited + opening_amount)
+    return round(invoiced - paid - settles + adds + opening_amount)
 
 
 def customer_balance(customer, business_id):
@@ -268,9 +248,12 @@ def _khaata_sides(business_id):
     Four queries per party kind, however many parties.
     """
     receivable, payable = [], []
+    # select_related: each row reads its name and phone from the person.
     kinds = (
-        ('customer', Customer.objects.filter(business_id=business_id)),
-        ('supplier', Supplier.objects.filter(business_id=business_id)),
+        ('customer', Customer.objects.filter(business_id=business_id)
+         .select_related('person')),
+        ('supplier', Supplier.objects.filter(business_id=business_id)
+         .select_related('person')),
     )
     for kind, parties in kinds:
         settled = settle_parties(business_id, kind)
@@ -285,6 +268,7 @@ def _khaata_sides(business_id):
             row = {
                 'id': party.id,
                 'party_kind': kind,
+                'person_id': party.person_id,
                 'name': party.name,
                 'business_name': getattr(party, 'business_name', None),
                 'phone': party.phone,
@@ -292,6 +276,28 @@ def _khaata_sides(business_id):
                 'aging': khaata.aging(),
             }
             (receivable if owes_business else payable).append(row)
+
+        # People with no role on this side whose loans or set-offs still put
+        # them on it - a lender who is neither customer nor supplier (#28).
+        # They have no role id; party_kind says which side the row is from.
+        loans_only = settle_people(business_id, kind)
+        people = Person.objects.in_bulk(list(loans_only))
+        for person_id, khaata in loans_only.items():
+            balance = round(khaata.balance)
+            if balance == 0 or person_id not in people:
+                continue
+            person = people[person_id]
+            owes_business = balance > 0 if kind == 'customer' else balance < 0
+            (receivable if owes_business else payable).append({
+                'id': None,
+                'party_kind': kind,
+                'person_id': person_id,
+                'name': person.name,
+                'business_name': person.business_name,
+                'phone': person.phone,
+                'balance': abs(balance),
+                'aging': khaata.aging(),
+            })
     return receivable, payable
 
 
@@ -352,10 +358,10 @@ def opening_balance_remaining(business_id, party, party_id, opening=None,
     a list works them out for every party at once.
     """
     if opening is None:
-        opening = (
+        opening = OpeningNet.of(
             PartyOpeningBalance.objects
-            .filter(business_id=business_id, **{f'{party}_id': party_id})
-            .first()
+            .filter(business_id=business_id)
+            .of_role(party, party_id)
         )
 
     if opening is None:
@@ -371,9 +377,10 @@ def opening_balance_remaining(business_id, party, party_id, opening=None,
     settled = opening_amount - remaining
     if include_pending:
         if pending is None:
-            pending, _ = on_account_totals(
-                business_id, {f'{party}_id': party_id}, PARTY_ON_ACCOUNT[party],
-                statuses=('PEN',),
+            # By person, so a pending loan repayment is held back too.
+            pending, _ = party_effect_totals(
+                business_id, {f'person__{party}__id': party_id}, party,
+                statuses=('PEN',), money_only=True,
             )
         settled += min(pending, remaining)
         remaining = max(remaining - pending, 0)
@@ -399,26 +406,35 @@ def uncleared_opening_balances(business_id, party):
     rows = []
     total = 0
 
-    openings = (
-        PartyOpeningBalance.objects
-        .filter(business_id=business_id, amount__gt=0)
-        .exclude(**{f'{party}__isnull': True})
-        .select_related(party)
-    )
-    party_ids = [getattr(opening, f'{party}_id') for opening in openings]
+    # Each role's openings on its own khaata, netted; only what comes out
+    # owed is an opening balance to clear.
+    Role = Customer if party == 'customer' else Supplier
+    by_role = defaultdict(list)
+    for row in (PartyOpeningBalance.objects
+                .filter(business_id=business_id, kind=party,
+                        **{f'person__{party}__isnull': False})
+                .annotate(_role=F(f'person__{party}__id'))):
+        by_role[row._role].append(row)
+    nets = {role_id: OpeningNet.of(found) for role_id, found in by_role.items()}
+    nets = {role_id: net for role_id, net in nets.items() if net.amount > 0}
+    roles = Role.objects.filter(pk__in=list(nets)).select_related('person')
+    openings = [(role, nets[role.id]) for role in roles]
+    party_ids = list(nets)
     settlements = settle_parties(business_id, party, party_ids)
+    # By person (then back to the role), so a pending loan repayment is
+    # held back with the rest of the person's pending money on this side.
     pending_payment = {
-        row[f'{party}_id']: row['total'] or 0
+        row[f'person__{party}__id']: row['total'] or 0
         for row in PartyPayment.objects
         .filter(business_id=business_id, transaction__status='PEN',
-                transaction__type=PARTY_ON_ACCOUNT[party]['payment'],
-                **{f'{party}_id__in': party_ids})
-        .values(f'{party}_id')
+                transaction__type__in=Transaction.party_types(
+                    party, 'settles', money_only=True),
+                **{f'person__{party}__id__in': party_ids})
+        .values(f'person__{party}__id')
         .annotate(total=Sum('transaction__amount'))
     }
 
-    for opening in openings:
-        who = getattr(opening, party)
+    for who, opening in openings:
         settlement = settlements.get(who.id) or Settlement(party, who.id)
 
         # This is a payment PICKER, so `balance` is what can still be
@@ -452,31 +468,34 @@ def uncleared_opening_balances(business_id, party):
 
 # ── Khaata ────────────────────────────────────────────────────────────────────
 
-def party_ledger(business_id, customer=None, supplier=None,
-                 date_from=None, date_to=None):
+def _side_rows(business_id, kind, role, person):
     """
-    One party's khaata: every invoice raised and every payment made, in date
-    order, with a running balance. Naam is what they owe; jama is what they
-    have paid.
+    One khaata of a person, unsorted: their opening balances on it,
+    invoices and invoice payments (when they have the role), and every money
+    row of this side naming the person - on-account payments, notes,
+    refunds, loans and set-offs. Naam is what puts the side up; jama what
+    brings it down.
     """
     rows = []
-    party = customer or supplier
-    opening = getattr(party, 'opening_balance', None)
-
-    if opening:
+    # The person's opening balances that count on this khaata: one row each,
+    # an advance (a Payable opening of a customer, say) as jama.
+    openings = PartyOpeningBalance.objects.filter(
+        business_id=business_id, person_id=person.id, kind=kind)
+    for opening in openings:
+        signed = opening.signed_amount
         rows.append({
             'date': opening.as_of_date.isoformat(),
             '_seq': '',
             'description': 'Opening balance',
             'reference': None,
-            'naam': opening.amount if opening.amount > 0 else 0,
-            'jama': -opening.amount if opening.amount < 0 else 0,
+            'naam': signed if signed > 0 else 0,
+            'jama': -signed if signed < 0 else 0,
         })
 
-    if customer:
+    if role is not None and kind == 'customer':
         invoices = (
             SalesInvoice.objects
-            .filter(business_id=business_id, customer_id=customer.id)
+            .filter(business_id=business_id, customer_id=role.id)
             .exclude(status__in=NOT_A_DEBT_SALES_STATUSES)
         )
         for invoice in invoices:
@@ -486,13 +505,13 @@ def party_ledger(business_id, customer=None, supplier=None,
                 '_seq': invoice.created_at.isoformat(),
                 'description': 'Sales invoice',
                 'reference': invoice.invoice_number or str(invoice.id),
-                'naam': round(invoice.total or 0),
+                'naam': invoice.total or 0,
                 'jama': 0,
             })
 
         receipts = SalesReceipt.objects.filter(
             sales_invoice__business_id=business_id,
-            sales_invoice__customer_id=customer.id,
+            sales_invoice__customer_id=role.id,
         ).filter(CLEARED_RECEIPT).select_related(
             'sales_invoice', 'transaction_record')
         for receipt in receipts:
@@ -503,13 +522,13 @@ def party_ledger(business_id, customer=None, supplier=None,
                 'reference': receipt.sales_invoice.invoice_number
                 or str(receipt.sales_invoice_id),
                 'naam': 0,
-                'jama': round(receipt.amount or 0),
+                'jama': receipt.amount or 0,
             })
 
-    if supplier:
+    if role is not None and kind == 'supplier':
         invoices = (
             PurchaseInvoice.objects
-            .filter(business_id=business_id, supplier_id=supplier.id)
+            .filter(business_id=business_id, supplier_id=role.id)
             .exclude(status__in=NOT_A_DEBT_PURCHASE_STATUSES)
         )
         for invoice in invoices:
@@ -523,13 +542,13 @@ def party_ledger(business_id, customer=None, supplier=None,
                 '_seq': invoice.created_at.isoformat(),
                 'description': 'Purchase invoice',
                 'reference': invoice.invoice_number or str(invoice.id),
-                'naam': round(invoice.total or 0),
+                'naam': invoice.total or 0,
                 'jama': 0,
             })
 
         receipts = PurchaseReceipt.objects.filter(
             purchase_invoice__business_id=business_id,
-            purchase_invoice__supplier_id=supplier.id,
+            purchase_invoice__supplier_id=role.id,
         ).filter(CLEARED_RECEIPT).select_related(
             'purchase_invoice', 'transaction_record')
         for receipt in receipts:
@@ -540,69 +559,189 @@ def party_ledger(business_id, customer=None, supplier=None,
                 'reference': receipt.purchase_invoice.invoice_number
                 or str(receipt.purchase_invoice_id),
                 'naam': 0,
-                'jama': round(receipt.amount or 0),
+                'jama': receipt.amount or 0,
             })
 
-    # Everything on account carries no invoice. A payment or a credit note
-    # lowers the balance; a refund (money going back out) or a debit note
-    # raises it, so those land on the other side.
-    if customer:
-        party_filter = {'customer_id': customer.id}
-        kinds = PARTY_ON_ACCOUNT['customer']
-    else:
-        party_filter = {'supplier_id': supplier.id}
-        kinds = PARTY_ON_ACCOUNT['supplier']
-
+    # Everything that names no invoice, by person, so loans and set-offs are
+    # here whatever roles the person has. A payment, credit note, recovery or
+    # set-off lowers this side; a refund, debit note or loan raises it.
     descriptions = {
-        kinds['payment']: ('On-account payment', 'jama'),
-        kinds['credit_note']: ('Credit note', 'jama'),
-        kinds['refund']: ('Refund', 'naam'),
-        kinds['debit_note']: ('Debit note', 'naam'),
+        t: (LABELS[entry_kind], 'jama' if effect == 'settles' else 'naam')
+        for t, (p, effect, entry_kind) in Transaction.PARTY_EFFECTS.items()
+        if p == kind
     }
     on_account = PartyPayment.objects.filter(
         business_id=business_id, transaction__status='C',
-        transaction__type__in=list(descriptions),
-        **party_filter
+        transaction__type__in=list(descriptions), person_id=person.id,
     ).select_related('transaction')
     for payment in on_account:
-        description, side = descriptions[payment.transaction.type]
-        amount = payment.transaction.amount
+        txn = payment.transaction
+        description, side = descriptions[txn.type]
         rows.append({
-            'date': payment.transaction.date.isoformat(),
+            'date': txn.date.isoformat(),
             '_seq': payment.created_at.isoformat(),
             'description': description,
-            'reference': payment.transaction.reference,
-            'naam': amount if side == 'naam' else 0,
-            'jama': amount if side == 'jama' else 0,
+            'reference': txn.set_off_reference or txn.reference,
+            'naam': txn.amount if side == 'naam' else 0,
+            'jama': txn.amount if side == 'jama' else 0,
         })
 
-    rows = [row for row in rows if row['date']]
+    return [row for row in rows if row['date']]
+
+
+def _finish_ledger(rows, date_from, date_to, sides=None):
+    """
+    Sort, carry everything before date_from in as one figure, and add the
+    running balance. With `sides` (the both-sides view) each side keeps its
+    own running balance and brought-forward figure - never one netted
+    balance (register #25).
+    """
     rows.sort(key=lambda row: (row['date'], row['_seq']))
     for row in rows:
         del row['_seq']
 
-    # Everything before the range is carried in as one figure, so a ranged
-    # statement still starts from the party's real position.
-    brought_forward = 0
+    keys = sides or [None]
+    brought_forward = {key: 0 for key in keys}
     if date_from:
         cutoff = date_from.isoformat()
-        brought_forward = sum(
-            row['naam'] - row['jama'] for row in rows if row['date'] < cutoff
-        )
+        for row in rows:
+            if row['date'] < cutoff:
+                brought_forward[row.get('side')] += row['naam'] - row['jama']
         rows = [row for row in rows if row['date'] >= cutoff]
     if date_to:
         rows = [row for row in rows if row['date'] <= date_to.isoformat()]
 
-    running = brought_forward
+    running = dict(brought_forward)
     for row in rows:
-        running += row['naam'] - row['jama']
-        row['balance'] = running
+        running[row.get('side')] += row['naam'] - row['jama']
+        if sides:
+            for key in sides:
+                row[f'{key}_balance'] = running[key]
+        else:
+            row['balance'] = running[None]
 
+    if sides:
+        return {
+            'rows': rows,
+            'brought_forward': {key: round(value) for key, value in brought_forward.items()},
+            'closing_balance': {key: round(value) for key, value in running.items()},
+        }
     return {
         'rows': rows,
-        'brought_forward': round(brought_forward),
-        'closing_balance': running,
+        'brought_forward': round(brought_forward[None]),
+        'closing_balance': running[None],
     }
+
+
+def party_ledger(business_id, customer=None, supplier=None,
+                 date_from=None, date_to=None):
+    """
+    One role's khaata: every invoice raised and every payment made, in date
+    order, with a running balance - plus the person's loans and set-offs on
+    that side. Naam is what they owe; jama is what they have paid.
+    """
+    kind = 'customer' if customer else 'supplier'
+    role = customer or supplier
+    rows = _rounded_running(_side_rows(business_id, kind, role, role.person))
+    return _finish_ledger(rows, date_from, date_to)
+
+
+def _rounded_running(rows):
+    """
+    Whole-rupee rows that add up to the rounded balance. Invoice totals and
+    receipts carry fractions (FloatField); rounding each row on its own and
+    adding those up drifts from the cards, which add the exact amounts and
+    round once (2026-11-23 production check: 1 and 2 PKR). So each row shows
+    how far it moves the rounded running balance instead: one row may read a
+    rupee off its own rounded amount, but the khaata always closes on the
+    card's figure.
+    """
+    rows.sort(key=lambda row: (row['date'], row['_seq']))
+    balance = 0
+    for row in rows:
+        before = round(balance)
+        balance += row['naam'] - row['jama']
+        change = round(balance) - before
+        row['naam'] = change if change > 0 else 0
+        row['jama'] = -change if change < 0 else 0
+    return rows
+
+
+# The khaata's sides by their People names (register #27).
+SIDE_KINDS = {'receivable': 'customer', 'payable': 'supplier'}
+
+
+def person_ledger(business_id, person, side='both', date_from=None, date_to=None):
+    """
+    A person's khaata (register #25), by the person's two sides: side=
+    'receivable' or 'payable' gives one side with one running balance;
+    'both' gives every row tagged with its side and a running balance per
+    side.
+
+    The sides are the person's, not the roles'. Each role's rows run on that
+    role's khaata, and whatever takes it below zero is on the other side: a
+    customer who pays 15,000 against 10,000 owed shows the payment as 10,000
+    on Receivable and 5,000 on Payable (the advance), and the next sale uses
+    the advance up there first. So neither side's running balance goes
+    negative, and each closes on what the cards show (root.people
+    .side_balances). It is still one transaction: only the khaata shows it
+    in two parts.
+    """
+    rows = _person_side_rows(business_id, person)
+    if side in SIDE_KINDS:
+        rows = [row for row in rows if row.pop('side') == side]
+        return _finish_ledger(rows, date_from, date_to)
+    return _finish_ledger(rows, date_from, date_to, sides=list(SIDE_KINDS))
+
+
+NATURAL_SIDE = {kind: side for side, kind in SIDE_KINDS.items()}
+OTHER_SIDE = {'receivable': 'payable', 'payable': 'receivable'}
+
+
+def _person_side_rows(business_id, person):
+    """
+    Every khaata row of the person, put on the side it moves. Walks each
+    role's khaata in date order with its signed running balance: the part of
+    a row that moves the balance on the role's own side stays there, and the
+    part past zero goes to the other side, marked as the advance it makes or
+    uses. A row that does both appears twice, once per side, with the same
+    date and reference.
+
+    Amounts are whole rupees: each part is how far the row moves the ROUNDED
+    running balance (see _rounded_running), so each side closes on exactly
+    the card's figure, which rounds each role's balance once.
+    """
+    from root.people import role_of
+
+    out = []
+    for kind, own in NATURAL_SIDE.items():
+        other = OTHER_SIDE[own]
+        rows = _side_rows(business_id, kind, role_of(person, kind), person)
+        rows.sort(key=lambda row: (row['date'], row['_seq']))
+        balance = 0
+        for row in rows:
+            before = round(balance)
+            balance += row['naam'] - row['jama']
+            after = round(balance)
+            own_part = max(after, 0) - max(before, 0)
+            other_part = max(-after, 0) - max(-before, 0)
+            if not own_part and not other_part:
+                out.append({**row, 'side': own, 'naam': 0, 'jama': 0})
+                continue
+            for part_side, part in ((own, own_part), (other, other_part)):
+                if not part:
+                    continue
+                description = row['description']
+                if part_side == other:
+                    description += ' · advance' if part > 0 else ' · against advance'
+                out.append({
+                    **row,
+                    'side': part_side,
+                    'description': description,
+                    'naam': part if part > 0 else 0,
+                    'jama': -part if part < 0 else 0,
+                })
+    return out
 
 
 # ── Roznamcha ─────────────────────────────────────────────────────────────────
@@ -691,6 +830,16 @@ def day_book(business_id, day, date_to=None):
     }
 
 
+def _with_other(total, lines):
+    """
+    The named lines, an `other` line for whatever they leave out (refunds,
+    other payments, transfers the day book counts), and the total - so the
+    lines always add up to the total (register #8).
+    """
+    other = round(total - sum(lines.values()))
+    return {**lines, 'other': other, 'total': total}
+
+
 def daily_summary(business_id, day, date_to=None):
     """
     The end-of-day picture (§6.9) — what came in, what went out, what is left,
@@ -756,18 +905,20 @@ def daily_summary(business_id, day, date_to=None):
             }
             for section in book['accounts']
         ],
-        'money_in': {
+        'money_in': _with_other(book['total_money_in'], {
             'cash_sales': cash_sales,
             'udhaar_recovered': udhaar_recovered,
+            # Loans have their own line (register #8): money borrowed, and
+            # money lent out coming back. Neither is income.
+            'loans': (totals.get('loan_received', 0)
+                      + totals.get('loan_recovered', 0)),
             'other_income': (
                 totals.get('other_income', 0)
                 + totals.get('owner_capital', 0)
-                + totals.get('loan_received', 0)
                 + totals.get('purchase_return_refund', 0)
             ),
-            'total': book['total_money_in'],
-        },
-        'money_out': {
+        }),
+        'money_out': _with_other(book['total_money_out'], {
             # Salaries are expenses in the salary category now, not their own
             # type, so their share moves out of the expenses line and into the
             # salaries one. Without this the expenses line would quietly
@@ -780,8 +931,10 @@ def daily_summary(business_id, day, date_to=None):
             ),
             'salaries': totals.get('salary_payment', 0) + salary_expenses,
             'drawings': totals.get('owner_drawings', 0),
-            'total': book['total_money_out'],
-        },
+            # Loans repaid, and money lent out.
+            'loans': (totals.get('loan_repayment', 0)
+                      + totals.get('loan_given', 0)),
+        }),
         'credit_extended': round(max(credit_extended - cash_sales, 0)),
         'total_receivable': sum(row['balance'] for row in receivable_rows),
         'total_payable': sum(row['balance'] for row in payable_rows),

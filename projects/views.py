@@ -18,7 +18,7 @@ class ProjectViewSet(ModelViewSet):
     # the view accepted the parameters and returned every project.
     filter_backends = [SearchFilter, DjangoFilterBackend]
     filterset_fields = ['customer', 'status']
-    search_fields = ['name', 'desc', 'customer__name']
+    search_fields = ['name', 'desc', 'customer__person__name']
 
     def get_queryset(self):
 
@@ -31,7 +31,7 @@ class ProjectViewSet(ModelViewSet):
             # Each row nests its customer (and the customer's city) and counts
             # its invoices and tasks; fetched with the rows, not once per row.
             # The counts read the prefetched rows (RelatedManager.count does).
-            queryset = (queryset.select_related('customer__city')
+            queryset = (queryset.select_related('customer__person__city')
                         .prefetch_related('sales_invoices', 'purchase_invoices', 'tasks'))
         return queryset
 

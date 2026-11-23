@@ -67,7 +67,7 @@ class PeriodSwitchTests(TestCase):
         cls.business = Business.objects.create(
             name="Period Paints", owner=cls.user, phone="03001234567", is_active=True)
         BusinessConfig.objects.create(business=cls.business, accounting=True)
-        cls.walk_in = Customer.objects.get(business=cls.business, name=WALK_IN_CUSTOMER_NAME)
+        cls.walk_in = Customer.objects.get(business=cls.business, person__name=WALK_IN_CUSTOMER_NAME)
         cls.ali = Customer.objects.create(business=cls.business, name="Ali Traders", city=city)
         cls.supplier = Supplier.objects.create(business=cls.business, name="Jotun")
         cls.cash = MoneyAccount.objects.get_default_account(cls.business.id)
