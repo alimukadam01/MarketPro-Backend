@@ -1,4 +1,4 @@
-from django.db import models
+from django.db import models, transaction as db_transaction
 from django.db.models.functions import Coalesce, TruncDate
 from calendar import monthrange
 from datetime import date, datetime, timedelta
@@ -193,6 +193,7 @@ class EmployeeAccess(models.Model):
         "products":      {"view": bool, "create": bool, "edit": bool, "delete": bool},
         "customers":     {"view": bool, "create": bool, "edit": bool, "delete": bool},
         "suppliers":     {"view": bool, "create": bool, "edit": bool, "delete": bool},
+        "people":        {"view": bool, "create": bool, "edit": bool, "delete": bool},
         "locations":     {"view": bool, "create": bool, "edit": bool, "delete": bool},
         "expenses":      {"view": bool, "create": bool, "edit": bool, "delete": bool},
         "projects":      {"view": bool, "create": bool, "edit": bool, "delete": bool},
@@ -210,6 +211,9 @@ class EmployeeAccess(models.Model):
         "products",
         "customers",
         "suppliers",
+        # The People list and person page; only `people.delete` deletes a
+        # person. customers / suppliers now cover each side of it.
+        "people",
         "locations",
         "expenses",
         "projects",
@@ -236,11 +240,101 @@ class EmployeeAccess(models.Model):
 WALK_IN_CUSTOMER_NAME = "Walk-In Customer"
 
 
+class PersonQuerySet(BaseQuerySet):
+    pass
+
+
+class Person(models.Model):
+    """
+    One person or firm the business deals with (People plan, register #29).
+
+    Customer and Supplier are roles a person plays: each is a small record
+    pointing here, and keeps its own id, so every invoice, receipt, project,
+    target and audit row that names a customer or supplier is unchanged. The
+    details - name, phone, city and the rest - live here, once, however many
+    roles the person has. A person can also have no role at all.
+    """
+
+    business = models.ForeignKey(
+        Business, models.CASCADE, related_name='people')
+    name = models.CharField(max_length=256)
+    phone = models.CharField(max_length=256, null=True, blank=True)
+    email = models.EmailField(null=True, blank=True)
+    address = models.TextField(null=True, blank=True)
+    # Required by the forms, optional here: suppliers never had a city, so
+    # the ones carried over from before People have none (register S5).
+    city = models.ForeignKey(
+        City, models.DO_NOTHING, null=True, blank=True)
+    business_name = models.CharField(max_length=256, null=True, blank=True)
+    notes = models.TextField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    objects = PersonQuerySet.as_manager()
+
+    def __str__(self):
+        return self.name
+
+
+# The details that live on Person, which the roles still accept on create and
+# read through (PersonDetails below).
+PERSON_FIELDS = ('name', 'phone', 'email', 'address', 'city',
+                 'business_name', 'notes')
+
+
+class RoleManager(models.Manager):
+    """
+    create() for a role still takes the person's details, as it did when they
+    lived on the role, and makes the Person first. Pass `person` to give an
+    existing person the role instead.
+    """
+
+    def create(self, **kwargs):
+        if 'person' in kwargs or 'person_id' in kwargs:
+            return super().create(**kwargs)
+        details = {key: kwargs.pop(key) for key in
+                   (*PERSON_FIELDS, 'city_id') if key in kwargs}
+        business = kwargs.get('business')
+        business_id = kwargs.get('business_id') or getattr(business, 'id', None)
+        with db_transaction.atomic():
+            kwargs['person'] = Person.objects.create(
+                business_id=business_id, **details)
+            return super().create(**kwargs)
+
+
+class PersonDetails:
+    """
+    A role reads its person's details as its own, so customer.name keeps
+    meaning what it always did. Read-only: change details on the person.
+    """
+
+    name = property(lambda self: self.person.name)
+    phone = property(lambda self: self.person.phone)
+    email = property(lambda self: self.person.email)
+    address = property(lambda self: self.person.address)
+    city = property(lambda self: self.person.city)
+    city_id = property(lambda self: self.person.city_id)
+    business_name = property(lambda self: self.person.business_name)
+    notes = property(lambda self: self.person.notes)
+
+    @property
+    def opening_balance(self):
+        """
+        The person's opening balances that count on this role's khaata,
+        netted (accounts.models.OpeningNet), or None. Reads
+        person.opening_balances, so prefetch it for a list.
+        """
+        from accounts.models import OpeningNet
+        kind = self._meta.model_name
+        return OpeningNet.of(
+            row for row in self.person.opening_balances.all() if row.kind == kind)
+
+
 class CustomerQuerySet(BaseQuerySet):
     pass
 
 
-class CustomerManager(models.Manager):
+class CustomerManager(RoleManager):
 
     def get_queryset(self):
         return CustomerQuerySet(self.model)
@@ -270,32 +364,34 @@ class CustomerManager(models.Manager):
         if not city_id:
             return None
 
-        customer, _ = self.get_queryset().get_or_create(
-            business_id=business_id,
-            name=WALK_IN_CUSTOMER_NAME,
-            defaults={'city_id': city_id},
-        )
-        return customer
+        existing = self.get_queryset().filter(
+            business_id=business_id, person__name=WALK_IN_CUSTOMER_NAME).first()
+        if existing:
+            return existing
+        return self.create(business_id=business_id,
+                           name=WALK_IN_CUSTOMER_NAME, city_id=city_id)
 
 
-class Customer(models.Model):
+class Customer(PersonDetails, models.Model):
+    """
+    The customer role of a Person: who sales invoices and projects name. Its
+    details (name, phone, city...) are the person's.
+    """
 
-    name = models.CharField(max_length=256)
+    person = models.OneToOneField(
+        Person, models.CASCADE, related_name='customer')
     business = models.ForeignKey(
         Business, models.CASCADE, related_name='customers')
-    phone = models.CharField(max_length=256, null=True, blank=True)
-    email = models.EmailField(null=True, blank=True)
-    address = models.TextField(null=True, blank=True)
-    city = models.ForeignKey(City, models.DO_NOTHING)
+    # Off: kept with all its history, but no longer offered for new sales
+    # documents. A role is never deleted on its own (register R4, R13).
+    is_active = models.BooleanField(default=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
-    notes = models.TextField(null=True, blank=True)
-    total_sales = models.FloatField(null=True, blank=True)
 
     objects = CustomerManager()
 
     def __str__(self):
-        return f"{self.email}"
+        return f"{self.person.email}"
 
 
 class LocationQuerySet(BaseQuerySet):
@@ -472,7 +568,7 @@ class SupplierQuerySet(BaseQuerySet):
     pass
 
 
-class SupplierManager(models.Manager):
+class SupplierManager(RoleManager):
 
     def get_queryset(self):
         return SupplierQuerySet(self.model)
@@ -485,19 +581,27 @@ class SupplierManager(models.Manager):
         return self.get_queryset().for_business(business_id).count()
 
 
-class Supplier(models.Model):
+class Supplier(PersonDetails, models.Model):
+    """
+    The supplier role of a Person: who purchase invoices and quotations name.
+    Its details (name, business name, phone...) are the person's.
+    """
+
+    person = models.OneToOneField(
+        Person, models.CASCADE, related_name='supplier')
     business = models.ForeignKey(
         Business, models.CASCADE, related_name='suppliers')
-    name = models.CharField(max_length=256)
-    business_name = models.CharField(max_length=256, null=True, blank=True)
-    phone = models.CharField(max_length=256, null=True, blank=True)
-    email = models.EmailField(null=True, blank=True)
-    notes = models.TextField(null=True, blank=True)
+    # See Customer.is_active.
+    is_active = models.BooleanField(default=True)
+    # Suppliers had no date before People. Carried-over ones were given the
+    # audit log's creation time, else their first purchase invoice's date,
+    # else the day of the migration (register S6).
+    created_at = models.DateTimeField(auto_now_add=True)
 
     objects = SupplierManager()
 
     def __str__(self):
-        return f"{self.business_name}: {self.name}"
+        return f"{self.person.business_name}: {self.person.name}"
 
 
 class ExpenseQuerySet(BaseQuerySet):

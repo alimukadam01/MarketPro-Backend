@@ -12,6 +12,9 @@ class TransactionFilter(filters.FilterSet):
     # customer / supplier of the invoice a payment was recorded against.
     customer = filters.NumberFilter(method='filter_customer')
     supplier = filters.NumberFilter(method='filter_supplier')
+    # Everything with one person, whatever role it went through - including
+    # loans and set-offs, which name only the person (People).
+    person = filters.NumberFilter(method='filter_person')
     amount_min, amount_max = number_range('amount')
 
     class Meta:
@@ -27,3 +30,9 @@ class TransactionFilter(filters.FilterSet):
     def filter_supplier(self, queryset, name, value):
         return queryset.filter(
             Q(party_payment__supplier=value) | Q(purchase_receipt__purchase_invoice__supplier=value))
+
+    def filter_person(self, queryset, name, value):
+        return queryset.filter(
+            Q(party_payment__person=value)
+            | Q(sales_receipt__sales_invoice__customer__person=value)
+            | Q(purchase_receipt__purchase_invoice__supplier__person=value))

@@ -7,7 +7,7 @@ package itself; RootConfig.ready() imports this module.
 from root.search import Hit, SearchType, admin_only, link, register, status
 from root.search.labels import joined, person_name, product_label
 
-from .models import Customer, Employee, Expense, Location, Product, ProductVariant, Supplier
+from .models import Employee, Expense, Location, Person, Product, ProductVariant
 
 INACTIVE = status("OFF", "Inactive", "neutral")
 
@@ -72,40 +72,33 @@ register(SearchType(
 
 # ── People ───────────────────────────────────────────────────────────────────
 
+def _person_roles(person):
+    roles = []
+    for kind, label in (("customer", "Customer"), ("supplier", "Supplier")):
+        # A missing reverse one-to-one raises an AttributeError subclass.
+        role = getattr(person, kind, None)
+        if role is not None:
+            roles.append(label if role.is_active else f"{label} (inactive)")
+    return ", ".join(roles)
+
+
+# One result per person, whatever roles they hold (People, register R33).
 register(SearchType(
-    key="customer",
-    label="Customers",
-    model=Customer,
-    module="customers",
-    text_fields=["name", "email", "address", "city__name", "notes"],
+    key="person",
+    label="People",
+    model=Person,
+    module="people",
+    text_fields=["name", "business_name", "email", "address", "city__name", "notes"],
     number_fields=["id"],
     phone_fields=["phone"],
-    select_related=["city"],
+    select_related=["city", "customer", "supplier"],
     order_by=["name", "id"],
     priority=150,
-    to_hit=lambda customer: Hit(
-        id=customer.id,
-        title=customer.name,
-        subtitle=joined(getattr(customer.city, "name", ""), customer.phone),
-        link=link("/customers/view-customer", customer_id=customer.id),
-    ),
-))
-
-register(SearchType(
-    key="supplier",
-    label="Suppliers",
-    model=Supplier,
-    module="suppliers",
-    text_fields=["name", "business_name", "email", "notes"],
-    number_fields=["id"],
-    phone_fields=["phone"],
-    order_by=["name", "id"],
-    priority=160,
-    to_hit=lambda supplier: Hit(
-        id=supplier.id,
-        title=supplier.name,
-        subtitle=joined(supplier.business_name, supplier.phone),
-        link=link("/suppliers/view-supplier", supplier_id=supplier.id),
+    to_hit=lambda person: Hit(
+        id=person.id,
+        title=person.name,
+        subtitle=joined(_person_roles(person), getattr(person.city, "name", ""), person.phone),
+        link=link("/people/view-person", person_id=person.id),
     ),
 ))
 

@@ -623,7 +623,7 @@ class BacklogWorkViewSet(GenericViewSet):
     def glossary(self, request):
         business = self.business()
         rows = (GlossaryEntry.objects.filter(business_id=business.id).current()
-                .select_related('customer', 'supplier', 'product').order_by('term'))
+                .select_related('customer__person', 'supplier__person', 'product').order_by('term'))
         return Response({'version': current_version(business),
                          'entries': GlossaryEntrySerializer(rows, many=True).data})
 

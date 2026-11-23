@@ -19,7 +19,7 @@ from rest_framework_simplejwt.tokens import AccessToken
 
 from inventory.models import InventoryItem
 from root.models import (
-    Business, BusinessConfig, City, Customer, Employee, EmployeeAccess, Location, Product,
+    Business, BusinessConfig, City, Customer, Employee, EmployeeAccess, Location, Person, Product,
     ProductVariant, Supplier, Unit,
 )
 from sales.models import InvoiceImage, PurchaseInvoice, ReturnedItem, SalesInvoice, SalesInvoiceItem
@@ -289,8 +289,8 @@ class VisibilityTests(BacklogFixture):
     def test_the_whole_list_for_a_picker_that_filters_on_the_page(self):
         """?all=1 lifts the cap: the entry pickers load every record once and
         filter it themselves, as the invoice screens do. Still names only."""
-        Customer.objects.bulk_create([Customer(business=self.business, name=f'Buyer {n:02}', city=self.city)
-                                      for n in range(30)])
+        for n in range(30):
+            Customer.objects.create(business=self.business, name=f'Buyer {n:02}', city=self.city)
         client = client_for(self.typist)
         capped = client.get('/backlog-work/lookup/customers/', {'q': ''}).json()
         everyone = client.get('/backlog-work/lookup/customers/', {'q': '', 'all': '1'}).json()
@@ -627,7 +627,7 @@ class NewRecordsTests(BacklogFixture):
         customer = Customer.objects.get(pk=response.json()['id'])
         self.assertEqual(response.json(), {'id': customer.id, 'label': 'Shafiq Ahmed'})
         self.assertEqual((customer.business, customer.city), (self.business, self.city))
-        self.assertFalse(PartyOpeningBalance.objects.filter(customer=customer).exists())
+        self.assertFalse(PartyOpeningBalance.objects.filter(person=customer.person).exists())
 
     def test_a_new_supplier_from_a_backlog_page(self):
         from accounts.models import PartyOpeningBalance
@@ -637,7 +637,7 @@ class NewRecordsTests(BacklogFixture):
             'opening_balance': {'amount': 3000, 'as_of_date': '2019-01-01'}}, format='json')
         self.assertEqual(response.status_code, 201, response.content)
         self.assertEqual(response.json()['label'], 'Nippon (Nippon Paint Pakistan)')
-        self.assertFalse(PartyOpeningBalance.objects.filter(supplier_id=response.json()['id']).exists())
+        self.assertFalse(PartyOpeningBalance.objects.filter(person__supplier__id=response.json()['id']).exists())
 
     def test_products_are_not_created_from_an_invoice(self):
         """Only a stock page makes products; the invoice screens' endpoints
@@ -747,7 +747,7 @@ class NewRecordsTests(BacklogFixture):
             'name': 'Walk-in Builders', 'city': self.city.id,
             'opening_balance': {'amount': 750, 'as_of_date': '2026-01-01'}}, format='json')
         self.assertEqual(customer.status_code, 201, customer.content)
-        self.assertEqual(PartyOpeningBalance.objects.get(customer_id=customer.json()['id']).amount, 750)
+        self.assertEqual(PartyOpeningBalance.objects.get(person__customer__id=customer.json()['id']).amount, 750)
 
         supplier = owner.post('/suppliers/create-with-balance/', {'name': 'Nippon'}, format='json')
         self.assertEqual((supplier.status_code, supplier.json()['label']), (201, 'Nippon'))
@@ -1080,7 +1080,7 @@ class CustomerLookupPhoneTests(BacklogFixture):
     """A customer reads "Name · phone" in the entry pickers (plans part 03, 3.1)."""
 
     def test_label_has_the_phone_and_name_does_not(self):
-        Customer.objects.filter(pk=self.customer.pk).update(phone='03313689402')
+        Person.objects.filter(pk=self.customer.person_id).update(phone='03313689402')
         Customer.objects.create(business=self.business, name='No Phone Traders', city=self.city)
         rows = client_for(self.typist).get('/backlog-work/lookup/customers/', {'q': ''}).json()
         by_name = {row['name']: row['label'] for row in rows}

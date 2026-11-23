@@ -79,8 +79,10 @@ class SalesInvoiceFilter(filters.FilterSet):
         method='filter_status')
 
     # By id, not name: two customers can share a name, and the filter's
-    # dropdown keeps them apart. customer__name stays for older clients.
+    # dropdown keeps them apart. customer__name stays for older clients; the
+    # name now lives on the customer's person.
     customer = filters.NumberFilter(field_name='customer')
+    customer__name = filters.CharFilter(field_name='customer__person__name')
     created_by = filters.NumberFilter(field_name='created_by')
     # An invoice is linked to a project through ProjectSalesInvoice.
     project = filters.NumberFilter(field_name='projects__project', distinct=True)
@@ -159,6 +161,8 @@ class PurchaseInvoiceFilter(filters.FilterSet):
         field_name='date_due', lookup_expr='lte')
 
     supplier = filters.NumberFilter(field_name='supplier')
+    # Same name as before; the name now lives on the supplier's person.
+    supplier__name = filters.CharFilter(field_name='supplier__person__name')
     created_by = filters.NumberFilter(field_name='created_by')
     project = filters.NumberFilter(field_name='projects__project', distinct=True)
     total_min, total_max = number_range('total')

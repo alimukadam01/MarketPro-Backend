@@ -35,7 +35,9 @@ class ProductFilter(filters.FilterSet):
 class CustomerFilter(filters.FilterSet):
     # By id: an exact-match text box on the city's name found nothing for a
     # typo or a different case.
-    city = filters.NumberFilter(field_name='city')
+    city = filters.NumberFilter(field_name='person__city')
+    # Same parameter as before; the city now lives on the customer's person.
+    city__name = filters.CharFilter(field_name='person__city__name')
 
     class Meta:
         model = Customer

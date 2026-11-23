@@ -7,7 +7,7 @@ from .models import (
     Product, Supplier, Unit, Business,
     Expense, ProductVariantType, 
     ProductVariant, Employee, EmployeeAccess, BusinessConfig,
-    ProductField, ProductFieldLink,
+    ProductField, ProductFieldLink, Person,
 )
 
 # Registered through MaskedModelAdmin so currency amounts render as asterisks.
@@ -16,8 +16,8 @@ from .models import (
 # masks the FK dropdowns and columns pointing at amount-bearing models.
 for model in (
     City, Category, Unit, Business, BusinessConfig, Employee, EmployeeAccess,
-    Customer, Location, Product, ProductVariant, ProductVariantType, Supplier,
-    Expense,
+    Person, Customer, Location, Product, ProductVariant, ProductVariantType,
+    Supplier, Expense,
 ):
     admin.site.register(model, MaskedModelAdmin)
 

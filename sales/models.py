@@ -792,8 +792,11 @@ class PurchaseInvoice(SettledInvoiceMixin, models.Model):
     invoice_number = models.CharField(max_length=256, null=True, blank=True)
     business = models.ForeignKey(
         Business, models.CASCADE, related_name='purchase_invoices')
+    # CASCADE, as for sales invoices: a supplier role is never deleted on its
+    # own, and deleting the person removes everything about them, after the
+    # user has seen the list (People, register S1).
     supplier = models.ForeignKey(
-        Supplier, models.DO_NOTHING, related_name='purchase_invoices')
+        Supplier, models.CASCADE, related_name='purchase_invoices')
     # Editable, so a purchase entered a day late can carry the day it happened.
     # created_at cannot do this job: it is auto_now_add, so a quarterly purchase
     # target would count a late-entered invoice in the wrong quarter for good.

@@ -565,6 +565,7 @@ class Transaction(models.Model):
         'purchase_return_refund',
         'owner_capital',
         'loan_received',
+        'loan_recovered',
         'other_income',
     ]
 
@@ -576,6 +577,7 @@ class Transaction(models.Model):
         'salary_payment',
         'owner_drawings',
         'loan_repayment',
+        'loan_given',
         'other_payment',
     ]
 
@@ -584,18 +586,59 @@ class Transaction(models.Model):
         'cash_adjustment',
     ]
 
+    # The khaata rules, in one place. Every type that sits on a party's khaata
+    # without naming an invoice: which party it names, which way it moves
+    # their balance, and what kind of entry it is. Every other list of party
+    # types (here, in settlement, utils and serializers) is read from this.
+    #
+    #   settles  takes debt off (jama): on-account payments, credit notes
+    #   adds     puts debt back on (naam): refunds paid out, debit notes
+    #
+    # The kind names the entry on the khaata (settlement.LABELS). Notes move
+    # no money; everything else here does.
+    PARTY_EFFECTS = {
+        'customer_receipt':       ('customer', 'settles', 'payment'),
+        'customer_credit_note':   ('customer', 'settles', 'credit_note'),
+        'sales_return_refund':    ('customer', 'adds',    'refund'),
+        'customer_debit_note':    ('customer', 'adds',    'debit_note'),
+        'supplier_payment':       ('supplier', 'settles', 'payment'),
+        'supplier_credit_note':   ('supplier', 'settles', 'credit_note'),
+        'purchase_return_refund': ('supplier', 'adds',    'refund'),
+        'supplier_debit_note':    ('supplier', 'adds',    'debit_note'),
+        # Loans and set-offs name the person, not a role: anyone can lend or
+        # borrow (register #28). 'customer' is the Receivable side, 'supplier'
+        # the Payable side.
+        'loan_given':             ('customer', 'adds',    'loan_given'),
+        'loan_recovered':         ('customer', 'settles', 'loan_recovered'),
+        'set_off_receivable':     ('customer', 'settles', 'set_off'),
+        'loan_received':          ('supplier', 'adds',    'loan_received'),
+        'loan_repayment':         ('supplier', 'settles', 'loan_repayment'),
+        'set_off_payable':        ('supplier', 'settles', 'set_off'),
+    }
+
     # Notes move no money. A credit note lowers what the party owes (or what
     # the business owes them); a debit note raises it. One type per party kind
     # keeps the one-type-one-reference rule the type picker relies on.
-    CREDIT_NOTE_TYPES = ['customer_credit_note', 'supplier_credit_note']
-    DEBIT_NOTE_TYPES = ['customer_debit_note', 'supplier_debit_note']
+    CREDIT_NOTE_TYPES = [t for t, (_, _, kind) in PARTY_EFFECTS.items()
+                         if kind == 'credit_note']
+    DEBIT_NOTE_TYPES = [t for t, (_, _, kind) in PARTY_EFFECTS.items()
+                        if kind == 'debit_note']
     NOTE_TYPES = CREDIT_NOTE_TYPES + DEBIT_NOTE_TYPES
-    NOTE_PARTY = {
-        'customer_credit_note': 'customer',
-        'customer_debit_note': 'customer',
-        'supplier_credit_note': 'supplier',
-        'supplier_debit_note': 'supplier',
-    }
+    NOTE_PARTY = {t: party for t, (party, _, kind) in PARTY_EFFECTS.items()
+                  if kind in ('credit_note', 'debit_note')}
+
+    # A loan names the person, whatever roles they have. A repayment may
+    # also name the loan it repays (PartyPayment.loan).
+    LOAN_TYPES = ['loan_given', 'loan_recovered', 'loan_received', 'loan_repayment']
+    # What a repayment of each loan type is.
+    LOAN_REPAID_BY = {'loan_given': 'loan_recovered', 'loan_received': 'loan_repayment'}
+    # A set-off settles both sides of one person by the same amount and moves
+    # no money (register #20): two of these share a payment_group.
+    SET_OFF_TYPES = ['set_off_receivable', 'set_off_payable']
+    # Named by the person, not by a customer or supplier record.
+    PERSON_TYPES = LOAN_TYPES + SET_OFF_TYPES
+    # No account, no payment method: never in a cash figure.
+    NO_MONEY_TYPES = NOTE_TYPES + SET_OFF_TYPES
 
     # Money that counts toward sales / purchase KPIs (every rupee actually
     # received from customers, and every rupee actually paid to suppliers).
@@ -605,17 +648,26 @@ class Transaction(models.Model):
     # Types that name a customer or supplier when recorded on account. Notes
     # always name one: a note never names an invoice, so the party is the
     # only thing it settles against.
-    PARTY_TYPES = [
-        'customer_receipt',
-        'supplier_payment',
-        'sales_return_refund',
-        'purchase_return_refund',
-    ] + NOTE_TYPES
+    PARTY_TYPES = list(PARTY_EFFECTS)
+
+    @classmethod
+    def party_types(cls, party=None, effect=None, money_only=False):
+        """
+        The PARTY_EFFECTS types for one party kind and/or one effect
+        ('settles' or 'adds'). money_only leaves out the notes and set-offs,
+        which move no money and so are never pending.
+        """
+        return [
+            t for t, (p, e, _) in cls.PARTY_EFFECTS.items()
+            if (party is None or p == party)
+            and (effect is None or e == effect)
+            and not (money_only and t in cls.NO_MONEY_TYPES)
+        ]
 
     TYPE_CHOICES = [
         ('sale_payment', 'Sale Payment'),
         # Label only. The code stays customer_receipt so existing rows,
-        # filters and PARTY_ON_ACCOUNT keep working; renaming it would
+        # filters and PARTY_EFFECTS keep working; renaming it would
         # need a data migration for no user-visible gain.
         ('customer_receipt', 'Customer Payment'),
         ('purchase_return_refund', 'Purchase Return Refund'),
@@ -636,6 +688,10 @@ class Transaction(models.Model):
         ('customer_debit_note', 'Customer Debit Note'),
         ('supplier_credit_note', 'Supplier Credit Note'),
         ('supplier_debit_note', 'Supplier Debit Note'),
+        ('loan_given', 'Loan Given'),
+        ('loan_recovered', 'Loan Recovered'),
+        ('set_off_receivable', 'Set-off (Receivable)'),
+        ('set_off_payable', 'Set-off (Payable)'),
     ]
 
     PAYMENT_METHOD_CHOICES = [
@@ -724,13 +780,24 @@ class Transaction(models.Model):
             return 'in'
         if self.type in self.OUT_TYPES:
             return 'out'
-        if self.type in self.NOTE_TYPES:
+        if self.type in self.NO_MONEY_TYPES:
             return 'none'
         return 'neutral'
 
     @property
     def is_note(self):
         return self.type in self.NOTE_TYPES
+
+    @property
+    def is_set_off(self):
+        return self.type in self.SET_OFF_TYPES
+
+    @property
+    def set_off_reference(self):
+        """SO-<date>-<id>, built when shown; nothing extra is stored (R27)."""
+        if not self.is_set_off:
+            return None
+        return f"SO-{self.date:%Y%m%d}-{self.id}"
 
     @property
     def is_source_linked(self):
@@ -761,6 +828,19 @@ class PartyPayment(models.Model):
         Supplier, on_delete=models.CASCADE,
         null=True, blank=True, related_name='party_payments'
     )
+    # The person behind the row, always set. Loans and set-offs name only the
+    # person (they need no role); everything else names a customer or
+    # supplier as well, and save() fills this in from it. The khaata reads
+    # by person and side (accounts/settlement.py).
+    person = models.ForeignKey(
+        'root.Person', on_delete=models.CASCADE, related_name='party_payments'
+    )
+    # Set on a loan repayment that says which loan it repays (register R18).
+    # SET_NULL: deleting the loan leaves the repayment as money on the khaata.
+    loan = models.ForeignKey(
+        Transaction, on_delete=models.SET_NULL,
+        null=True, blank=True, related_name='repayments'
+    )
     transaction = models.OneToOneField(
         Transaction, on_delete=models.CASCADE, related_name='party_payment')
     # Set only on an automatic refund: the invoice whose edit left it paid for
@@ -777,37 +857,128 @@ class PartyPayment(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
+    def save(self, *args, **kwargs):
+        role = self.customer or self.supplier
+        if role is not None:
+            self.person_id = role.person_id
+        super().save(*args, **kwargs)
+
     def __str__(self):
-        party = self.customer or self.supplier
+        party = self.customer or self.supplier or self.person
         return f"{self.id}-{party}-{self.transaction.amount}"
+
+
+class OpeningNet:
+    """
+    A person's opening balance on one khaata kind, netted: what the engine
+    and the list balances count. `amount` is signed the kind's way (positive:
+    the customer owes us, or we owe the supplier); `as_of_date` is the
+    earliest of the rows it nets.
+    """
+
+    __slots__ = ('amount', 'as_of_date', 'created_at')
+
+    def __init__(self, amount, as_of_date, created_at):
+        self.amount = amount
+        self.as_of_date = as_of_date
+        self.created_at = created_at
+
+    @classmethod
+    def of(cls, rows):
+        rows = list(rows)
+        if not rows:
+            return None
+        return cls(
+            sum(row.signed_amount for row in rows),
+            min(row.as_of_date for row in rows),
+            min((row.created_at for row in rows if row.created_at), default=None),
+        )
+
+
+class PartyOpeningBalanceQuerySet(models.QuerySet):
+
+    def of_role(self, kind, role_id):
+        """The rows that count on one role's khaata."""
+        return self.filter(kind=kind, **{f'person__{kind}__id': role_id})
+
+
+class PartyOpeningBalanceManager(models.Manager.from_queryset(PartyOpeningBalanceQuerySet)):
+
+    def create(self, customer=None, supplier=None, **kwargs):
+        """
+        Also takes the old role form, customer= or supplier= with a signed
+        amount, and stores it on the role's person, on the role's khaata:
+        exactly how such a row counted before openings moved to the person.
+        """
+        role = customer or supplier
+        if role is not None:
+            kind = 'customer' if customer is not None else 'supplier'
+            amount = kwargs.pop('amount', 0) or 0
+            natural = PartyOpeningBalance.NATURAL_SIDE[kind]
+            kwargs.update(
+                person_id=role.person_id, kind=kind, amount=abs(amount),
+                side=natural if amount >= 0 else PartyOpeningBalance.OTHER_SIDE[natural])
+        return super().create(**kwargs)
 
 
 class PartyOpeningBalance(models.Model):
     """
     A balance carried across from the paper khaata at onboarding (BRD §6.6).
     Counted in party balances, excluded from period reporting.
+
+    It belongs to the person: one per side (Receivable, Payable), whatever
+    roles they hold. `amount` is never negative; `side` says which way it
+    goes. `kind` is the khaata it counts on, fixed when it is first saved
+    (opening_kind): a Payable opening for someone who is only a customer is an
+    advance on the customer khaata, which their next sale uses up, and a
+    Receivable opening for someone who is only a supplier is used by the next
+    purchase. Otherwise each side counts on its own khaata.
     """
+
+    SIDES = [('receivable', 'Receivable'), ('payable', 'Payable')]
+    KINDS = [('customer', 'Customer'), ('supplier', 'Supplier')]
+    NATURAL_SIDE = {'customer': 'receivable', 'supplier': 'payable'}
+    OTHER_SIDE = {'receivable': 'payable', 'payable': 'receivable'}
 
     business = models.ForeignKey(
         Business, on_delete=models.CASCADE,
         related_name='party_opening_balances'
     )
-    customer = models.OneToOneField(
-        Customer, on_delete=models.CASCADE,
-        null=True, blank=True, related_name='opening_balance'
+    person = models.ForeignKey(
+        'root.Person', on_delete=models.CASCADE,
+        related_name='opening_balances'
     )
-    supplier = models.OneToOneField(
-        Supplier, on_delete=models.CASCADE,
-        null=True, blank=True, related_name='opening_balance'
-    )
-    amount = models.IntegerField(
-        default=0,
-        help_text='Positive means the customer owes us, or we owe the supplier.'
-    )
+    side = models.CharField(max_length=16, choices=SIDES)
+    kind = models.CharField(max_length=16, choices=KINDS)
+    amount = models.IntegerField(default=0)
     as_of_date = models.DateField()
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
+    objects = PartyOpeningBalanceManager()
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=['person', 'side'], name='one_opening_balance_per_person_side'),
+        ]
+
+    @property
+    def signed_amount(self):
+        """The amount as its khaata counts it (positive: on the kind's own side)."""
+        amount = self.amount or 0
+        return amount if self.side == self.NATURAL_SIDE[self.kind] else -amount
+
+    @staticmethod
+    def opening_kind(person, side):
+        """
+        The khaata a new opening on `side` counts on. Only when the person
+        holds the other side's role alone is it that role's advance.
+        """
+        has = {kind: hasattr(person, kind) for kind in ('customer', 'supplier')}
+        if side == 'receivable':
+            return 'supplier' if has['supplier'] and not has['customer'] else 'customer'
+        return 'customer' if has['customer'] and not has['supplier'] else 'supplier'
+
     def __str__(self):
-        party = self.customer or self.supplier
-        return f"{self.id}-{party}-{self.amount}"
+        return f"{self.id}-{self.person_id}-{self.side}-{self.amount}"

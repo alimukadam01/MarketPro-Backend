@@ -8,7 +8,7 @@ Each app declares what it makes searchable in its own `search.py`:
 
     register(SearchType(
         key="reward", label="Rewards", model=Reward, module="loyalty",
-        text_fields=["name", "customer__name"], number_fields=["id"],
+        text_fields=["name", "customer__person__name"], number_fields=["id"],
         to_hit=lambda r: Hit(id=r.id, title=r.name,
                              link=link("/loyalty/update-reward", reward_id=r.id)),
     ))

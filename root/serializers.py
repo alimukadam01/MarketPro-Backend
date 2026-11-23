@@ -19,7 +19,9 @@ from .models import (
     Employee,
     EmployeeAccess,
     BusinessConfig,
+    Person,
 )
+from .new_records import OpeningBalanceSerializer
 from .utils import generate_sku, generate_variant_name
 from audit.helpers import audited_bulk_create, audited_bulk_update
 
@@ -133,32 +135,62 @@ class SimpleBusinessSerializer(serializers.ModelSerializer):
         fields = ['id', 'name', 'logo']
 
 
-class CustomerSerializer(serializers.ModelSerializer):
+def _detail_text(field, **kwargs):
+    """An optional text detail read from and written to the role's person."""
+    return field(source=f'person.{kwargs.pop("name")}', required=False,
+                 allow_null=True, allow_blank=True, **kwargs)
 
-    business = SimpleBusinessSerializer(read_only=True)
-    total_sales = serializers.FloatField(read_only=True)
 
-    class Meta:
-        model = Customer
-        fields = [
-            'id', 'name', 'business', 'phone', 'email',
-            'address', 'city', 'created_at', 'updated_at',
-            'notes', 'total_sales'
-        ]
+class RoleDetailsMixin:
+    """
+    For a Customer or Supplier serializer whose detail fields come from the
+    role's Person (fields with source='person.<detail>'). The API is the same
+    as when the details lived on the role: same names, same rules. Creating
+    makes the person (RoleManager.create); updating writes to it.
+    """
 
     def create(self, validated_data):
-        return Customer.objects.create(
+        details = validated_data.pop('person', {})
+        return self.Meta.model.objects.create(
             business_id=self.context['business_id'],
-            **self.validated_data
+            **details, **validated_data
         )
 
     def update(self, instance, validated_data):
+        details = validated_data.pop('person', {})
+        if details:
+            for attr, value in details.items():
+                setattr(instance.person, attr, value)
+            instance.person.save()
 
         for attr, value in validated_data.items():
             setattr(instance, attr, value)
 
         instance.save()
         return instance
+
+
+class CustomerSerializer(RoleDetailsMixin, serializers.ModelSerializer):
+
+    business = SimpleBusinessSerializer(read_only=True)
+    name = serializers.CharField(source='person.name', max_length=256)
+    phone = _detail_text(serializers.CharField, name='phone', max_length=256)
+    email = serializers.EmailField(source='person.email', required=False,
+                                   allow_null=True, allow_blank=True)
+    address = _detail_text(serializers.CharField, name='address')
+    # Required for customers, as it always was (register S5).
+    city = serializers.PrimaryKeyRelatedField(
+        source='person.city', queryset=City.objects.all())
+    notes = _detail_text(serializers.CharField, name='notes')
+
+    class Meta:
+        model = Customer
+        fields = [
+            'id', 'person_id', 'is_active', 'name', 'business', 'phone', 'email',
+            'address', 'city', 'created_at', 'updated_at',
+            'notes'
+        ]
+        read_only_fields = ['person_id', 'is_active']
 
 
 class CaptureCustomerSerializer(CustomerSerializer):
@@ -170,17 +202,22 @@ class CaptureCustomerSerializer(CustomerSerializer):
     WhatsApp to this number the moment it saves.
     """
 
-    phone = serializers.CharField(required=True, allow_blank=False)
+    phone = serializers.CharField(source='person.phone', max_length=256,
+                                  required=True, allow_blank=False)
 
 
 class SimpleCustomerSerializer(serializers.ModelSerializer):
 
-    city = CitySerializer()
+    name = serializers.CharField(source='person.name', read_only=True)
+    phone = serializers.CharField(source='person.phone', read_only=True)
+    email = serializers.EmailField(source='person.email', read_only=True)
+    address = serializers.CharField(source='person.address', read_only=True)
+    city = CitySerializer(source='person.city', read_only=True)
 
     class Meta:
         model = Customer
         fields = [
-            'id', 'name', 'phone',
+            'id', 'person_id', 'is_active', 'name', 'phone',
             'email', 'address', 'city'
         ]
 
@@ -538,31 +575,179 @@ class ProductAndVariantCreateSerializer(FieldLinksMixin, serializers.ModelSerial
         fields = ['id', 'name', 'desc', 'unit', 'variants', 'field_links']
 
 
-class SupplierSerializer(serializers.ModelSerializer):
+class SupplierSerializer(RoleDetailsMixin, serializers.ModelSerializer):
 
     business = SimpleBusinessSerializer(read_only=True)
+    name = serializers.CharField(source='person.name', max_length=256)
+    business_name = _detail_text(
+        serializers.CharField, name='business_name', max_length=256)
+    phone = _detail_text(serializers.CharField, name='phone', max_length=256)
+    email = serializers.EmailField(source='person.email', required=False,
+                                   allow_null=True, allow_blank=True)
+    notes = _detail_text(serializers.CharField, name='notes')
 
     class Meta:
         model = Supplier
         fields = [
-            'id', 'business', 'name', 'business_name', 'phone', 'email', 'notes'
+            'id', 'person_id', 'is_active', 'business', 'name', 'business_name',
+            'phone', 'email', 'notes'
         ]
-
-    def create(self, validated_data):
-
-        return Supplier.objects.create(
-            business_id=self.context['business_id'],
-            **self.validated_data
-        )
+        read_only_fields = ['person_id', 'is_active']
 
 
 class SimpleSupplierSerializer(serializers.ModelSerializer):
 
+    name = serializers.CharField(source='person.name', read_only=True)
+    business_name = serializers.CharField(
+        source='person.business_name', read_only=True)
+
     class Meta:
         model = Supplier
         fields = [
-            'id', 'name', 'business_name',
+            'id', 'person_id', 'is_active', 'name', 'business_name',
         ]
+
+
+# ── People ────────────────────────────────────────────────────────────────────
+
+PERSON_DETAIL_FIELDS = [
+    'name', 'phone', 'email', 'address', 'city', 'business_name', 'notes',
+]
+
+
+class PersonSerializer(serializers.ModelSerializer):
+    """
+    One row of the People list. Balances and last activity are worked out for
+    the whole page at once and passed in the context (root/people.py).
+    """
+
+    city = CitySerializer(read_only=True)
+    roles = serializers.SerializerMethodField()
+    receivable = serializers.SerializerMethodField()
+    payable = serializers.SerializerMethodField()
+    net = serializers.SerializerMethodField()
+    last_activity = serializers.SerializerMethodField()
+    is_walk_in = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Person
+        fields = [
+            'id', *PERSON_DETAIL_FIELDS, 'created_at', 'updated_at',
+            'roles', 'receivable', 'payable', 'net', 'last_activity', 'is_walk_in',
+        ]
+
+    def get_roles(self, person):
+        from .people import ROLES, role_of
+        roles = {}
+        for kind in ROLES:
+            role = role_of(person, kind)
+            roles[kind] = {'id': role.id, 'is_active': role.is_active} if role else None
+        return roles
+
+    def _sides(self, person):
+        return self.context.get('balances', {}).get(person.id) or {'receivable': 0, 'payable': 0}
+
+    def get_receivable(self, person):
+        return self._sides(person)['receivable']
+
+    def get_payable(self, person):
+        return self._sides(person)['payable']
+
+    def get_net(self, person):
+        sides = self._sides(person)
+        return sides['receivable'] - sides['payable']
+
+    def get_last_activity(self, person):
+        day = self.context.get('last_activity', {}).get(person.id)
+        return day.isoformat() if day else None
+
+    def get_is_walk_in(self, person):
+        from .people import is_walk_in
+        return is_walk_in(person)
+
+
+class PersonDetailSerializer(PersonSerializer):
+    """
+    The person page: the list row plus each side's opening balance, and each
+    role's own balance (signed its khaata's way), which decides whether the
+    role can be deactivated.
+    """
+
+    opening_balances = serializers.SerializerMethodField()
+
+    class Meta(PersonSerializer.Meta):
+        fields = PersonSerializer.Meta.fields + ['opening_balances']
+
+    def get_roles(self, person):
+        roles = super().get_roles(person)
+        balances = self.context.get('role_balances', {})
+        for kind, role in roles.items():
+            if role is not None:
+                role['balance'] = balances.get(kind, 0)
+        return roles
+
+    def get_opening_balances(self, person):
+        sides = {'receivable': None, 'payable': None}
+        for opening in person.opening_balances.all():
+            sides[opening.side] = {
+                'id': opening.id,
+                'amount': opening.amount,
+                'as_of_date': opening.as_of_date.isoformat(),
+                'kind': opening.kind,
+            }
+        return sides
+
+
+class PersonWriteSerializer(serializers.ModelSerializer):
+    """
+    Create a person, with roles and an opening balance per side, or edit
+    their details. Roles change through /people/<id>/roles/ afterwards.
+    """
+
+    city = serializers.PrimaryKeyRelatedField(
+        queryset=City.objects.all(), required=False, allow_null=True)
+    roles = serializers.ListField(
+        child=serializers.ChoiceField(choices=['customer', 'supplier']),
+        required=False, write_only=True)
+    opening_balances = serializers.DictField(
+        child=OpeningBalanceSerializer(allow_null=True), required=False, write_only=True)
+
+    class Meta:
+        model = Person
+        fields = PERSON_DETAIL_FIELDS + ['roles', 'opening_balances']
+
+    def validate_opening_balances(self, value):
+        unknown = set(value) - {'receivable', 'payable'}
+        if unknown:
+            raise serializers.ValidationError('Use receivable and payable only.')
+        return {side: entry for side, entry in value.items() if entry and entry.get('amount')}
+
+    def validate(self, attrs):
+        # Opening balances are the person's, one per side, whatever roles
+        # they hold (or none).
+        if self.instance is not None and ('roles' in attrs or 'opening_balances' in attrs):
+            raise serializers.ValidationError(
+                'Roles change through /people/<id>/roles/; opening balances on their own screen.')
+        return attrs
+
+    def create(self, validated_data):
+        from accounts.models import PartyOpeningBalance
+        roles = validated_data.pop('roles', [])
+        openings = validated_data.pop('opening_balances', {})
+        business_id = self.context['business_id']
+        with transaction.atomic():
+            person = Person.objects.create(business_id=business_id, **validated_data)
+            for kind, model in (('customer', Customer), ('supplier', Supplier)):
+                if kind in roles:
+                    model.objects.create(business_id=business_id, person=person)
+            for side in ('receivable', 'payable'):
+                if side in openings:
+                    PartyOpeningBalance.objects.create(
+                        business_id=business_id, person=person, side=side,
+                        kind=PartyOpeningBalance.opening_kind(person, side),
+                        amount=abs(openings[side]['amount']),
+                        as_of_date=openings[side]['as_of_date'])
+        return person
 
 
 class BaseItemSerializer(serializers.Serializer):
