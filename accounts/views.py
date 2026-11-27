@@ -16,7 +16,7 @@ from root.periods import (
 )
 from root.utils import get_active_business, whatsapp_number
 from sales.models import PurchaseReceipt, SalesInvoice, SalesReceipt
-from sales.utils import sync_charge_expenses
+from sales.utils import stop_charge_expenses, sync_charge_expenses
 from .filters import TransactionFilter
 from .models import MoneyAccount, OpeningNet, PartyOpeningBalance, Transaction
 from .payments import (
@@ -464,29 +464,18 @@ class TransactionViewSet(PeriodFilterMixin, ModelViewSet):
         )
 
     @staticmethod
-    def _charge_expense_refusal(transactions):
+    def _charge_expenses(transactions):
         """
-        A 400 if any of these is an invoice's extra-charge expense, else None.
-
-        Those belong to the invoice, which rebuilds them from its charges and
-        payments. Deleting one here would leave the invoice charging the
-        customer for something the books no longer pay out - until the next
-        edit quietly put it back.
+        The invoice extra-charge expenses among these transactions. Deleting
+        one marks its charge as kept by the shopkeeper instead of deleting it
+        outright, which the invoice's next rebuild would undo
+        (sales.utils.stop_charge_expenses).
         """
-        for txn in transactions:
-            expense = txn.expense if txn.expense_id else None
-            if expense is not None and expense.sales_invoice_id:
-                invoice = expense.sales_invoice
-                reference = invoice.invoice_number or invoice.id
-                return Response(
-                    {'detail': f'This is an extra charge on sales invoice '
-                               f'{reference}. Change or remove the charge on '
-                               f'the invoice instead.'},
-                    status=status.HTTP_400_BAD_REQUEST)
-        return None
+        return [txn.expense for txn in transactions
+                if txn.expense_id and txn.expense.sales_invoice_id]
 
-    @staticmethod
-    def _delete_with_sources(transactions):
+    @classmethod
+    def _delete_with_sources(cls, transactions):
         """
         Deleting a source-backed transaction deletes the record that owns it.
 
@@ -495,7 +484,12 @@ class TransactionViewSet(PeriodFilterMixin, ModelViewSet):
         one frees that share of the invoice again. The transaction goes with it
         through the FK's CASCADE.
         """
+        charges = cls._charge_expenses(transactions)
+        stop_charge_expenses(charges)
+        charge_ids = {expense.id for expense in charges}
         for txn in transactions:
+            if txn.expense_id in charge_ids:
+                continue
             source = (txn.sales_receipt
                       or txn.purchase_receipt
                       or txn.expense)
@@ -516,10 +510,6 @@ class TransactionViewSet(PeriodFilterMixin, ModelViewSet):
             instance = self.get_object()
             members = self._with_payment_group(
                 [instance], instance.business_id)
-
-            refusal = self._charge_expense_refusal(members)
-            if refusal:
-                return refusal
 
             with db_transaction.atomic():
                 self._delete_with_sources(members)
@@ -660,12 +650,12 @@ class TransactionViewSet(PeriodFilterMixin, ModelViewSet):
             # Selecting one leg of an allocated payment removes all of it.
             transactions = self._with_payment_group(selected, business.id)
 
-            refusal = self._charge_expense_refusal(transactions)
-            if refusal:
-                return refusal
-
+            charges = self._charge_expenses(transactions)
+            charge_ids = {expense.id for expense in charges}
             plain, receipts, purchases, expenses = [], [], [], []
             for txn in transactions:
+                if txn.expense_id in charge_ids:
+                    continue
                 if txn.sales_receipt_id:
                     receipts.append(txn.sales_receipt_id)
                 elif txn.purchase_receipt_id:
@@ -675,9 +665,11 @@ class TransactionViewSet(PeriodFilterMixin, ModelViewSet):
                 else:
                     plain.append(txn.id)
 
-            deleted = len(plain) + len(receipts) + len(purchases) + len(expenses)
+            deleted = (len(plain) + len(receipts) + len(purchases)
+                       + len(expenses) + len(charges))
 
             with db_transaction.atomic():
+                stop_charge_expenses(charges)
                 # Deleting a source cascades to its transaction.
                 SalesReceipt.objects.filter(id__in=receipts).delete()
                 PurchaseReceipt.objects.filter(id__in=purchases).delete()

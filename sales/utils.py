@@ -697,6 +697,93 @@ def paid_into_account(invoice):
     return None
 
 
+# A charge the shopkeeper keeps (fix plan follow-up, 27 Nov): its automatic
+# expense was deleted, so the charge stays in the invoice total as revenue and
+# no money is paid out for it. Marked on the charge itself, so the rebuild
+# below leaves it alone.
+CHARGE_EXPENSED = 'expensed'
+
+
+def charge_is_expensed(charge):
+    return charge.get(CHARGE_EXPENSED, True) is not False
+
+
+def paid_out_charges(invoice):
+    """
+    (position, label, amount) for each extra charge that gets an expense, in
+    the order sync_charge_expenses makes them. Positions are in the invoice's
+    extra_charges list.
+    """
+    out = []
+    for position, charge in enumerate(invoice.extra_charges or []):
+        try:
+            label = str(charge.get('label') or '').strip()
+            amount = round(float(charge.get('amount') or 0), 2)
+        except (AttributeError, TypeError, ValueError):
+            continue
+        if label and amount > 0 and charge_is_expensed(charge):
+            out.append((position, label, amount))
+    return out
+
+
+def stop_charge_expenses(expenses):
+    """
+    Delete these extra-charge expenses for good.
+
+    Each one's charge is marked as kept, then the invoice's expenses are
+    rebuilt without it, which deletes the expense and its transaction. The
+    invoice itself is untouched: its total already carries the charge, and
+    with no expense against it the charge counts as revenue.
+    """
+    from root.models import Expense
+
+    by_invoice = {}
+    for expense in expenses:
+        by_invoice.setdefault(expense.sales_invoice_id, []).append(expense)
+
+    with transaction.atomic():
+        for invoice_id, chosen in by_invoice.items():
+            invoice = SalesInvoice.objects.select_for_update().filter(pk=invoice_id).first()
+            if invoice is None:
+                continue
+            charges = [dict(charge) for charge in (invoice.extra_charges or [])]
+            made = list(Expense.objects.filter(sales_invoice=invoice).order_by('id'))
+            paid = paid_out_charges(invoice)
+            marked = set()
+            for expense in chosen:
+                position = _charge_position(expense, made, paid, marked)
+                if position is not None:
+                    charges[position][CHARGE_EXPENSED] = False
+                    marked.add(position)
+            if marked:
+                SalesInvoice.objects.filter(pk=invoice.pk).update(extra_charges=charges)
+            # The rebuild deletes the marked charges' expenses with their
+            # transactions. One that matched no charge stays: deleting it here
+            # would only last until the invoice was next rebuilt.
+            sync_charge_expenses(invoice)
+
+
+def _charge_position(expense, made, paid, marked):
+    """
+    Which charge an expense was made for. The sync makes them in charge
+    order, so the expense's place among the invoice's expenses names it; the
+    label and amount confirm it, and are the fallback if the two lists ever
+    disagree.
+    """
+    def same(entry):
+        _, label, amount = entry
+        return label == expense.name and amount == round(expense.amount or 0, 2)
+
+    if len(made) == len(paid):
+        index = next((i for i, e in enumerate(made) if e.pk == expense.pk), None)
+        if index is not None and same(paid[index]) and paid[index][0] not in marked:
+            return paid[index][0]
+    for entry in paid:
+        if same(entry) and entry[0] not in marked:
+            return entry[0]
+    return None
+
+
 @automatic('signal:sync_charge_expenses')
 def sync_charge_expenses(invoice):
     """
@@ -709,7 +796,8 @@ def sync_charge_expenses(invoice):
 
     One expense per charge, dated on the invoice - the day the delivery or the
     labour happened - and on the account paid_into_account() picks. None at all
-    for a draft or a cancelled invoice, or while nothing has been paid.
+    for a draft or a cancelled invoice, or while nothing has been paid, and
+    none for a charge the shopkeeper keeps (charge_is_expensed).
 
     When anything differs the old expenses are deleted and new ones made,
     rather than patched one by one: a charge has no identity of its own to
@@ -729,14 +817,8 @@ def sync_charge_expenses(invoice):
             and invoice.extra_charges):
         account = paid_into_account(invoice)
         if account is not None:
-            for charge in invoice.extra_charges:
-                try:
-                    label = str(charge.get('label') or '').strip()
-                    amount = round(float(charge.get('amount') or 0), 2)
-                except (AttributeError, TypeError, ValueError):
-                    continue
-                if label and amount > 0:
-                    desired.append((label, amount))
+            desired = [(label, amount)
+                       for _, label, amount in paid_out_charges(invoice)]
 
     date = local_date(invoice.date_issued or invoice.created_at)
     method = ACCOUNT_PAYMENT_METHOD.get(account.type) if account else None

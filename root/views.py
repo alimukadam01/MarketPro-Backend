@@ -1,4 +1,5 @@
 from datetime import datetime
+from django.db import transaction as db_transaction
 from django.db.models import Count, Exists, OuterRef, QuerySet, Sum
 from django.utils import timezone
 from rest_framework import exceptions, status
@@ -756,18 +757,23 @@ class ExpenseViewSet(PeriodFilterMixin, ModelViewSet):
         }
 
     # An invoice's extra-charge expenses belong to the invoice, which rebuilds
-    # them from its charges and payments; deleting one here would only last
-    # until the invoice was next touched.
-    CHARGE_EXPENSE_REFUSAL = {
-        'detail': 'One or more of these expenses is an extra charge on a sales '
-                  'invoice. Change or remove the charge on the invoice instead.'
-    }
+    # them from its charges and payments. Deleting one marks its charge as
+    # kept by the shopkeeper, so the rebuild never brings it back: the charge
+    # stays on the invoice and counts as revenue, and no money is paid out
+    # for it (sales.utils.stop_charge_expenses).
 
     def destroy(self, request, *args, **kwargs):
-        if self.get_object().is_invoice_charge:
-            return Response(self.CHARGE_EXPENSE_REFUSAL,
-                            status=status.HTTP_400_BAD_REQUEST)
-        return super().destroy(request, *args, **kwargs)
+        expense = self.get_object()
+        if not expense.is_invoice_charge:
+            return super().destroy(request, *args, **kwargs)
+        from sales.utils import stop_charge_expenses
+        try:
+            stop_charge_expenses([expense])
+            return Response({'detail': 'Success.'}, status=status.HTTP_200_OK)
+        except Exception as error:
+            print(error)
+            return Response({'detail': 'Internal Server Error.'},
+                            status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
     @action(['POST'], detail=False, url_path='bulk-delete', url_name='bulk-delete')
     def bulk_delete(self, request):
@@ -778,13 +784,13 @@ class ExpenseViewSet(PeriodFilterMixin, ModelViewSet):
                 'detail': 'Bad Request.'
             }, status=status.HTTP_400_BAD_REQUEST)
 
-        if Expense.objects.filter(
-                id__in=expense_ids, sales_invoice__isnull=False).exists():
-            return Response(self.CHARGE_EXPENSE_REFUSAL,
-                            status=status.HTTP_400_BAD_REQUEST)
-
+        from sales.utils import stop_charge_expenses
         try:
-            Expense.objects.filter(id__in=expense_ids).delete()
+            selected = self.get_queryset().filter(id__in=expense_ids)
+            charges = list(selected.filter(sales_invoice__isnull=False))
+            with db_transaction.atomic():
+                stop_charge_expenses(charges)
+                selected.filter(sales_invoice__isnull=True).delete()
             return Response({
                 'detail': 'Success.'
             }, status=status.HTTP_200_OK)

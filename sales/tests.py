@@ -1376,7 +1376,8 @@ class SalesInvoiceChargeExpenseTests(TestCase):
     of the account the customer's payment came into: cash before bank before
     a mobile wallet. Nothing until there is a payment, nothing for a draft or
     a cancelled invoice. The invoice owns these expenses, so they cannot be
-    edited or deleted on their own.
+    edited on their own. Deleting one means the shopkeeper keeps that charge:
+    it stays on the invoice as revenue and is never paid out again.
     """
 
     @classmethod
@@ -1653,7 +1654,7 @@ class SalesInvoiceChargeExpenseTests(TestCase):
 
     # --- owned by the invoice ---------------------------------------------
 
-    def test_it_cannot_be_edited_or_deleted_from_the_expenses_screen(self):
+    def test_it_cannot_be_edited_from_the_expenses_screen(self):
         invoice = self.create("EXP-18", [{"label": "Delivery", "amount": 500}])
         self.pay(invoice, self.cash)
         expense = self.charge_expenses(invoice)[0]
@@ -1665,28 +1666,134 @@ class SalesInvoiceChargeExpenseTests(TestCase):
         )
         self.assertEqual(response.status_code, 400, response.content)
 
-        response = self.client.delete(f"/expenses/{expense.id}/")
-        self.assertEqual(response.status_code, 400, response.content)
+    # --- kept by the shopkeeper: its expense deleted -----------------------
+
+    def update(self, invoice, charges):
+        line = invoice.invoice_items.get()
+        response = self.client.post(
+            f"/sales-invoices/{invoice.pk}/update-with-items/",
+            {
+                "invoice_number": invoice.invoice_number,
+                "customer": str(self.customer.id),
+                "date_issued": "2026-05-10",
+                "date_due": FAR_FUTURE,
+                "discount": {"value": 0, "type": "amount"},
+                "tax": {"value": 0, "type": "percentage"},
+                "extra_charges": charges,
+                "project": None,
+                "items": [{"id": line.id, "product_id": self.variant.id,
+                           "quantity": 1, "unit_price": 1000}],
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, 200, response.content)
+        invoice.refresh_from_db()
+
+    def test_deleting_it_keeps_the_charge_as_revenue(self):
+        invoice = self.create("EXP-18", self.DELIVERY)
+        before = self.cash.balance()
+        self.pay(invoice, self.cash, amount=1000)
+        delivery, labour = self.charge_expenses(invoice)
+
+        response = self.client.delete(f"/expenses/{delivery.id}/")
+        self.assertEqual(response.status_code, 200, response.content)
+
+        # A later payment rebuilds the expenses; the kept charge stays kept.
+        self.pay(invoice, self.cash, amount=700)
+        invoice.refresh_from_db()
+        # The invoice is untouched apart from the mark: same charges, same
+        # total.
+        self.assertEqual(invoice.total, 1700)
+        self.assertEqual(invoice.extra_charges, [
+            {"label": "Delivery", "amount": 500, "expensed": False},
+            {"label": "Labour", "amount": 200},
+        ])
+        self.assertEqual([(e.name, e.amount) for e in self.charge_expenses(invoice)],
+                         [("Labour", 200)])
+        # Only labour is paid out of the till now; delivery is kept.
+        self.assertEqual(self.cash.balance() - before, 1500)
+        figures = profit_estimate(
+            self.business.id, date(2026, 5, 1), date(2026, 5, 31))
+        self.assertEqual(figures["revenue"], 1700)
+        self.assertEqual(figures["expenses"], 200)
+
+        # Nothing brings it back: a resync or an invoice edit.
+        sync_charge_expenses(invoice)
+        self.update(invoice, self.DELIVERY)
+        self.assertEqual([e.name for e in self.charge_expenses(invoice)], ["Labour"])
+        self.assertFalse(invoice.extra_charges[0]["expensed"])
+
+    def test_a_changed_charge_is_paid_out_again(self):
+        invoice = self.create("EXP-19", [{"label": "Delivery", "amount": 500}])
+        self.pay(invoice, self.cash)
+        expense = self.charge_expenses(invoice)[0]
+        self.client.delete(f"/expenses/{expense.id}/")
+        self.assertEqual(self.charge_expenses(invoice), [])
+
+        self.update(invoice, [{"label": "Delivery", "amount": 650}])
+        self.assertEqual([(e.name, e.amount) for e in self.charge_expenses(invoice)],
+                         [("Delivery", 650)])
+
+    def test_bulk_delete_keeps_charges_and_deletes_the_rest(self):
+        invoice = self.create("EXP-20", self.DELIVERY)
+        self.pay(invoice, self.cash)
+        charge = self.charge_expenses(invoice)[1]
+        response = self.client.post(
+            "/expenses/", {"name": "Tea", "amount": 300, "category": "transport"},
+            format="json")
+        self.assertEqual(response.status_code, 201, response.content)
+        tea = Expense.objects.get(business=self.business, name="Tea")
 
         response = self.client.post(
-            "/expenses/bulk-delete/", {"expense_ids": [expense.id]},
+            "/expenses/bulk-delete/", {"expense_ids": [charge.id, tea.id]},
             format="json")
-        self.assertEqual(response.status_code, 400, response.content)
-        self.assertTrue(Expense.objects.filter(id=expense.id).exists())
+        self.assertEqual(response.status_code, 200, response.content)
+        self.assertFalse(Expense.objects.filter(id=tea.id).exists())
+        self.assertEqual([e.name for e in self.charge_expenses(invoice)], ["Delivery"])
+        invoice.refresh_from_db()
+        self.assertFalse(invoice.extra_charges[1]["expensed"])
 
-    def test_it_cannot_be_deleted_from_the_transactions_screen(self):
-        invoice = self.create("EXP-19", [{"label": "Delivery", "amount": 500}])
+    def test_deleting_it_from_the_transactions_screen_keeps_it_too(self):
+        invoice = self.create("EXP-21", [{"label": "Delivery", "amount": 500}])
         self.pay(invoice, self.cash)
         txn = self.charge_expenses(invoice)[0].transaction_record
 
         response = self.client.delete(f"/transactions/{txn.id}/")
-        self.assertEqual(response.status_code, 400, response.content)
+        self.assertEqual(response.status_code, 200, response.content)
+        self.assertEqual(self.charge_expenses(invoice), [])
+        invoice.refresh_from_db()
+        self.assertFalse(invoice.extra_charges[0]["expensed"])
+
+    def test_bulk_delete_from_the_transactions_screen(self):
+        invoice = self.create("EXP-22", self.DELIVERY)
+        self.pay(invoice, self.cash)
+        txn = self.charge_expenses(invoice)[0].transaction_record
 
         response = self.client.post(
             "/transactions/bulk-delete/", {"transaction_ids": [txn.id]},
             format="json")
+        self.assertEqual(response.status_code, 200, response.content)
+        self.assertEqual(response.json()["deleted"], 1)
+        self.assertEqual([e.name for e in self.charge_expenses(invoice)], ["Labour"])
+
+    def test_the_mark_must_be_true_or_false(self):
+        response = self.client.post(
+            "/sales-invoices/create-with-items/",
+            {
+                "invoice_number": "EXP-23",
+                "customer": str(self.customer.id),
+                "date_issued": "2026-05-10",
+                "date_due": FAR_FUTURE,
+                "discount": {"value": 0, "type": "amount"},
+                "tax": {"value": 0, "type": "percentage"},
+                "extra_charges": [{"label": "Delivery", "amount": 500, "expensed": "no"}],
+                "project": None,
+                "items": [{"product_id": self.variant.id, "quantity": 1,
+                           "unit_price": 1000}],
+            },
+            format="json",
+        )
         self.assertEqual(response.status_code, 400, response.content)
-        self.assertEqual(len(self.charge_expenses(invoice)), 1)
 
     def test_the_category_cannot_be_picked_by_hand(self):
         response = self.client.post(
