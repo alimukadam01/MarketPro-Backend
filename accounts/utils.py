@@ -810,6 +810,17 @@ def _person_side_rows(business_id, person):
             own_after, other_after = sides()
             own_part = round(own_after) - round(own_before)
             other_part = round(other_after) - round(other_before)
+            if other_part < 0 <= own_part:
+                # A row that uses up an advance (owner, 28 Nov 2026): it shows
+                # at its full amount on its own side, then the advance moves
+                # across as its own pair - applied on this side, used on the
+                # other - the way an accountant books it. Same balances as
+                # showing only the part the advance didn't cover.
+                used = -other_part
+                out.append(_part_row(row, own, own_part + used, description))
+                out.append(_part_row(row, own, -used, description + ' · advance applied'))
+                out.append(_part_row(row, other, other_part, description + ' · advance used'))
+                return True
             for part_side, part in ((own, own_part), (other, other_part)):
                 if not part:
                     continue

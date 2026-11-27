@@ -327,19 +327,38 @@ class InvoicePaysItselfFirstTests(KhaataOrderFixture):
         ledger, rows = self.rows(self.ali.person)
         self.assertEqual([(r[1], r[2], r[4], r[5]) for r in rows], [
             ('payable', 'On-account payment · advance', 0, 10000),
-            ('receivable', 'Sales invoice', 6000, 0),
-            ('payable', 'Sales invoice · against advance', 4000, 0),
+            ('receivable', 'Sales invoice', 10000, 0),
+            ('receivable', 'Sales invoice · advance applied', 0, 4000),
+            ('payable', 'Sales invoice · advance used', 4000, 0),
             ('receivable', 'Payment received', 0, 6000),
         ])
         self.assertEqual(ledger['closing_balance'], {'receivable': 0, 'payable': 6000})
+        self.assertClosesOnTheCards(self.ali.person, ledger)
+
+    def test_the_invoice_shows_its_full_amount(self):
+        self.advance(20000)
+        invoice = self.sale('INV-54', 9000, (2026, 3, 5))
+        self.sale_payment(invoice, 4500, '2026-03-05')
+        ledger, rows = self.rows(self.ali.person)
+        invoice_rows = [(r[1], r[2], r[4], r[5]) for r in rows if r[3] == 'INV-54']
+        self.assertEqual(invoice_rows, [
+            ('receivable', 'Sales invoice', 9000, 0),
+            ('receivable', 'Sales invoice · advance applied', 0, 4500),
+            ('payable', 'Sales invoice · advance used', 4500, 0),
+            ('receivable', 'Payment received', 0, 4500),
+        ])
+        self.assertEqual(ledger['closing_balance'], {'receivable': 0, 'payable': 15500})
         self.assertClosesOnTheCards(self.ali.person, ledger)
 
     def test_an_unpaid_invoice_still_uses_the_advance(self):
         self.advance(10000)
         self.sale('INV-52', 4000, (2026, 3, 5))
         ledger, rows = self.rows(self.ali.person)
-        self.assertEqual([(r[1], r[2]) for r in rows][-1],
-                         ('payable', 'Sales invoice · against advance'))
+        self.assertEqual([(r[1], r[2], r[4], r[5]) for r in rows][1:], [
+            ('receivable', 'Sales invoice', 4000, 0),
+            ('receivable', 'Sales invoice · advance applied', 0, 4000),
+            ('payable', 'Sales invoice · advance used', 4000, 0),
+        ])
         self.assertEqual(ledger['closing_balance'], {'receivable': 0, 'payable': 6000})
 
     def test_a_payment_before_its_invoice_is_refused(self):
