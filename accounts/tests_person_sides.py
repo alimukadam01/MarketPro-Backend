@@ -123,8 +123,8 @@ class KhaataBySideTests(PersonSidesFixture):
         self.assertEqual([(row['side'], row['description'], row['naam'], row['jama'])
                           for row in sale],
                          [('receivable', 'Sales invoice', 8000, 0),
-                          ('receivable', 'Sales invoice · advance applied', 0, 5000),
-                          ('payable', 'Sales invoice · advance used', 0, 5000)])
+                          ('receivable', 'Sales invoice · advance applied from Customer Payment of 01/04/2026', 0, 5000),
+                          ('payable', 'Sales invoice · advance used from Customer Payment of 01/04/2026', 0, 5000)])
         self.assertEqual(ledger['closing_balance'], {'receivable': 3000, 'payable': 0})
         self.assertEqual(self.sides(self.ali.person), (3000, 0))
 

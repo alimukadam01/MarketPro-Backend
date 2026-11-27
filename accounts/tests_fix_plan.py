@@ -223,9 +223,9 @@ class AdvanceKeptForItsInvoiceTests(KhaataOrderFixture):
              0, 30000, 0, 30000),
             ('2025-03-18', 'receivable', 'Sales invoice', '303', 70870, 0, 70870, 30000),
             ('2025-03-18', 'receivable', 'Sales invoice', '304', 133000, 0, 203870, 30000),
-            ('2025-03-18', 'receivable', 'Payment received · advance applied', '304',
+            ('2025-03-18', 'receivable', 'Sales invoice · advance applied from Payment received of 23/01/2025 (304)', '304',
              0, 30000, 173870, 30000),
-            ('2025-03-18', 'payable', 'Payment received · advance used', '304',
+            ('2025-03-18', 'payable', 'Sales invoice · advance used from Payment received of 23/01/2025 (304)', '304',
              30000, 0, 173870, 0),
             ('2025-03-18', 'receivable', 'Payment received', '303', 0, 70870, 103000, 0),
             ('2025-03-18', 'receivable', 'Payment received', '304', 0, 50000, 53000, 0),
@@ -265,8 +265,8 @@ class AdvanceKeptForItsInvoiceTests(KhaataOrderFixture):
         self.assertEqual([(row[1], row[2], row[4], row[5]) for row in rows], [
             ('receivable', 'Payment made · advance for its invoice', 20000, 0),
             ('payable', 'Purchase invoice', 0, 20000),
-            ('payable', 'Payment made · advance applied', 20000, 0),
-            ('receivable', 'Payment made · advance used', 0, 20000),
+            ('payable', 'Purchase invoice · advance applied from Payment made of 10/01/2026 (PI-7)', 20000, 0),
+            ('receivable', 'Purchase invoice · advance used from Payment made of 10/01/2026 (PI-7)', 0, 20000),
         ])
         self.assertEqual(ledger['closing_balance'], {'receivable': 0, 'payable': 0})
         self.assertClosesOnTheCards(person, ledger)
@@ -328,8 +328,8 @@ class InvoicePaysItselfFirstTests(KhaataOrderFixture):
         self.assertEqual([(r[1], r[2], r[4], r[5]) for r in rows], [
             ('payable', 'On-account payment · advance', 0, 10000),
             ('receivable', 'Sales invoice', 10000, 0),
-            ('receivable', 'Sales invoice · advance applied', 0, 4000),
-            ('payable', 'Sales invoice · advance used', 4000, 0),
+            ('receivable', 'Sales invoice · advance applied from Customer Payment of 01/03/2026', 0, 4000),
+            ('payable', 'Sales invoice · advance used from Customer Payment of 01/03/2026', 4000, 0),
             ('receivable', 'Payment received', 0, 6000),
         ])
         self.assertEqual(ledger['closing_balance'], {'receivable': 0, 'payable': 6000})
@@ -343,8 +343,8 @@ class InvoicePaysItselfFirstTests(KhaataOrderFixture):
         invoice_rows = [(r[1], r[2], r[4], r[5]) for r in rows if r[3] == 'INV-54']
         self.assertEqual(invoice_rows, [
             ('receivable', 'Sales invoice', 9000, 0),
-            ('receivable', 'Sales invoice · advance applied', 0, 4500),
-            ('payable', 'Sales invoice · advance used', 4500, 0),
+            ('receivable', 'Sales invoice · advance applied from Customer Payment of 01/03/2026', 0, 4500),
+            ('payable', 'Sales invoice · advance used from Customer Payment of 01/03/2026', 4500, 0),
             ('receivable', 'Payment received', 0, 4500),
         ])
         self.assertEqual(ledger['closing_balance'], {'receivable': 0, 'payable': 15500})
@@ -356,8 +356,8 @@ class InvoicePaysItselfFirstTests(KhaataOrderFixture):
         ledger, rows = self.rows(self.ali.person)
         self.assertEqual([(r[1], r[2], r[4], r[5]) for r in rows][1:], [
             ('receivable', 'Sales invoice', 4000, 0),
-            ('receivable', 'Sales invoice · advance applied', 0, 4000),
-            ('payable', 'Sales invoice · advance used', 4000, 0),
+            ('receivable', 'Sales invoice · advance applied from Customer Payment of 01/03/2026', 0, 4000),
+            ('payable', 'Sales invoice · advance used from Customer Payment of 01/03/2026', 4000, 0),
         ])
         self.assertEqual(ledger['closing_balance'], {'receivable': 0, 'payable': 6000})
 
@@ -388,3 +388,30 @@ class InvoicePaysItselfFirstTests(KhaataOrderFixture):
             'purchase_invoice': invoice.id}, format='json')
         self.assertEqual(response.status_code, 400)
         self.assertIn('Supplier Payment', response.json()['date'][0])
+
+
+class AdvanceNamesItsPaymentTests(KhaataOrderFixture):
+    """An advance used by an invoice names the payment it came from."""
+
+    def test_two_advances_are_named_oldest_first(self):
+        self.pay(customer=self.ali.id, amount=3000, date='2026-03-01', reference='R-1')
+        self.pay(customer=self.ali.id, amount=5000, date='2026-03-02')
+        self.sale('INV-60', 6000, (2026, 3, 5))
+        ledger, rows = self.rows(self.ali.person)
+        self.assertEqual([(r[1], r[2], r[4], r[5]) for r in rows if r[3] == 'INV-60'], [
+            ('receivable', 'Sales invoice', 6000, 0),
+            ('receivable', 'Sales invoice · advance applied from Customer Payment of 01/03/2026 (R-1)', 0, 3000),
+            ('payable', 'Sales invoice · advance used from Customer Payment of 01/03/2026 (R-1)', 3000, 0),
+            ('receivable', 'Sales invoice · advance applied from Customer Payment of 02/03/2026', 0, 3000),
+            ('payable', 'Sales invoice · advance used from Customer Payment of 02/03/2026', 3000, 0),
+        ])
+        self.assertEqual(ledger['closing_balance'], {'receivable': 0, 'payable': 2000})
+        self.assertClosesOnTheCards(self.ali.person, ledger)
+
+    def test_a_supplier_advance_names_the_supplier_payment(self):
+        self.party_txn('supplier_payment', 4000, (2026, 1, 5))
+        self.purchase('PI-60', 10000, (2026, 2, 1))
+        ledger, rows = self.rows(self.jotun.person)
+        self.assertIn(('payable', 'Purchase invoice · advance applied from Supplier Payment of 05/01/2026', 4000, 0),
+                      [(r[1], r[2], r[4], r[5]) for r in rows])
+        self.assertClosesOnTheCards(self.jotun.person, ledger)

@@ -798,6 +798,36 @@ def _person_side_rows(business_id, person):
         waiting = 0
         waits_for = {}
 
+        # The advances on the other side, oldest first: [where it came from,
+        # whole rupees left]. Used up oldest first, like the settlement, so
+        # each "advance applied" row can name the payment it came from.
+        advances = []
+
+        def source_of(row, label):
+            """'Customer Payment of 01/03/2026 (RCPT-9)', say."""
+            base = label.split(' · ')[0]
+            if base == LABELS['payment']:
+                base = 'Customer Payment' if kind == 'customer' else 'Supplier Payment'
+            day = row['date']
+            text = f'{base} of {day[8:10]}/{day[5:7]}/{day[:4]}'
+            return f"{text} ({row['reference']})" if row.get('reference') else text
+
+        def use_advances(amount):
+            """Take `amount` from the oldest advances: [(source, amount)]."""
+            taken = []
+            while amount > 0 and advances:
+                source, left = advances[0]
+                part = min(left, amount)
+                taken.append((source, part))
+                amount -= part
+                if part == left:
+                    advances.pop(0)
+                else:
+                    advances[0][1] = left - part
+            if amount > 0:
+                taken.append((None, amount))
+            return taken
+
         def sides():
             return max(balance, 0) + waiting, max(-balance, 0)
 
@@ -814,12 +844,16 @@ def _person_side_rows(business_id, person):
                 # A row that uses up an advance (owner, 28 Nov 2026): it shows
                 # at its full amount on its own side, then the advance moves
                 # across as its own pair - applied on this side, used on the
-                # other - the way an accountant books it. Same balances as
-                # showing only the part the advance didn't cover.
-                used = -other_part
-                out.append(_part_row(row, own, own_part + used, description))
-                out.append(_part_row(row, own, -used, description + ' · advance applied'))
-                out.append(_part_row(row, other, other_part, description + ' · advance used'))
+                # other - the way an accountant books it, each pair naming the
+                # payment the advance came from. Same balances as showing only
+                # the part the advance didn't cover.
+                out.append(_part_row(row, own, own_part - other_part, description))
+                for source, used in use_advances(-other_part):
+                    origin = f' from {source}' if source else ''
+                    out.append(_part_row(
+                        row, own, -used, f'{description} · advance applied{origin}'))
+                    out.append(_part_row(
+                        row, other, -used, f'{description} · advance used{origin}'))
                 return True
             for part_side, part in ((own, own_part), (other, other_part)):
                 if not part:
@@ -828,6 +862,10 @@ def _person_side_rows(business_id, person):
                 if part_side == other:
                     text = past_zero or (description + (
                         ' · advance' if part > 0 else ' · against advance'))
+                    if part > 0:
+                        advances.append([source_of(row, past_zero or description), part])
+                    else:
+                        use_advances(-part)
                 out.append(_part_row(row, part_side, part, text))
             return own_part or other_part
 
@@ -836,7 +874,8 @@ def _person_side_rows(business_id, person):
             if early(row):
                 before = round(sum(held.values()))
                 held[target] = held.get(target, 0) + row['jama']
-                held_as[target] = row['description']
+                held_as.setdefault(target, []).append(
+                    (row['description'], source_of(row, row['description'])))
                 part = round(sum(held.values())) - before
                 out.append(_part_row(
                     row, other, part,
@@ -861,15 +900,18 @@ def _person_side_rows(business_id, person):
             # full amount, then the advance is applied against it, all of it.
             # Any of it past the invoice carries on like other money.
             if invoice in held:
-                paid_as = held_as.pop(invoice)
+                paid = held_as.pop(invoice)
+                origin = ', '.join(source for _, source in paid)
                 before = round(sum(held.values()))
                 used = held.pop(invoice)
                 released = round(sum(held.values())) - before
-                walk(row, -used, paid_as + ' · advance applied',
-                     past_zero=paid_as + ' · advance')
+                walk(row, -used,
+                     f"{row['description']} · advance applied from {origin}",
+                     past_zero=paid[0][0] + ' · advance')
                 if released:
                     out.append(_part_row(
-                        row, other, released, paid_as + ' · advance used'))
+                        row, other, released,
+                        f"{row['description']} · advance used from {origin}"))
         # Every kept invoice is in `rows` and comes after its advance, and
         # every invoice's own payments clear what waits for them, so `held`
         # and `waiting` are empty here and each side closes on the card's
