@@ -15,7 +15,9 @@ from root.serializers import (
 from inventory.models import InventoryItem
 from .models import InvoiceImage, PurchaseInvoice, PurchaseInvoiceItem, PurchaseQuotation, PurchaseQuotationItem, PurchaseReceipt, SalesInvoice, SalesInvoiceItem, ReturnedItem, SalesReceipt
 from .utils import (
+    CHARGE_EXPENSED,
     apply_money_details,
+    charge_is_expensed,
     checkPurchaseInvoiceItemFields,
     checkPurchaseInvoiceCreateFields,
     checkSalesInvoiceItemCreateFields,
@@ -122,12 +124,18 @@ class ExtraChargesValidationMixin:
                     f'and an amount.'
                 )
 
-            unknown = sorted(set(charge) - {'label', 'amount'})
+            unknown = sorted(set(charge) - {'label', 'amount', CHARGE_EXPENSED})
             if unknown:
                 raise serializers.ValidationError(
                     f'Extra charge {position} has unexpected '
                     f'{"keys" if len(unknown) > 1 else "key"} '
                     f'{", ".join(unknown)}. Only label and amount are allowed.'
+                )
+            kept = charge.get(CHARGE_EXPENSED, True)
+            if not isinstance(kept, bool):
+                raise serializers.ValidationError(
+                    f'Extra charge {position}: "{CHARGE_EXPENSED}" must be '
+                    f'true or false.'
                 )
 
             label = str(charge.get('label') or '').strip()
@@ -162,8 +170,37 @@ class ExtraChargesValidationMixin:
             if amount == 0:
                 continue
 
-            cleaned.append({'label': label, 'amount': amount})
+            entry = {'label': label, 'amount': amount}
+            if CHARGE_EXPENSED in charge:
+                entry[CHARGE_EXPENSED] = kept
+            cleaned.append(entry)
 
+        return self._carry_kept_charges(cleaned)
+
+    def _carry_kept_charges(self, cleaned):
+        """
+        A charge whose expense was deleted stays kept through an invoice edit.
+        The invoice form sends only label and amount, so the mark is carried
+        from the saved charges: each kept one marks one unmarked incoming
+        charge with the same label and amount. A charge whose label or amount
+        changed is a different charge, and gets its expense again.
+        """
+        instance = getattr(self, 'instance', None)
+        if instance is None:
+            return cleaned
+        kept = []
+        for charge in instance.extra_charges or []:
+            if isinstance(charge, dict) and not charge_is_expensed(charge):
+                try:
+                    kept.append((str(charge.get('label') or '').strip(),
+                                 round(float(charge.get('amount') or 0), 2)))
+                except (TypeError, ValueError):
+                    continue
+        for charge in cleaned:
+            key = (charge['label'], charge['amount'])
+            if CHARGE_EXPENSED not in charge and key in kept:
+                charge[CHARGE_EXPENSED] = False
+                kept.remove(key)
         return cleaned
 
 
