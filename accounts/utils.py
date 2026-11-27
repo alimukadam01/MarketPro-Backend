@@ -752,6 +752,12 @@ def _person_side_rows(business_id, person):
     uses. A row that does both appears twice, once per side, with the same
     date and reference.
 
+    An invoice takes all its own payments first (owner's rule, 27 Nov 2026),
+    as the settlement does: the part its payments will cover waits on the
+    role's own side for them and never touches an advance. Only what they
+    leave unpaid is open to the advance. So a customer with an advance who
+    pays an invoice separately keeps the advance, with no advance rows.
+
     Amounts are whole rupees: each part is how far the row moves the ROUNDED
     running balance (see _rounded_running), so each side closes on exactly
     the card's figure, which rounds each role's balance once.
@@ -765,22 +771,45 @@ def _person_side_rows(business_id, person):
         rows.sort(key=_walk_key)
         invoice_dates = {row['_invoice']: row['date']
                          for row in rows if row.get('_invoice')}
-        # Payments made on an invoice before its date (fix plan 4, rule 2)
-        # are kept for that invoice: an advance on the other side that no
-        # other invoice can use. Exact amounts; each row shows how far it
-        # moves the rounded total, like the balance below.
+
+        def early(row):
+            """A payment on an invoice, dated before the invoice."""
+            target = row.get('_for')
+            return bool(target and row['jama'] and not row['naam']
+                        and invoice_dates.get(target, '') > row['date'])
+
+        # What each invoice's own payments come to (on or after its date):
+        # the part of the invoice that waits for them.
+        own_paid = defaultdict(float)
+        for row in rows:
+            if row.get('_for') in invoice_dates and not early(row):
+                own_paid[row['_for']] += row['jama'] - row['naam']
+
+        # Payments made on an invoice before its date (fix plan 4, rule 2;
+        # old records only, as such payments are refused now) are kept for
+        # that invoice: an advance on the other side that no other invoice
+        # can use. Exact amounts; each row shows how far it moves the rounded
+        # total, like the balance below.
         held = {}
         held_as = {}
+        # balance: the role's khaata less what invoices hold for their own
+        # payments (waiting); waiting sits on the role's own side.
         balance = 0
+        waiting = 0
+        waits_for = {}
 
-        def walk(row, change, description, past_zero=None):
+        def sides():
+            return max(balance, 0) + waiting, max(-balance, 0)
+
+        def walk(row, change, description, past_zero=None, wait=0):
             """Move the role's balance; put each part on the side it moves."""
-            nonlocal balance
-            before = round(balance)
+            nonlocal balance, waiting
+            own_before, other_before = sides()
             balance += change
-            after = round(balance)
-            own_part = max(after, 0) - max(before, 0)
-            other_part = max(-after, 0) - max(-before, 0)
+            waiting += wait
+            own_after, other_after = sides()
+            own_part = round(own_after) - round(own_before)
+            other_part = round(other_after) - round(other_before)
             for part_side, part in ((own, own_part), (other, other_part)):
                 if not part:
                     continue
@@ -793,8 +822,7 @@ def _person_side_rows(business_id, person):
 
         for row in rows:
             target = row.get('_for')
-            if (target and row['jama'] and not row['naam']
-                    and invoice_dates.get(target, '') > row['date']):
+            if early(row):
                 before = round(sum(held.values()))
                 held[target] = held.get(target, 0) + row['jama']
                 held_as[target] = row['description']
@@ -804,24 +832,37 @@ def _person_side_rows(business_id, person):
                     row['description'] + ' · advance for its invoice'))
                 continue
 
-            if not walk(row, row['naam'] - row['jama'], row['description']):
+            change = row['naam'] - row['jama']
+            wait = 0
+            invoice = row.get('_invoice')
+            if invoice and row['naam'] > 0:
+                # The part its own payments will pay waits for them.
+                wait = min(row['naam'], max(own_paid.get(invoice, 0), 0))
+                waits_for[invoice] = wait
+            elif target in waits_for and row['jama'] > 0:
+                # Its own payment clears what was waiting for it.
+                wait = -min(row['jama'], waits_for[target])
+                waits_for[target] += wait
+            if not walk(row, change - wait, row['description'], wait=wait):
                 out.append({**row, 'side': own, 'naam': 0, 'jama': 0})
 
             # The invoice its advance was kept for: the invoice stands at its
             # full amount, then the advance is applied against it, all of it.
             # Any of it past the invoice carries on like other money.
-            if row.get('_invoice') in held:
-                paid_as = held_as.pop(row['_invoice'])
+            if invoice in held:
+                paid_as = held_as.pop(invoice)
                 before = round(sum(held.values()))
-                used = held.pop(row['_invoice'])
+                used = held.pop(invoice)
                 released = round(sum(held.values())) - before
                 walk(row, -used, paid_as + ' · advance applied',
                      past_zero=paid_as + ' · advance')
                 if released:
                     out.append(_part_row(
                         row, other, released, paid_as + ' · advance used'))
-        # Every kept invoice is in `rows` and comes after its advance, so
-        # `held` is empty here and each side closes on the card's figure.
+        # Every kept invoice is in `rows` and comes after its advance, and
+        # every invoice's own payments clear what waits for them, so `held`
+        # and `waiting` are empty here and each side closes on the card's
+        # figure.
     return out
 
 

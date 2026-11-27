@@ -276,3 +276,96 @@ class AdvanceKeptForItsInvoiceTests(KhaataOrderFixture):
         self.pay_sale(invoice, 4000, (2026, 1, 1))
         _, rows = self.rows(self.ali.person)
         self.assertFalse(any('advance' in row[2] for row in rows))
+
+
+class InvoicePaysItselfFirstTests(KhaataOrderFixture):
+    """
+    An invoice takes all its own payments first; the khaata's advance only
+    covers what they leave unpaid (owner's rule, 27 Nov 2026). So an invoice
+    the advance covers can still be paid on its own, the advance stays, and
+    the khaata shows no advance moving. A payment can't be dated before its
+    invoice: money paid ahead is a Customer or Supplier Payment.
+    """
+
+    def advance(self, amount, day='2026-03-01'):
+        response = self.pay(customer=self.ali.id, amount=amount, date=day)
+        self.assertEqual(response.status_code, 201, response.content)
+
+    def sale_payment(self, invoice, amount, day):
+        return self.client.post('/transactions/', {
+            'type': 'sale_payment', 'amount': amount, 'date': day,
+            'account': self.account.id, 'payment_method': 'cash',
+            'sales_invoice': invoice.id}, format='json')
+
+    def test_paying_an_invoice_the_advance_covers_keeps_the_advance(self):
+        self.advance(10000)
+        invoice = self.sale('INV-50', 10000, (2026, 3, 5))
+        self.assertEqual(self.sides(self.ali.person), (0, 0))
+
+        response = self.sale_payment(invoice, 10000, '2026-03-06')
+        self.assertEqual(response.status_code, 201, response.content)
+        self.assertEqual(self.sides(self.ali.person), (0, 10000))
+
+        ledger, rows = self.rows(self.ali.person)
+        self.assertEqual([(r[1], r[2], r[4], r[5], r[6], r[7]) for r in rows], [
+            ('payable', 'On-account payment · advance', 0, 10000, 0, 10000),
+            ('receivable', 'Sales invoice', 10000, 0, 10000, 10000),
+            ('receivable', 'Payment received', 0, 10000, 0, 10000),
+        ])
+        self.assertClosesOnTheCards(self.ali.person, ledger)
+
+        # The invoice dialog's figures say the same.
+        body = self.client.get(f'/sales-invoices/{invoice.id}/settlement/').json()
+        self.assertEqual((body['paid_on_invoice'], body['settled_from_khaata'],
+                          body['room']), (10000, 0, 0))
+
+    def test_part_paid_the_advance_covers_the_rest(self):
+        self.advance(10000)
+        invoice = self.sale('INV-51', 10000, (2026, 3, 5))
+        self.sale_payment(invoice, 6000, '2026-03-06')
+
+        ledger, rows = self.rows(self.ali.person)
+        self.assertEqual([(r[1], r[2], r[4], r[5]) for r in rows], [
+            ('payable', 'On-account payment · advance', 0, 10000),
+            ('receivable', 'Sales invoice', 6000, 0),
+            ('payable', 'Sales invoice · against advance', 4000, 0),
+            ('receivable', 'Payment received', 0, 6000),
+        ])
+        self.assertEqual(ledger['closing_balance'], {'receivable': 0, 'payable': 6000})
+        self.assertClosesOnTheCards(self.ali.person, ledger)
+
+    def test_an_unpaid_invoice_still_uses_the_advance(self):
+        self.advance(10000)
+        self.sale('INV-52', 4000, (2026, 3, 5))
+        ledger, rows = self.rows(self.ali.person)
+        self.assertEqual([(r[1], r[2]) for r in rows][-1],
+                         ('payable', 'Sales invoice · against advance'))
+        self.assertEqual(ledger['closing_balance'], {'receivable': 0, 'payable': 6000})
+
+    def test_a_payment_before_its_invoice_is_refused(self):
+        invoice = self.sale('INV-53', 10000, (2026, 3, 5))
+
+        response = self.sale_payment(invoice, 1000, '2026-03-04')
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('Customer Payment', response.json()['date'][0])
+
+        response = self.client.post(f'/sales-invoices/{invoice.id}/payments/', {
+            'amount': 1000, 'account': self.account.id, 'payment_method': 'cash',
+            'date': '2026-03-04'}, format='json')
+        self.assertEqual(response.status_code, 400)
+
+        response = self.pay(customer=self.ali.id, amount=1000, date='2026-03-04',
+                            items=[{'kind': 'invoice', 'id': invoice.id}])
+        self.assertEqual(response.status_code, 400)
+
+        # On the day itself, it is fine.
+        self.assertEqual(self.sale_payment(invoice, 1000, '2026-03-05').status_code, 201)
+
+    def test_a_supplier_payment_before_its_purchase_is_refused(self):
+        invoice = self.purchase('PI-9', 20000, (2026, 2, 1))
+        response = self.client.post('/transactions/', {
+            'type': 'purchase_payment', 'amount': 1000, 'date': '2026-01-31',
+            'account': self.account.id, 'payment_method': 'cash',
+            'purchase_invoice': invoice.id}, format='json')
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('Supplier Payment', response.json()['date'][0])

@@ -179,7 +179,10 @@ class RecordPartyPaymentTests(KhaataFixtures, TestCase):
 
     # -- pending cheques hold room ----------------------------------------
 
-    def test_a_pending_on_account_cheque_holds_the_invoices_it_will_settle(self):
+    def test_a_pending_on_account_cheque_holds_no_invoice(self):
+        # The khaata only covers what an invoice's own payments leave unpaid
+        # (owner's rule, 27 Nov), so on-account money, cleared or not, never
+        # holds an invoice against its own payment.
         first = self.purchase('INV-1', 30000, (2026, 1, 1))
         second = self.purchase('INV-2', 30000, (2026, 2, 1))
 
@@ -188,40 +191,37 @@ class RecordPartyPaymentTests(KhaataFixtures, TestCase):
         cheque = Transaction.objects.get(type='supplier_payment')
         self.assertEqual(cheque.status, 'PEN')
 
-        # Nothing is settled yet...
         self.assertEqual(self.fresh(first).amount_paid, 0)
-        # ...but INV-1 and 10k of INV-2 are held for when it clears.
-        self.assertEqual(invoice_room(self.fresh(first)), 0)
-        self.assertEqual(invoice_room(self.fresh(second)), 20000)
+        self.assertEqual(invoice_room(self.fresh(first)), 30000)
+        self.assertEqual(invoice_room(self.fresh(second)), 30000)
         self.assertEqual(
             [(i['label'], i['room'], i['reserved'])
              for i in self.items()['items']],
-            [('INV-2', 20000, 10000)])
+            [('INV-1', 30000, 0), ('INV-2', 30000, 0)])
 
-        # A named payment above the held room is refused.
         response = self.client.post('/transactions/', {
             'type': 'purchase_payment', 'amount': 25000, 'date': '2026-06-02',
             'account': self.account.id, 'payment_method': 'cash',
             'purchase_invoice': second.id}, format='json')
-        self.assertEqual(response.status_code, 400)
-        self.assertIn('20,000', response.json()['amount'][0])
+        self.assertEqual(response.status_code, 201, response.content)
 
-        # Bounced: the hold is released.
+        # Bounced: nothing changes for the invoices' own room.
         response = self.client.post(f'/transactions/{cheque.id}/mark-bounced/')
         self.assertIn(response.status_code, (200, 204), response.content)
         self.assertEqual(invoice_room(self.fresh(first)), 30000)
-        self.assertEqual(invoice_room(self.fresh(second)), 30000)
+        self.assertEqual(invoice_room(self.fresh(second)), 5000)
 
     def test_a_cleared_cheque_settles_what_it_held(self):
         first = self.purchase('INV-1', 30000, (2026, 1, 1))
         self.cheque(30000)
         cheque = Transaction.objects.get(type='supplier_payment')
-        self.assertEqual(invoice_room(self.fresh(first)), 0)
+        self.assertEqual(invoice_room(self.fresh(first)), 30000)
 
         response = self.client.post(f'/transactions/{cheque.id}/mark-cleared/')
         self.assertIn(response.status_code, (200, 204), response.content)
         self.assertEqual(self.fresh(first).payment_status, 'P')
-        self.assertEqual(invoice_room(self.fresh(first)), 0)
+        # Settled by the khaata, it can still take its own payment.
+        self.assertEqual(invoice_room(self.fresh(first)), 30000)
 
     def test_a_pending_named_cheque_is_not_held_twice(self):
         # A pending cheque named on INV-1 holds INV-1 itself; on-account money
@@ -232,14 +232,13 @@ class RecordPartyPaymentTests(KhaataFixtures, TestCase):
         self.party_txn('supplier_payment', 10000, (2026, 3, 1))
 
         self.assertEqual(invoice_room(self.fresh(first)), 0)
-        self.assertEqual(invoice_room(self.fresh(second)), 20000)
+        self.assertEqual(invoice_room(self.fresh(second)), 30000)
 
-    def test_a_pending_refund_does_not_open_room(self):
+    def test_an_invoice_the_khaata_settled_can_still_be_paid(self):
         invoice = self.purchase('INV-1', 30000, (2026, 1, 1))
         self.party_txn('supplier_payment', 30000, (2026, 3, 1))
-        self.party_txn('purchase_return_refund', 5000, (2026, 3, 2),
-                       status='PEN')
-        self.assertEqual(invoice_room(self.fresh(invoice)), 0)
+        self.assertEqual(self.fresh(invoice).payment_status, 'P')
+        self.assertEqual(invoice_room(self.fresh(invoice)), 30000)
 
 
 class DailySummaryUdhaarTests(KhaataFixtures, TestCase):

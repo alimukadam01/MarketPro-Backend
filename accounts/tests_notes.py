@@ -251,7 +251,9 @@ class NotesAPITests(TestCase):
 
     # -- the payment picker -----------------------------------------------
 
-    def test_picker_rooms_follow_the_pool(self):
+    def test_picker_rooms_ignore_the_pool(self):
+        # An invoice takes its own payments first (owner's rule, 27 Nov):
+        # what the khaata settles on it doesn't shrink what it can take.
         PartyOpeningBalance.objects.create(
             business=self.business, supplier=self.jotun, amount=10000,
             as_of_date=datetime.date(2025, 12, 31))
@@ -263,16 +265,29 @@ class NotesAPITests(TestCase):
         items = self.client.get(
             f'/accounting-kpis/settleable-items/?supplier_id={self.jotun.id}'
         ).json()['items']
-        self.assertEqual([(i['label'], i['room']) for i in items],
-                         [('INV-1', 15000), ('INV-2', 30000)])
+        self.assertEqual([(i['label'], i['room'], i['covered'], i['owed'])
+                          for i in items],
+                         [('INV-1', 30000, 15000, 15000), ('INV-2', 30000, 0, 30000)])
 
-        # A named payment above the room is refused, with the real limit.
+        # A named payment above the invoice itself is refused.
         response = self.client.post('/transactions/', {
-            'type': 'purchase_payment', 'amount': 20000, 'date': '2026-04-20',
+            'type': 'purchase_payment', 'amount': 35000, 'date': '2026-04-20',
             'account': self.account.id, 'payment_method': 'cash',
             'purchase_invoice': first.id}, format='json')
         self.assertEqual(response.status_code, 400)
-        self.assertIn('15,000', response.json()['amount'][0])
+        self.assertIn('30,000', response.json()['amount'][0])
+
+        # Up to it is taken, and the note's share goes on to INV-2.
+        response = self.client.post('/transactions/', {
+            'type': 'purchase_payment', 'amount': 30000, 'date': '2026-04-20',
+            'account': self.account.id, 'payment_method': 'cash',
+            'purchase_invoice': first.id}, format='json')
+        self.assertEqual(response.status_code, 201, response.content)
+        items = self.client.get(
+            f'/accounting-kpis/settleable-items/?supplier_id={self.jotun.id}'
+        ).json()['items']
+        self.assertEqual([(i['label'], i['covered']) for i in items],
+                         [('INV-2', 15000)])
 
     # -- the invoice side -------------------------------------------------
 
@@ -285,7 +300,9 @@ class NotesAPITests(TestCase):
         self.assertEqual(body['paid_on_invoice'], 100000)
         self.assertEqual(body['settled_from_khaata'], 72338)
         self.assertEqual(body['still_owed'], 36331)
-        self.assertEqual(body['room'], 36331)
+        # Its own payments may still reach its total; the note's share would
+        # go back to the khaata.
+        self.assertEqual(body['room'], 108669)
         self.assertEqual([(row['label'], row['applied'])
                           for row in body['settled_by']],
                          [('Credit note', 72338)])

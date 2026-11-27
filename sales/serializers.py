@@ -22,6 +22,7 @@ from .utils import (
     checkPurchaseInvoiceCreateFields,
     checkSalesInvoiceItemCreateFields,
     invoice_room,
+    payment_date_error,
     overpaid_by,
     receive_into_stock,
     refund_new_overpayment,
@@ -818,9 +819,18 @@ class PurchaseReceiptCreateSerializer(PaymentReceiptCreateSerializer):
         # one does not, so its amount can be paid again.
         room = invoice_room(purchase_invoice)
 
+        date_error = payment_date_error(
+            purchase_invoice, self.validated_data.get("date"))
+        if date_error:
+            error = serializers.ValidationError({"date": date_error})
+            if raise_exception:
+                raise error
+            self._errors.update(error.detail)
+            return False
+
         if float(self.validated_data.get("amount") or 0) > room:
             error = serializers.ValidationError({
-                "amount": f"This invoice can take at most PKR {room:,.0f} more - part of it may already be settled from the khaata."
+                "amount": f"This invoice can take at most PKR {room:,.0f} more."
             })
             if raise_exception:
                 raise error
@@ -1423,9 +1433,18 @@ class SalesReceiptCreateSerializer(PaymentReceiptCreateSerializer):
         # one does not, so its amount can be paid again.
         room = invoice_room(sales_invoice)
 
+        date_error = payment_date_error(
+            sales_invoice, self.validated_data.get("date"))
+        if date_error:
+            error = serializers.ValidationError({"date": date_error})
+            if raise_exception:
+                raise error
+            self._errors.update(error.detail)
+            return False
+
         if float(self.validated_data.get("amount") or 0) > room:
             error = serializers.ValidationError({
-                "amount": f"This invoice can take at most PKR {room:,.0f} more - part of it may already be settled from the khaata."
+                "amount": f"This invoice can take at most PKR {room:,.0f} more."
             })
             if raise_exception:
                 raise error

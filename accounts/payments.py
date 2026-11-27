@@ -39,7 +39,7 @@ from rest_framework import serializers
 
 from root.models import Customer, Supplier
 from sales.models import PurchaseInvoice, SalesInvoice
-from sales.utils import invoice_room
+from sales.utils import invoice_room, live_receipt_total
 
 from .models import Transaction
 from .settlement import LABELS, attach_settlement, settle_parties, settle_party
@@ -130,37 +130,41 @@ def settleable_items(business_id, party, party_id):
     `room` is what the invoice can still take and is authoritative: it comes
     from invoice_room(), the same helper TransactionCreateSerializer validates
     against, so the dialog can never offer more than the server will accept.
-    `reserved` is what pending cheques hold on it - its own, and on-account
-    ones that will reach it when they clear - counted against room, but
-    settling nothing yet.
+    It ignores the khaata: an invoice takes its own payments first, so one the
+    advance covers is still listed, with `covered` saying how much the khaata
+    settles on it. Paying it returns that much to the khaata. `owed` is what
+    is still unpaid once the khaata has settled. `reserved` is what its own
+    pending cheques hold, counted against room but settling nothing yet.
 
     party is 'customer' or 'supplier'.
     """
     items = []
 
-    # Two khaata passes for the party, not two per invoice: the settled one
-    # for what is still owed, the reserving one that invoice_room reads.
     invoices = list(_invoice_queryset(business_id, party, party_id))
     attach_settlement(invoices)
-    attach_settlement(invoices, include_pending=True)
     for invoice in invoices:
         room = int(invoice_room(invoice))
         if room <= 0:
             continue
 
         total = float(invoice.total or 0)
-        owed = total - float(invoice.amount_paid or 0)
+        owed = max(total - float(invoice.amount_paid or 0), 0)
+        covered = float(invoice.pool_applied or 0)
 
         items.append({
             'kind': INVOICE,
             'id': invoice.id,
             'label': invoice.invoice_number or f'#{invoice.id}',
-            'sub': None,
+            'sub': ('Covered by the khaata; paying it returns the advance'
+                    if covered and owed < 1 else None),
             'date': invoice.date_issued.date().isoformat()
             if invoice.date_issued else None,
             'total': round(total),
             'room': room,
-            'reserved': max(round(owed - room), 0),
+            'owed': round(owed),
+            'covered': round(covered),
+            'reserved': max(round(float(live_receipt_total(invoice))
+                                  - float(invoice.receipts_paid or 0)), 0),
         })
 
     items.extend(_loan_items(business_id, party, party_id))
