@@ -331,10 +331,12 @@ class MeasurementTests(TestCase):
         target = self.q3(data_point='purchase_value')
         self.assertEqual(self.measure(target), 1000)
 
-    def test_draft_invoices_are_counted(self):
+    def test_draft_invoices_are_not_counted(self):
+        # A draft isn't a sale yet (fix plan 1.2): the khaata's rule.
         self.sales_invoice(700, status='D')
+        self.sales_invoice(300)
         target = self.q3(data_point='sales_revenue')
-        self.assertEqual(self.measure(target), 700)
+        self.assertEqual(self.measure(target), 300)
 
     # --- net of returns --------------------------------------------------
 

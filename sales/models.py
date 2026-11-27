@@ -234,15 +234,15 @@ class SalesInvoiceManager(models.Manager):
         """
         Invoiced sales value over an absolute window, dated on the invoice.
 
-        Cancelled invoices never count. Drafts do, which matches what
-        party_invoiced, profit_estimate and the Sales page already show.
+        Cancelled invoices and drafts never count: a draft isn't a sale yet,
+        the same rule as the khaata and profit_estimate (fix plan 1.2).
 
         Extra charges included: see the note above SalesInvoiceQuerySet.
         """
         return (
             self.get_queryset()
             .for_business(business_id)
-            .exclude(status__in=self.model.CANCELLED_STATUSES)
+            .exclude(status__in=self.model.CANCELLED_STATUSES + self.model.DRAFT_STATUSES)
             .in_range('date_issued__date', date_from, date_to)
             .filter_optional(
                 customer_id=customer_id,
@@ -258,7 +258,7 @@ class SalesInvoiceManager(models.Manager):
         return (
             self.get_queryset()
             .for_business(business_id)
-            .exclude(status__in=self.model.CANCELLED_STATUSES)
+            .exclude(status__in=self.model.CANCELLED_STATUSES + self.model.DRAFT_STATUSES)
             .in_range('date_issued__date', date_from, date_to)
             .filter_optional(
                 customer_id=customer_id,

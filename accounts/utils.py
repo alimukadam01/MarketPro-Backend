@@ -87,8 +87,8 @@ CANCELLED_SALES_STATUSES = ['X']
 CANCELLED_PURCHASE_STATUSES = ['C']
 
 # Invoices that are not debts on the khaata: cancelled ones never happened and
-# drafts are not confirmed yet (credit-debit-notes plan, D11). A khaata rule
-# only - reporting keeps counting drafts as it always has.
+# drafts are not confirmed yet (credit-debit-notes plan, D11). Profit and the
+# sales targets use the same rule (fix plan 1.2).
 NOT_A_DEBT_SALES_STATUSES = (
     SalesInvoice.CANCELLED_STATUSES + SalesInvoice.DRAFT_STATUSES)
 NOT_A_DEBT_PURCHASE_STATUSES = (
@@ -468,6 +468,22 @@ def uncleared_opening_balances(business_id, party):
 
 # ── Khaata ────────────────────────────────────────────────────────────────────
 
+# Same-day order on the khaata (fix plan 4, rule 1): what the person stood at,
+# then what they took on, then what they paid, then notes and refunds. Typing
+# order only breaks a tie inside one of these.
+WALK_ORDER = {
+    'opening': 0,
+    'invoice': 1, 'loan_given': 1, 'loan_received': 1,
+    'payment': 2, 'loan_recovered': 2, 'loan_repayment': 2, 'set_off': 2,
+    'credit_note': 3, 'debit_note': 3, 'refund': 3,
+}
+
+
+def _walk_key(row):
+    """The order the khaata walks its rows in, oldest first."""
+    return (row['date'], row.get('_order', 2), row['_seq'])
+
+
 def _side_rows(business_id, kind, role, person):
     """
     One khaata of a person, unsorted: their opening balances on it,
@@ -486,6 +502,7 @@ def _side_rows(business_id, kind, role, person):
         rows.append({
             'date': opening.as_of_date.isoformat(),
             '_seq': '',
+            '_order': WALK_ORDER['opening'],
             'description': 'Opening balance',
             'reference': None,
             'naam': signed if signed > 0 else 0,
@@ -503,6 +520,8 @@ def _side_rows(business_id, kind, role, person):
                 'date': local_date(invoice.date_issued).isoformat()
                 if invoice.date_issued else None,
                 '_seq': invoice.created_at.isoformat(),
+                '_order': WALK_ORDER['invoice'],
+                '_invoice': f's{invoice.id}',
                 'description': 'Sales invoice',
                 'reference': invoice.invoice_number or str(invoice.id),
                 'naam': invoice.total or 0,
@@ -518,6 +537,9 @@ def _side_rows(business_id, kind, role, person):
             rows.append({
                 'date': receipt_date(receipt).isoformat(),
                 '_seq': receipt.created_at.isoformat(),
+                '_order': WALK_ORDER['payment'],
+                # The invoice this payment names (fix plan 4, rule 2).
+                '_for': f's{receipt.sales_invoice_id}',
                 'description': 'Payment received',
                 'reference': receipt.sales_invoice.invoice_number
                 or str(receipt.sales_invoice_id),
@@ -540,6 +562,8 @@ def _side_rows(business_id, kind, role, person):
                 'date': local_date(invoice.date_issued).isoformat()
                 if invoice.date_issued else None,
                 '_seq': invoice.created_at.isoformat(),
+                '_order': WALK_ORDER['invoice'],
+                '_invoice': f'p{invoice.id}',
                 'description': 'Purchase invoice',
                 'reference': invoice.invoice_number or str(invoice.id),
                 'naam': invoice.total or 0,
@@ -555,6 +579,8 @@ def _side_rows(business_id, kind, role, person):
             rows.append({
                 'date': receipt_date(receipt).isoformat(),
                 '_seq': receipt.created_at.isoformat(),
+                '_order': WALK_ORDER['payment'],
+                '_for': f'p{receipt.purchase_invoice_id}',
                 'description': 'Payment made',
                 'reference': receipt.purchase_invoice.invoice_number
                 or str(receipt.purchase_invoice_id),
@@ -566,7 +592,8 @@ def _side_rows(business_id, kind, role, person):
     # here whatever roles the person has. A payment, credit note, recovery or
     # set-off lowers this side; a refund, debit note or loan raises it.
     descriptions = {
-        t: (LABELS[entry_kind], 'jama' if effect == 'settles' else 'naam')
+        t: (LABELS[entry_kind], 'jama' if effect == 'settles' else 'naam',
+            WALK_ORDER.get(entry_kind, 2))
         for t, (p, effect, entry_kind) in Transaction.PARTY_EFFECTS.items()
         if p == kind
     }
@@ -576,10 +603,11 @@ def _side_rows(business_id, kind, role, person):
     ).select_related('transaction')
     for payment in on_account:
         txn = payment.transaction
-        description, side = descriptions[txn.type]
+        description, side, order = descriptions[txn.type]
         rows.append({
             'date': txn.date.isoformat(),
             '_seq': payment.created_at.isoformat(),
+            '_order': order,
             'description': description,
             'reference': txn.set_off_reference or txn.reference,
             'naam': txn.amount if side == 'naam' else 0,
@@ -589,16 +617,32 @@ def _side_rows(business_id, kind, role, person):
     return [row for row in rows if row['date']]
 
 
-def _finish_ledger(rows, date_from, date_to, sides=None):
+# Debit and Credit, the way the books put them (fix plan 3.1). Naam is what
+# raises a side and jama what lowers it. On Receivable (they owe you) a raise
+# is a Debit; on Payable (you owe them) a raise is a Credit.
+def _debit_credit(row, side):
+    if side == 'payable':
+        return row['jama'], row['naam']
+    return row['naam'], row['jama']
+
+
+# Working keys of the walk, never sent.
+WALK_KEYS = ('_seq', '_order', '_invoice', '_for')
+
+
+def _finish_ledger(rows, date_from, date_to, sides=None, side=None):
     """
     Sort, carry everything before date_from in as one figure, and add the
     running balance. With `sides` (the both-sides view) each side keeps its
     own running balance and brought-forward figure - never one netted
-    balance (register #25).
+    balance (register #25). `side` names the one side otherwise. Every row
+    gets its Debit and Credit for its side.
     """
-    rows.sort(key=lambda row: (row['date'], row['_seq']))
+    rows.sort(key=_walk_key)
     for row in rows:
-        del row['_seq']
+        for key in WALK_KEYS:
+            row.pop(key, None)
+        row['debit'], row['credit'] = _debit_credit(row, row.get('side') or side)
 
     keys = sides or [None]
     brought_forward = {key: 0 for key in keys}
@@ -627,6 +671,7 @@ def _finish_ledger(rows, date_from, date_to, sides=None):
             'closing_balance': {key: round(value) for key, value in running.items()},
         }
     return {
+        'side': side,
         'rows': rows,
         'brought_forward': round(brought_forward[None]),
         'closing_balance': running[None],
@@ -643,7 +688,7 @@ def party_ledger(business_id, customer=None, supplier=None,
     kind = 'customer' if customer else 'supplier'
     role = customer or supplier
     rows = _rounded_running(_side_rows(business_id, kind, role, role.person))
-    return _finish_ledger(rows, date_from, date_to)
+    return _finish_ledger(rows, date_from, date_to, side=NATURAL_SIDE[kind])
 
 
 def _rounded_running(rows):
@@ -656,7 +701,7 @@ def _rounded_running(rows):
     rupee off its own rounded amount, but the khaata always closes on the
     card's figure.
     """
-    rows.sort(key=lambda row: (row['date'], row['_seq']))
+    rows.sort(key=_walk_key)
     balance = 0
     for row in rows:
         before = round(balance)
@@ -690,7 +735,7 @@ def person_ledger(business_id, person, side='both', date_from=None, date_to=None
     rows = _person_side_rows(business_id, person)
     if side in SIDE_KINDS:
         rows = [row for row in rows if row.pop('side') == side]
-        return _finish_ledger(rows, date_from, date_to)
+        return _finish_ledger(rows, date_from, date_to, side=side)
     return _finish_ledger(rows, date_from, date_to, sides=list(SIDE_KINDS))
 
 
@@ -717,31 +762,78 @@ def _person_side_rows(business_id, person):
     for kind, own in NATURAL_SIDE.items():
         other = OTHER_SIDE[own]
         rows = _side_rows(business_id, kind, role_of(person, kind), person)
-        rows.sort(key=lambda row: (row['date'], row['_seq']))
+        rows.sort(key=_walk_key)
+        invoice_dates = {row['_invoice']: row['date']
+                         for row in rows if row.get('_invoice')}
+        # Payments made on an invoice before its date (fix plan 4, rule 2)
+        # are kept for that invoice: an advance on the other side that no
+        # other invoice can use. Exact amounts; each row shows how far it
+        # moves the rounded total, like the balance below.
+        held = {}
+        held_as = {}
         balance = 0
-        for row in rows:
+
+        def walk(row, change, description, past_zero=None):
+            """Move the role's balance; put each part on the side it moves."""
+            nonlocal balance
             before = round(balance)
-            balance += row['naam'] - row['jama']
+            balance += change
             after = round(balance)
             own_part = max(after, 0) - max(before, 0)
             other_part = max(-after, 0) - max(-before, 0)
-            if not own_part and not other_part:
-                out.append({**row, 'side': own, 'naam': 0, 'jama': 0})
-                continue
             for part_side, part in ((own, own_part), (other, other_part)):
                 if not part:
                     continue
-                description = row['description']
+                text = description
                 if part_side == other:
-                    description += ' · advance' if part > 0 else ' · against advance'
-                out.append({
-                    **row,
-                    'side': part_side,
-                    'description': description,
-                    'naam': part if part > 0 else 0,
-                    'jama': -part if part < 0 else 0,
-                })
+                    text = past_zero or (description + (
+                        ' · advance' if part > 0 else ' · against advance'))
+                out.append(_part_row(row, part_side, part, text))
+            return own_part or other_part
+
+        for row in rows:
+            target = row.get('_for')
+            if (target and row['jama'] and not row['naam']
+                    and invoice_dates.get(target, '') > row['date']):
+                before = round(sum(held.values()))
+                held[target] = held.get(target, 0) + row['jama']
+                held_as[target] = row['description']
+                part = round(sum(held.values())) - before
+                out.append(_part_row(
+                    row, other, part,
+                    row['description'] + ' · advance for its invoice'))
+                continue
+
+            if not walk(row, row['naam'] - row['jama'], row['description']):
+                out.append({**row, 'side': own, 'naam': 0, 'jama': 0})
+
+            # The invoice its advance was kept for: the invoice stands at its
+            # full amount, then the advance is applied against it, all of it.
+            # Any of it past the invoice carries on like other money.
+            if row.get('_invoice') in held:
+                paid_as = held_as.pop(row['_invoice'])
+                before = round(sum(held.values()))
+                used = held.pop(row['_invoice'])
+                released = round(sum(held.values())) - before
+                walk(row, -used, paid_as + ' · advance applied',
+                     past_zero=paid_as + ' · advance')
+                if released:
+                    out.append(_part_row(
+                        row, other, released, paid_as + ' · advance used'))
+        # Every kept invoice is in `rows` and comes after its advance, so
+        # `held` is empty here and each side closes on the card's figure.
     return out
+
+
+def _part_row(row, side, part, description):
+    """One side's part of a khaata row: a positive part raises that side."""
+    return {
+        **row,
+        'side': side,
+        'description': description,
+        'naam': part if part > 0 else 0,
+        'jama': -part if part < 0 else 0,
+    }
 
 
 # ── Roznamcha ─────────────────────────────────────────────────────────────────
@@ -761,13 +853,25 @@ def day_book(business_id, day, date_to=None):
     accounts = (MoneyAccount.objects.for_business(business_id).active()
                 .with_balance(previous_day))
     sections = []
+    # The shop's money in and out. A transfer between two of its own accounts
+    # is neither: it shows on both accounts' tables and moves both balances,
+    # but stays out of these totals (fix plan 1.1).
     total_in = 0
     total_out = 0
+    transfers = 0
+    # Cash counts, by direction, so the summary can name them (fix plan 1.1).
+    adjustments_in = 0
+    adjustments_out = 0
 
     for account in accounts:
         rows = []
         account_in = 0
         account_out = 0
+        opening = account.balance_value
+        # Worked out oldest-first, in the order the money moved; only cleared
+        # money moves it, so a pending cheque leaves the balance as it was
+        # (fix plan 3.2). The screen shows the rows newest-first.
+        balance = opening
 
         for txn in transactions:
             involved = (
@@ -777,12 +881,13 @@ def day_book(business_id, day, date_to=None):
             if not involved:
                 continue
 
+            is_transfer = txn.type == 'transfer'
             if txn.transfer_account_id == account.id:
                 # Money arriving from another of the shop's own accounts.
                 inflow, outflow = txn.amount, 0
             elif txn.direction == 'in':
                 inflow, outflow = txn.amount, 0
-            elif txn.direction == 'out' or txn.type == 'transfer':
+            elif txn.direction == 'out' or is_transfer:
                 inflow, outflow = 0, txn.amount
             else:
                 inflow = txn.amount if txn.amount > 0 else 0
@@ -791,6 +896,16 @@ def day_book(business_id, day, date_to=None):
             if txn.status == 'C':
                 account_in += inflow
                 account_out += outflow
+                balance += inflow - outflow
+                if is_transfer:
+                    # Counted once, on the account it left.
+                    transfers += outflow
+                else:
+                    total_in += inflow
+                    total_out += outflow
+                    if txn.type == 'cash_adjustment':
+                        adjustments_in += inflow
+                        adjustments_out += outflow
 
             rows.append({
                 'id': txn.id,
@@ -803,9 +918,9 @@ def day_book(business_id, day, date_to=None):
                 'notes': txn.notes,
                 'money_in': inflow,
                 'money_out': outflow,
+                'balance': balance,
             })
 
-        opening = account.balance_value
         sections.append({
             'account_id': account.id,
             'account_name': account.name,
@@ -817,9 +932,6 @@ def day_book(business_id, day, date_to=None):
             'closing_balance': opening + account_in - account_out,
         })
 
-        total_in += account_in
-        total_out += account_out
-
     return {
         'date': day.isoformat(),
         'date_from': day.isoformat(),
@@ -827,14 +939,18 @@ def day_book(business_id, day, date_to=None):
         'accounts': sections,
         'total_money_in': total_in,
         'total_money_out': total_out,
+        'total_transfers': transfers,
+        'cash_adjustments_in': adjustments_in,
+        'cash_adjustments_out': adjustments_out,
     }
 
 
 def _with_other(total, lines):
     """
     The named lines, an `other` line for whatever they leave out (refunds,
-    other payments, transfers the day book counts), and the total - so the
-    lines always add up to the total (register #8).
+    other payments), and the total - so the lines always add up to the total
+    (register #8). Transfers between the shop's own accounts are in neither
+    the lines nor the total (fix plan 1.1).
     """
     other = round(total - sum(lines.values()))
     return {**lines, 'other': other, 'total': total}
@@ -917,6 +1033,8 @@ def daily_summary(business_id, day, date_to=None):
                 + totals.get('owner_capital', 0)
                 + totals.get('purchase_return_refund', 0)
             ),
+            # A cash count that found more than the books said.
+            'cash_adjustments': book['cash_adjustments_in'],
         }),
         'money_out': _with_other(book['total_money_out'], {
             # Salaries are expenses in the salary category now, not their own
@@ -934,7 +1052,12 @@ def daily_summary(business_id, day, date_to=None):
             # Loans repaid, and money lent out.
             'loans': (totals.get('loan_repayment', 0)
                       + totals.get('loan_given', 0)),
+            # A cash count that found less.
+            'cash_adjustments': book['cash_adjustments_out'],
         }),
+        # Moved between the shop's own accounts in the period: not money in or
+        # out, so not in either total.
+        'transfers': book['total_transfers'],
         'credit_extended': round(max(credit_extended - cash_sales, 0)),
         'total_receivable': sum(row['balance'] for row in receivable_rows),
         'total_payable': sum(row['balance'] for row in payable_rows),
@@ -960,7 +1083,8 @@ def profit_estimate(business_id, date_from, date_to):
         .filter(business_id=business_id,
                 date_issued__date__gte=date_from,
                 date_issued__date__lte=date_to)
-        .exclude(status__in=CANCELLED_SALES_STATUSES)
+        # A draft isn't a sale yet: the same rule as the khaata (fix plan 1.2).
+        .exclude(status__in=NOT_A_DEBT_SALES_STATUSES)
         .aggregate(total=Sum('total'))['total'] or 0
     )
 
@@ -976,7 +1100,7 @@ def profit_estimate(business_id, date_from, date_to):
         .filter(sales_invoice__business_id=business_id,
                 sales_invoice__date_issued__date__gte=date_from,
                 sales_invoice__date_issued__date__lte=date_to)
-        .exclude(sales_invoice__status__in=CANCELLED_SALES_STATUSES)
+        .exclude(sales_invoice__status__in=NOT_A_DEBT_SALES_STATUSES)
     )
     cogs = sum(item.net_quantity * cost_map.get(item.product_id, 0)
                for item in items)
