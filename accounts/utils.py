@@ -752,6 +752,12 @@ def _person_side_rows(business_id, person):
     uses. A row that does both appears twice, once per side, with the same
     date and reference.
 
+    An invoice takes all its own payments first (owner's rule, 27 Nov 2026),
+    as the settlement does: the part its payments will cover waits on the
+    role's own side for them and never touches an advance. Only what they
+    leave unpaid is open to the advance. So a customer with an advance who
+    pays an invoice separately keeps the advance, with no advance rows.
+
     Amounts are whole rupees: each part is how far the row moves the ROUNDED
     running balance (see _rounded_running), so each side closes on exactly
     the card's figure, which rounds each role's balance once.
@@ -765,22 +771,92 @@ def _person_side_rows(business_id, person):
         rows.sort(key=_walk_key)
         invoice_dates = {row['_invoice']: row['date']
                          for row in rows if row.get('_invoice')}
-        # Payments made on an invoice before its date (fix plan 4, rule 2)
-        # are kept for that invoice: an advance on the other side that no
-        # other invoice can use. Exact amounts; each row shows how far it
-        # moves the rounded total, like the balance below.
+
+        def early(row):
+            """A payment on an invoice, dated before the invoice."""
+            target = row.get('_for')
+            return bool(target and row['jama'] and not row['naam']
+                        and invoice_dates.get(target, '') > row['date'])
+
+        # What each invoice's own payments come to (on or after its date):
+        # the part of the invoice that waits for them.
+        own_paid = defaultdict(float)
+        for row in rows:
+            if row.get('_for') in invoice_dates and not early(row):
+                own_paid[row['_for']] += row['jama'] - row['naam']
+
+        # Payments made on an invoice before its date (fix plan 4, rule 2;
+        # old records only, as such payments are refused now) are kept for
+        # that invoice: an advance on the other side that no other invoice
+        # can use. Exact amounts; each row shows how far it moves the rounded
+        # total, like the balance below.
         held = {}
         held_as = {}
+        # balance: the role's khaata less what invoices hold for their own
+        # payments (waiting); waiting sits on the role's own side.
         balance = 0
+        waiting = 0
+        waits_for = {}
 
-        def walk(row, change, description, past_zero=None):
+        # The advances on the other side, oldest first: [where it came from,
+        # whole rupees left]. Used up oldest first, like the settlement, so
+        # each "advance applied" row can name the payment it came from.
+        advances = []
+
+        def source_of(row, label):
+            """'Customer Payment of 01/03/2026 (RCPT-9)', say."""
+            base = label.split(' · ')[0]
+            if base == LABELS['payment']:
+                base = 'Customer Payment' if kind == 'customer' else 'Supplier Payment'
+            day = row['date']
+            text = f'{base} of {day[8:10]}/{day[5:7]}/{day[:4]}'
+            return f"{text} ({row['reference']})" if row.get('reference') else text
+
+        def use_advances(amount):
+            """Take `amount` from the oldest advances: [(source, amount)]."""
+            taken = []
+            while amount > 0 and advances:
+                source, left = advances[0]
+                part = min(left, amount)
+                taken.append((source, part))
+                amount -= part
+                if part == left:
+                    advances.pop(0)
+                else:
+                    advances[0][1] = left - part
+            if amount > 0:
+                taken.append((None, amount))
+            return taken
+
+        def sides():
+            return max(balance, 0) + waiting, max(-balance, 0)
+
+        def walk(row, change, description, past_zero=None, wait=0):
             """Move the role's balance; put each part on the side it moves."""
-            nonlocal balance
-            before = round(balance)
+            nonlocal balance, waiting
+            own_before, other_before = sides()
             balance += change
-            after = round(balance)
-            own_part = max(after, 0) - max(before, 0)
-            other_part = max(-after, 0) - max(-before, 0)
+            waiting += wait
+            own_after, other_after = sides()
+            own_part = round(own_after) - round(own_before)
+            other_part = round(other_after) - round(other_before)
+            if other_part < 0 <= own_part:
+                # A row that uses up an advance (owner, 28 Nov 2026): it shows
+                # at its full amount on its own side, then the advance moves
+                # across as its own pair - applied on this side, used on the
+                # other - the way an accountant books it, each pair naming the
+                # payment the advance came from. Same balances as showing only
+                # the part the advance didn't cover.
+                out.append(_part_row(row, own, own_part - other_part, description))
+                # The invoice is in the reference, so the rows name only the
+                # advance: "Advance applied · Customer Payment of 01/03/2026".
+                for source, used in use_advances(-other_part):
+                    origin = f' · {source}' if source else ''
+                    out.append(_part_row(
+                        row, own, -used, f'Advance applied{origin}'))
+                    out.append(_part_row(
+                        row, other, -used, f'Advance used{origin}'))
+                return True
             for part_side, part in ((own, own_part), (other, other_part)):
                 if not part:
                     continue
@@ -788,40 +864,58 @@ def _person_side_rows(business_id, person):
                 if part_side == other:
                     text = past_zero or (description + (
                         ' · advance' if part > 0 else ' · against advance'))
+                    if part > 0:
+                        advances.append([source_of(row, past_zero or description), part])
+                    else:
+                        use_advances(-part)
                 out.append(_part_row(row, part_side, part, text))
             return own_part or other_part
 
         for row in rows:
             target = row.get('_for')
-            if (target and row['jama'] and not row['naam']
-                    and invoice_dates.get(target, '') > row['date']):
+            if early(row):
                 before = round(sum(held.values()))
                 held[target] = held.get(target, 0) + row['jama']
-                held_as[target] = row['description']
+                held_as.setdefault(target, []).append(
+                    (row['description'], source_of(row, row['description'])))
                 part = round(sum(held.values())) - before
                 out.append(_part_row(
                     row, other, part,
                     row['description'] + ' · advance for its invoice'))
                 continue
 
-            if not walk(row, row['naam'] - row['jama'], row['description']):
+            change = row['naam'] - row['jama']
+            wait = 0
+            invoice = row.get('_invoice')
+            if invoice and row['naam'] > 0:
+                # The part its own payments will pay waits for them.
+                wait = min(row['naam'], max(own_paid.get(invoice, 0), 0))
+                waits_for[invoice] = wait
+            elif target in waits_for and row['jama'] > 0:
+                # Its own payment clears what was waiting for it.
+                wait = -min(row['jama'], waits_for[target])
+                waits_for[target] += wait
+            if not walk(row, change - wait, row['description'], wait=wait):
                 out.append({**row, 'side': own, 'naam': 0, 'jama': 0})
 
             # The invoice its advance was kept for: the invoice stands at its
             # full amount, then the advance is applied against it, all of it.
             # Any of it past the invoice carries on like other money.
-            if row.get('_invoice') in held:
-                paid_as = held_as.pop(row['_invoice'])
+            if invoice in held:
+                paid = held_as.pop(invoice)
+                origin = ', '.join(source for _, source in paid)
                 before = round(sum(held.values()))
-                used = held.pop(row['_invoice'])
+                used = held.pop(invoice)
                 released = round(sum(held.values())) - before
-                walk(row, -used, paid_as + ' · advance applied',
-                     past_zero=paid_as + ' · advance')
+                walk(row, -used, f'Advance applied · {origin}',
+                     past_zero=paid[0][0] + ' · advance')
                 if released:
                     out.append(_part_row(
-                        row, other, released, paid_as + ' · advance used'))
-        # Every kept invoice is in `rows` and comes after its advance, so
-        # `held` is empty here and each side closes on the card's figure.
+                        row, other, released, f'Advance used · {origin}'))
+        # Every kept invoice is in `rows` and comes after its advance, and
+        # every invoice's own payments clear what waits for them, so `held`
+        # and `waiting` are empty here and each side closes on the card's
+        # figure.
     return out
 
 

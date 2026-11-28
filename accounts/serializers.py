@@ -13,7 +13,7 @@ from root.serializers import SimpleCustomerSerializer, SimpleSupplierSerializer
 from sales.models import (
     PurchaseInvoice, PurchaseReceipt, SalesInvoice, SalesReceipt
 )
-from sales.utils import apply_money_details, invoice_room
+from sales.utils import apply_money_details, invoice_room, payment_date_error
 from .models import (
     MoneyAccount, PartyOpeningBalance, PartyPayment, Transaction
 )
@@ -586,12 +586,14 @@ class TransactionCreateSerializer(BaseTransactionWriteSerializer):
         # two screens can never disagree about what an invoice can still take.
         invoice = attrs.get('sales_invoice') or attrs.get('purchase_invoice')
         if invoice is not None:
+            date_error = payment_date_error(invoice, attrs.get('date'))
+            if date_error:
+                raise serializers.ValidationError({'date': date_error})
             room = invoice_room(invoice)
             if amount > room:
                 raise serializers.ValidationError({
                     'amount': f'This invoice can take at most PKR {room:,.0f} '
-                              'more - part of it may already be settled from '
-                              'the khaata.'
+                              'more.'
                 })
 
         return attrs
