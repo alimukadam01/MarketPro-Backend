@@ -848,12 +848,14 @@ def _person_side_rows(business_id, person):
                 # payment the advance came from. Same balances as showing only
                 # the part the advance didn't cover.
                 out.append(_part_row(row, own, own_part - other_part, description))
+                # The invoice is in the reference, so the rows name only the
+                # advance: "Advance applied · Customer Payment of 01/03/2026".
                 for source, used in use_advances(-other_part):
-                    origin = f' from {source}' if source else ''
+                    origin = f' · {source}' if source else ''
                     out.append(_part_row(
-                        row, own, -used, f'{description} · advance applied{origin}'))
+                        row, own, -used, f'Advance applied{origin}'))
                     out.append(_part_row(
-                        row, other, -used, f'{description} · advance used{origin}'))
+                        row, other, -used, f'Advance used{origin}'))
                 return True
             for part_side, part in ((own, own_part), (other, other_part)):
                 if not part:
@@ -905,13 +907,11 @@ def _person_side_rows(business_id, person):
                 before = round(sum(held.values()))
                 used = held.pop(invoice)
                 released = round(sum(held.values())) - before
-                walk(row, -used,
-                     f"{row['description']} · advance applied from {origin}",
+                walk(row, -used, f'Advance applied · {origin}',
                      past_zero=paid[0][0] + ' · advance')
                 if released:
                     out.append(_part_row(
-                        row, other, released,
-                        f"{row['description']} · advance used from {origin}"))
+                        row, other, released, f'Advance used · {origin}'))
         # Every kept invoice is in `rows` and comes after its advance, and
         # every invoice's own payments clear what waits for them, so `held`
         # and `waiting` are empty here and each side closes on the card's
