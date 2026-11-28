@@ -119,8 +119,12 @@ class KhaataBySideTests(PersonSidesFixture):
         self.sell(8000, day=(2026, 5, 1), number='SI-2')
         ledger = person_ledger(self.business.id, self.ali.person, side='both')
         sale = [row for row in ledger['rows'] if row['reference'] == 'SI-2']
-        self.assertEqual([(row['side'], row['naam'], row['jama']) for row in sale],
-                         [('receivable', 3000, 0), ('payable', 0, 5000)])
+        # The sale at its full amount, then the advance applied against it.
+        self.assertEqual([(row['side'], row['description'], row['naam'], row['jama'])
+                          for row in sale],
+                         [('receivable', 'Sales invoice', 8000, 0),
+                          ('receivable', 'Advance applied · Customer Payment of 01/04/2026', 0, 5000),
+                          ('payable', 'Advance used · Customer Payment of 01/04/2026', 0, 5000)])
         self.assertEqual(ledger['closing_balance'], {'receivable': 3000, 'payable': 0})
         self.assertEqual(self.sides(self.ali.person), (3000, 0))
 

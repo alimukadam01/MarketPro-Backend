@@ -3,6 +3,7 @@ from contextlib import contextmanager
 from urllib.parse import quote
 
 from django.db import transaction
+from django.utils import timezone
 from typing import Dict, Set, Tuple
 from django.db.models import Q, QuerySet
 from django.db.models import Sum
@@ -560,27 +561,46 @@ def live_receipt_total(invoice):
     )
 
 
+def payment_date_error(invoice, day):
+    """
+    Why a payment naming this invoice can't be dated `day`, or None.
+
+    A payment on an invoice can't come before the invoice (owner's rule,
+    27 Nov 2026). Money paid ahead is an advance: it goes on the khaata as a
+    Customer or Supplier Payment, which the next invoice uses. `day` None
+    means today: an invoice dated in the future can't be paid yet either.
+    """
+    if invoice is None or not invoice.date_issued:
+        return None
+    issued = local_date(invoice.date_issued)
+    day = day or timezone.localdate()
+    if day >= issued:
+        return None
+    on_account = ('Customer Payment' if isinstance(invoice, SalesInvoice)
+                  else 'Supplier Payment')
+    return (f"A payment on an invoice can't be dated before the invoice "
+            f"({issued:%d %b %Y}). Record money paid in advance as a "
+            f"{on_account}.")
+
+
 def invoice_room(invoice):
     """
     How much more this invoice can still accept as a payment that names it.
     Never negative.
 
-    Less what its own payments have claimed (pending cheques included) AND
-    what the party's khaata has settled onto it - otherwise an invoice the
-    pool covers would still take a payment, and the party would pay the same
-    debt twice. This cap is what keeps named payments and the pool from
-    contradicting each other (credit-debit-notes plan, section 4).
-
-    The khaata share is the RESERVED one: it counts on-account cheques that
-    are still pending, as if they had cleared. Such a cheque will settle the
-    oldest invoices when it clears, so until then they cannot be offered for
-    payment again - the same hold a pending named cheque already places on
-    its own invoice through live_receipt_total.
+    Its total less what its own payments have claimed, pending cheques
+    included. What the party's khaata has settled onto it does NOT count
+    against it (owner's rule, 27 Nov 2026): an invoice takes all its own
+    payments first, and the khaata's advance only covers what they leave
+    unpaid. So an invoice the advance already covers can still be paid on its
+    own; the settlement then applies that payment first, and the advance goes
+    back to the khaata for the next debt. It was capped at the pool's share
+    before, which made a customer who paid such an invoice separately look
+    as if the advance had paid it.
     """
     return max(
         float(invoice.total or 0)
-        - float(live_receipt_total(invoice))
-        - float(invoice.reserved_pool_applied or 0),
+        - float(live_receipt_total(invoice)),
         0.0,
     )
 

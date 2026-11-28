@@ -395,8 +395,10 @@ class EntryAndReviewTests(BacklogFixture):
         settled = client.get(url + 'settlement/')
         self.assertEqual(settled.status_code, 200, settled.content)
         data = settled.json()
+        # The invoice can still take its own payment (owner's rule, 27 Nov):
+        # the khaata's share would go back on account.
         self.assertEqual((data['total'], data['settled_from_khaata'], data['room'], data['still_owed']),
-                         (8600, 8600, 0, 0))
+                         (8600, 8600, 8600, 0))
         # One line for this invoice: no credit's remaining amount, date or reference.
         self.assertEqual(data['settled_by'], [{'kind': 'khaata', 'id': 0,
                                                'label': "Already on the customer's khaata",
@@ -406,7 +408,7 @@ class EntryAndReviewTests(BacklogFixture):
 
         body = {'amount': 100, 'account': cash.id, 'payment_method': 'cash',
                 'date': timezone.localdate().isoformat()}
-        self.assertEqual(client.post(url + 'payments/', body, format='json').status_code, 400)
+        self.assertEqual(client.post(url + 'payments/', body, format='json').status_code, 201)
 
     def test_saving_a_page_keeps_the_bills_date(self):
         """The date is read back as the shop's day, so saving it again - as
