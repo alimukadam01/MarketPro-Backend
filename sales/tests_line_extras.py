@@ -364,9 +364,10 @@ class LineDiscountOnSalesTests(LineFixture):
             charges=[{"label": "Delivery", "amount": 300}])
         self.assertEqual(response.status_code, 201, response.content)
         invoice = SalesInvoice.objects.get(business=self.business)
-        # sub_total after line discounts; the invoice's 5% and 10% tax on it.
+        # sub_total after line discounts; the invoice's 5% off it, then 10%
+        # tax on what is left (fix plan 5.3).
         self.assertEqual(invoice.sub_total, 2200)
-        self.assertAlmostEqual(invoice.total, 2200 - 110 + 220 + 300)
+        self.assertAlmostEqual(invoice.total, 2200 - 110 + 209 + 300)
 
     def test_old_bugs(self):
         # A zero invoice discount no longer hides the line's; a percentage

@@ -510,7 +510,10 @@ class BacklogWorkViewSet(GenericViewSet):
         }
         if sales:
             values.update(discount=invoice.discount or {},
-                          extra_charges=invoice.extra_charges or [])
+                          extra_charges=invoice.extra_charges or [],
+                          # Which tax rule the invoice was made under (fix
+                          # plan 5.3), so the screen adds it up the same way.
+                          tax_after_discount=invoice.tax_after_discount)
         else:
             values.update(delivery=invoice.delivery, status=invoice.status)
         return values

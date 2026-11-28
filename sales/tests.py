@@ -854,8 +854,9 @@ class SalesInvoiceExtraChargesTests(TestCase):
     def test_a_charge_is_added_after_tax_and_is_not_itself_taxed(self):
         """Goods 1000, 10% tax, 100 discount, a 500 delivery charge.
 
-        sub_total stays goods-only, so the tax is 100 and not 150: a delivery
-        fee is a pass-through, and taxing it would overcharge the customer.
+        sub_total stays goods-only, so the tax is 90 (10% of the 900 after the
+        discount, fix plan 5.3) and not 140: a delivery fee is a pass-through,
+        and taxing it would overcharge the customer.
         Invoice.jsx recomputes a percentage tax from sub_total to print it, so
         the two agree only while the charges stay out of it.
         """
@@ -863,7 +864,8 @@ class SalesInvoiceExtraChargesTests(TestCase):
                             tax=10, discount=100)
         self.assertEqual(invoice.sub_total, 1000)
         self.assertEqual(invoice.extra_charges_total, 500)
-        self.assertEqual(invoice.total, 1000 + 100 - 100 + 500)
+        self.assertEqual(invoice.tax_total, 90)
+        self.assertEqual(invoice.total, 1000 + 90 - 100 + 500)
 
     def test_several_charges_are_totalled(self):
         invoice = self.post("CHG-2", [

@@ -972,12 +972,14 @@ class SalesInvoiceSerializer(serializers.ModelSerializer):
             'status', 'sub_total', 'tax', 'discount', 'extra_charges',
             'extra_charges_total', 'total', 'amount_paid' ,'created_by', 'created_at',
             'notes', 'is_deducted', 'invoice_items', 'projects',
-            'payment_receipts', 'images'
+            'payment_receipts', 'images', 'tax_total', 'tax_after_discount'
         ]
         # Derived from extra_charges by adjust_totals. A client-sent value is
         # ignored rather than trusted - it is the figure every revenue and
-        # profit aggregate subtracts.
-        read_only_fields = ['extra_charges_total']
+        # profit aggregate subtracts. The tax figures are the server's too:
+        # tax_total from adjust_totals, the rule fixed when the invoice was
+        # made (fix plan 5.1, 5.3).
+        read_only_fields = ['extra_charges_total', 'tax_total', 'tax_after_discount']
 
 
 class SimpleSalesInvoiceSerializer(serializers.ModelSerializer):
@@ -1033,9 +1035,9 @@ class SimpleSalesInvoiceSerializer(serializers.ModelSerializer):
             'id', 'invoice_number', 'customer', 'date_issued', 'date_due',
             'payment_status', 'status', 'sub_total', 'tax', 'discount',
             'extra_charges', 'extra_charges_total', 'total',
-            'amount_paid', 'total_items', 'projects'
+            'amount_paid', 'total_items', 'projects', 'tax_total', 'tax_after_discount'
         ]
-        read_only_fields = ['extra_charges_total']
+        read_only_fields = ['extra_charges_total', 'tax_total', 'tax_after_discount']
 
 
 class SalesInvoiceCreateSerializer(ExtraChargesValidationMixin,

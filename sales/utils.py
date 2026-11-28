@@ -380,6 +380,26 @@ def units_in_stock(line):
     return line.restocks.aggregate(total=Sum('quantity'))['total'] or 0
 
 
+def stock_unit_cost(line, invoice=None):
+    """
+    What one unit of this purchase line costs the business (fix plan 5.2):
+    its price after its line discount (net_unit_cost, as stock has always
+    taken it) plus its share of the invoice's tax. MarketPro keeps no tax to
+    reclaim, so the tax paid on a purchase is part of the cost of the goods.
+    The tax is shared across the lines by their value after line discounts,
+    the figure it was charged on.
+    """
+    invoice = invoice or line.purchase_invoice
+    price = float(line.net_unit_cost or 0)
+    if invoice is None or not line.quantity:
+        return price
+    subtotal, total = invoice.computed_totals()
+    tax = float(total or 0) - float(subtotal or 0)
+    if tax <= 0 or not subtotal:
+        return price
+    return price + tax * float(line.line_total) / float(subtotal) / line.quantity
+
+
 @automatic('signal:receive_into_stock')
 def receive_into_stock(line, units, invoice):
     """Put `units` of this line's product into stock and log them against it."""
@@ -393,9 +413,10 @@ def receive_into_stock(line, units, invoice):
         skip_purchase_line(line)
         return
     data = line.morph()
+    cost = stock_unit_cost(line, invoice)
     if stock:
         stock.apply_restock_delta(
-            False, units, data['last_transaction'], data['unit_cost'])
+            False, units, data['last_transaction'], cost)
     else:
         InventoryItem.objects.create(
             business_id=data['business_id'],
@@ -406,7 +427,7 @@ def receive_into_stock(line, units, invoice):
             quantity_on_hand=units,
             track_code=data.get('track_code'),
             notes=data.get('notes'),
-            unit_cost=data.get('unit_cost'),
+            unit_cost=cost,
             last_transaction=data['last_transaction'],
         )
     logRestockEvent(line, units, invoice)

@@ -1165,22 +1165,29 @@ def daily_summary(business_id, day, date_to=None):
 def profit_estimate(business_id, date_from, date_to):
     """
     Revenue less cost of goods sold less expenses. An estimate only — it is
-    exactly as accurate as the data entered (§6.11).
+    exactly as accurate as the data entered (§6.11). Revenue leaves out the
+    sales tax the invoices collect, reported beside it as sales_tax.
 
     Extra charges are in revenue, because `total` carries them, and each one
     is also recorded as an "invoice_extra_charge" expense (sync_charge_expenses
     in sales/utils.py), which the expense total below picks up. The two cancel,
     so a charge nets to nothing in profit.
     """
-    revenue = (
+    sales = (
         SalesInvoice.objects
         .filter(business_id=business_id,
                 date_issued__date__gte=date_from,
                 date_issued__date__lte=date_to)
         # A draft isn't a sale yet: the same rule as the khaata (fix plan 1.2).
         .exclude(status__in=NOT_A_DEBT_SALES_STATUSES)
-        .aggregate(total=Sum('total'))['total'] or 0
+        .aggregate(total=Sum('total'), tax=Sum('tax_total'))
     )
+    # Sales tax is collected for the government, not earned (fix plan 5.1):
+    # revenue is the invoices less their tax. Extra charges stay in: their
+    # expense takes them back out, and a charge the shopkeeper keeps is
+    # revenue.
+    sales_tax = sales['tax'] or 0
+    revenue = (sales['total'] or 0) - sales_tax
 
     cost_map = {
         item['product_id']: item['unit_cost'] or 0
@@ -1234,5 +1241,6 @@ def profit_estimate(business_id, date_from, date_to):
         'cost_of_goods_sold': round(cogs),
         'expenses': round(expenses + salaries),
         'supplier_credits': round(supplier_credits),
+        'sales_tax': round(sales_tax),
         'profit': round(revenue - cogs - expenses - salaries + supplier_credits),
     }

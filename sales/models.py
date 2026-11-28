@@ -336,6 +336,14 @@ class SalesInvoice(SettledInvoiceMixin, models.Model):
         default=dict,
         help_text='e.g., {"value": 10.0, "type": "percentage" or "amount"}'
     )
+    # The tax this invoice charges, in rupees, as adjust_totals worked it out
+    # (fix plan 5.1). Sales tax is collected for the government, not earned,
+    # so profit takes it out of revenue.
+    tax_total = models.FloatField(default=0)
+    # A percentage tax is charged on the price after the invoice's discount
+    # (fix plan 5.3). Invoices made before that rule keep the old one, tax on
+    # the price before the discount, so no total a customer was given moves.
+    tax_after_discount = models.BooleanField(default=True)
     # Named charges added after tax - delivery, labour, a cutting fee. A list
     # rather than a column per charge, because which ones a shop adds is its
     # own business and they differ per invoice.
@@ -482,11 +490,14 @@ class SalesInvoice(SettledInvoiceMixin, models.Model):
             else:
                 raise Exception("incorrect value")
 
-        # Calculate tax on the Invoice
+        # Tax on the invoice. A percentage is charged on the price after the
+        # invoice's discount, or before it on an invoice made under the old
+        # rule (tax_after_discount).
         tax = 0
         if self.tax:
             if self.tax['type'] == "percentage":
-                tax = subtotal * (self.tax['value']/100)
+                taxable = subtotal - discount if self.tax_after_discount else subtotal
+                tax = taxable * (self.tax['value']/100)
 
             elif self.tax['type'] == "amount":
                 tax += self.tax['value']
@@ -505,8 +516,9 @@ class SalesInvoice(SettledInvoiceMixin, models.Model):
 
         self.sub_total = subtotal
         self.extra_charges_total = charges
+        self.tax_total = tax
         self.total = subtotal + tax - discount + charges
-        self.save(update_fields=["sub_total", "total", "extra_charges_total"])
+        self.save(update_fields=["sub_total", "total", "extra_charges_total", "tax_total"])
 
     # is_fulfilled() stood here and was dead: nothing called it, and it
     # assigned self.is_restocked / self.is_partially_restocked, which are
